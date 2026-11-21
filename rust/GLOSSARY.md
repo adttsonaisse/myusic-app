@@ -21,9 +21,14 @@ Maps upstream Kotlin `:shared` / `:app` domain terminology to consistent Rust cr
 | `PartyQueueReading` | Reading & diffing separate `PartyQueue` vs `PartyPlayback.queue_seq` | `bitchord_jam::queue_reading` | Self-heals stale queue copies |
 | `EqualizerCurve` / `EqualizerPreset` | 10-band graphic EQ gain curves & built-in presets | `bitchord_dsp_core::eq::{EqualizerCurve, EqualizerPreset}` | Frequency bands & dB interpolation |
 | `PeakLimiter` | Soft-knee lookahead/instant audio peak limiter preventing clipping | `bitchord_dsp_core::limiter::PeakLimiter` | Pure `f32` PCM processing |
-| `KizzyRPC` / `DiscordWebSocket` (`com.my.kizzy`) | Discord Rich Presence Gateway WebSocket protocol & payload entities | `bitchord_discord::*` | Native Linux: supports both local Discord IPC socket & Gateway RPC |
-| `LyricLine` / `SyllableRuns` / `TtmlLyrics` / `EnhancedLrc` | Word/syllable-timed lyrics representation & parsers | `bitchord_lyrics::*` | Wave 1 — careful with UTF-8 byte vs UTF-16 char offsets |
-| `QueueBuilder` / `QueueTimeline` / `QueueWindow` | Playback queue state machine & windowing | `bitchord_queue::*` | Wave 1 |
+| `KizzyRPC` / `DiscordWebSocket` (`com.my.kizzy`) | Discord Rich Presence Gateway WebSocket protocol & payload entities | `bitchord_integrations::*` | Native Linux: supports both local Discord IPC socket & Gateway RPC (Wave 2) |
+| `LyricLine` / `SyllableRuns` / `TtmlLyrics` / `EnhancedLrc` | Word/syllable-timed lyrics representation & parsers | `bitchord_lyrics::*` | Done in Wave 1 — Unicode scalar indices (`chars().count()`), `quick-xml 0.42`, `Box<LyricLine>` for recursive `background`/`timing_source` |
+| `LyricsRepository` / `SharedDocuments` / `YouTubeLyricsBackend` | Concurrent priority-ordered lyrics racing across 17 `LyricsSource` providers with ISRC lookup & lazy Genius | `bitchord_lyrics::{LyricsRepository, YouTubeLyricsBackend}` | Done in Wave 1 — trait seam avoids circular dep with Wave 2 `bitchord-innertube` |
+| `LyricsTranslation` / `TranslationLanguages` | Batched Google Translate + Input Tools Latin-script retry + romanization + 2 MiB gzipped cache + 133 language table | `bitchord_lyrics::{LyricsTranslator, TRANSLATION_LANGUAGES}` | Done in Wave 1 — preserves `timing_source` across translated word sweeps |
+| `QueueBuilder` / `QueueTimeline` / `QueueWindow` / `ContextRegistry` | Playback queue state machine, deterministic shuffle, continuation registry, and tier-pinned user queue | `bitchord_queue::*` | Done in Wave 1 |
+| `TransitionFilter` | 4th-order Butterworth SVF DJ high-pass/low-pass crossfade filter | `bitchord_dsp_core::transition_filter::TransitionFilter` | Done in Wave 1 |
+| `CanvasArtwork` / `SpotifyCanvasQuery` | Canvas animated artwork metadata matching & Spotify GraphQL persisted-query parser | `bitchord_model::canvas::*` | Done in Wave 1 |
+| `Presence` / `PresencePlatform` | Live-install anonymous heartbeat (`POST /api/presence`, no `Origin` header, 2s close debounce, `close_blocking`) | `bitchord_integrations::presence::*` | Done in Wave 1 |
 | `Innertube` / `StreamResolver` / `PoTokenGenerator` | YouTube Music API client & playable stream URL resolution | `bitchord_innertube::*` | Wave 2 — native-first + `yt-dlp` dev bridge (ADR-004) |
 | `AudioEngine` (replaces ExoPlayer/Media3) | Gapless + crossfade Linux audio pipeline (`symphonia` + PipeWire/CPAL/ALSA) | `bitchord_audio::*` | Wave 3 |
-| `BitChordApp` (replaces Compose `sharedUi` + `app/ui`) | GPUI desktop window, views, mesh gradient, lyrics canvas | `bitchord_desktop::*` | Wave 4 |
+| `BitChordApp` (replaces Compose `sharedUi` + `app/ui`) | GPUI (`gpui-ce 0.3.x`, ADR-009) desktop window, views, mesh gradient, lyrics canvas | `bitchord_desktop::*` | Wave 4 |

@@ -1,4 +1,5 @@
 pub mod artist_credits;
+pub mod canvas;
 pub mod models;
 pub mod playlist_order;
 pub mod search_history;
@@ -10,6 +11,10 @@ pub mod version_time_map;
 pub use artist_credits::{
     ArtistCredit, ArtistNameIndex, CreditSegment, complete_artist_credits, credit_segments,
     is_exact_artist_match, normalized_artist_name, split_credit_joiners,
+};
+pub use canvas::{
+    CanvasArtwork, CanvasSource, QueryHashes, SpotifyCanvasAnswer, SpotifyCanvasQuery,
+    normalize_for_match, split_artists,
 };
 pub use models::{
     Account, AccountChannel, ArtistPage, ArtistRef, BrowseItem, BrowseType, CARD_ART_PX,

@@ -60,3 +60,9 @@ Status: accepted (2026-11-21)
 Context: Active editor workspace is an unrelated portfolio repo (`adtt-portofolio`).
 Decision: Develop in `/home/adttsonaisse/Documents/Coding/bitchord-rs` with upstream BitChord kept read-only in `reference/BitChord/` (gitignored). Pause for user review and update `rust/MAP.md` + `rust/HANDOFF.md` at the completion of every Wave.
 Consequences: Clean separation from other projects and predictable multi-session continuity.
+
+## ADR-009: GPUI Crate Line — `gpui-ce 0.3.x` (`wgpu`) Over Official `gpui 0.2.2`
+Status: accepted (2026-11-21)
+Context: Primary-source research (`rust/research/gpui-linux.md`) revealed that official `gpui 0.2.2` (`blade-graphics`) has a `BladeAtlas::remove()` VRAM leak risking exhaustion on the 7.5 GiB shared-VRAM Intel UHD laptop, lacks `QuitMode::Explicit` for close-to-tray, and lacks CSS `backdrop_filter` blur. `gpui-ce 0.3.0` (`wgpu`, MSRV 1.95, compatible with local `rustc 1.100.0`) fixes atlas deallocation, adds native CSS `.backdrop_filter(Filter::Blur(...))`, `custom-gpu` shaders, `QuitMode::Explicit`, `gpui_ce_tokio 0.3.0`, and `gpui-tray 0.3.0` (`features = ["gpui-ce"]`, pure-Rust `zbus`, zero GTK3).
+Decision: Target `gpui-ce = "0.3"` + `gpui_ce_tokio = "0.3"` + `gpui-tray = "0.3"` (`gpui-ce` feature) for `crates/bitchord-desktop` in Wave 4. Keep `bitchord-desktop` outside workspace `default-members` and cap Tokio worker threads to 2 (GPUI already spawns 12 background workers on this CPU).
+Consequences: Native frosted-glass blur, safe bounded GPU atlas memory on shared-VRAM laptops, clean Wayland close-to-tray, and zero GTK3/WebKitGTK bloat.

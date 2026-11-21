@@ -4,10 +4,10 @@ Living index for multi-session continuity. Points to `DECISIONS.md`, `GLOSSARY.m
 
 - **Goal**: Standalone native Linux Desktop music client in Rust + GPUI (`bitchord-desktop`), backed by modular pure-Rust crates (`bitchord-*`), maintaining Listen Together protocol compatibility with the existing Go `backend/`.
 - **Reference Source**: `reference/BitChord/` (read-only upstream v1.9.1)
-- **ADRs**: [DECISIONS.md](DECISIONS.md) (`ADR-001` .. `ADR-008`)
+- **ADRs**: [DECISIONS.md](DECISIONS.md) (`ADR-001` .. `ADR-009`)
 - **Glossary**: [GLOSSARY.md](GLOSSARY.md)
 - **Research Topics** (`rust/research/`):
-  - [gpui-linux.md](research/gpui-linux.md) — `done` (flags `gpui 0.2.2` vs `gpui-ce 0.3.0` choice before Wave 4)
+  - [gpui-linux.md](research/gpui-linux.md) — `done` (`gpui-ce 0.3.x` selected per `ADR-009`)
   - [youtube-extraction.md](research/youtube-extraction.md) — `done` (`reqwest 0.13.5`, `rquickjs 0.14.0`, `yt-dlp` bridge flags, 1 MiB chunked range probing)
   - [linux-audio-engine.md](research/linux-audio-engine.md) — `done` (`symphonia 0.6.1` + `symphonia-adapter-libopus 0.3.0`, `pipewire 0.10.1`, `rtrb 0.4.1`, `mpris-server 0.11.0`, `oo7 0.7.3`)
 
@@ -20,20 +20,19 @@ Living index for multi-session continuity. Points to `DECISIONS.md`, `GLOSSARY.m
 
 | Unit ID | Upstream Kotlin Source | Target Crate | Status | Notes / Verification |
 | --- | --- | --- | --- | --- |
-| `W0-1` | `shared/.../data/model/*` + `shared/.../data/settings/*` | `crates/bitchord-model` | `done` | 21/21 tests passing (`ModelsTest`, `PlayingRowMatcherTest`, `PlaylistOrderTest`, `ArtistCreditsTest`, `ArtistNameIndexTest`, `ArtistNameMatchTest`, `JoinerLanguageTest`, `VersionTimeMap`, `SearchHistory`, `TopPicks`, `SpotifyMatch`). |
+| `W0-1` | `shared/.../data/model/*` + `shared/.../data/settings/*` | `crates/bitchord-model` | `done` | 24/24 tests passing (`ModelsTest`, `PlayingRowMatcherTest`, `PlaylistOrderTest`, `ArtistCreditsTest`, `ArtistNameIndexTest`, `ArtistNameMatchTest`, `JoinerLanguageTest`, `VersionTimeMap`, `SearchHistory`, `TopPicks`, `SpotifyMatch`, plus `Canvas` added in `W1-3`). |
 | `W0-2` | `shared/.../data/listentogether/*` | `crates/bitchord-jam` | `done` | 15/15 tests passing (`JamInviteTest`, `PartyQueueReadingTest`, `ServerClockTest`, Go backend `camelCase` JSON wire contract). |
-| `W0-3` | `shared/.../playback/{EqualizerCurve,EqualizerPreset,PeakLimiter}.kt` + `app/.../EqualizerProcessor.kt` | `crates/bitchord-dsp-core` | `done` | 4 acoustic/DSP suites passing (replicates all 14 `EqualizerProcessorTest` sine-correlation, shelf, tone-pad, focus, balance, `PeakLimiter` ceiling, bit-exact passthrough, glide-down, and preset checks). Zero external deps. |
+| `W0-3` | `shared/.../playback/{EqualizerCurve,EqualizerPreset,PeakLimiter}.kt` + `app/.../EqualizerProcessor.kt` | `crates/bitchord-dsp-core` | `done` | 5 acoustic/DSP suites passing (all 14 `EqualizerProcessorTest` assertions + `TransitionFilter` SVF added in `W1-1`). Zero external deps. |
 | `W0-4` | `shared/.../data/sources/{SourceTrackKeys,StreamFormat,TrackMatcher}.kt` | `crates/bitchord-matcher` | `done` | 7 comprehensive suites passing (replicates `SourcesTest`, `TrackIdentityMismatchTest`, `trackMatcher.test.ts` — NFKC, Portuguese `part.`, CJK translations, Hepburn kana→romaji, album version markers, explicit flag, video switch). |
 
-## Open Questions (Before Wave 4)
-- **GPUI Crate Line**: Official Zed `gpui = "0.2.2"` (monolithic `blade-graphics`, known `BladeAtlas::remove()` VRAM leak on shared-VRAM GPUs, no CSS backdrop blur) vs `gpui-ce = "0.3.0"` (`wgpu`, fixed atlas deallocation, native CSS `.backdrop_filter(Filter::Blur(...))`, `QuitMode::Explicit`, `gpui_ce_tokio`, `gpui-tray` support). See [gpui-linux.md](research/gpui-linux.md).
+### Wave 1: Queue Engine, Lyrics Engine (17 Sources) & Canvas/Presence
+*201/201 workspace tests passing, 0 clippy warnings (`-D warnings`), `cargo fmt --check` clean, `#![forbid(unsafe_code)]`.*
 
-### Wave 1: Queue Engine & Lyrics Engine (12+ Providers)
 | Unit ID | Upstream Kotlin Source | Target Crate | Status | Notes / Verification |
 | --- | --- | --- | --- | --- |
-| `W1-1` | `shared/.../playback/{ContextRegistry,QueueBuilder,QueueSections,QueueTimeline,QueueWindow,TransitionFilter}.kt` | `crates/bitchord-queue` | `open` | Replicate `ContextRegistryTest`, `QueueWindowTest`, `QueueTimeline` tests. |
-| `W1-2` | `shared/.../data/lyrics/*` (29 files: TTML, EnhancedLRC, SyllableRuns, BackgroundVocals, LyricAlignments, Translation, 12 providers) | `crates/bitchord-lyrics` | `open` | Replicate `LrcLibTest`, `LrcRedTest`, `LrcWriterTest`, `GeniusTest`, `KuGouTest`, `MusixmatchTest`, `BackgroundVocalTest`, `LyricsLookupKeyTest`. Careful with UTF-8 vs UTF-16 offsets! |
-| `W1-3` | `shared/.../data/canvas/*` + `shared/.../data/presence/*` | `crates/bitchord-model` / `crates/bitchord-integrations` | `open` | Canvas artwork normalization + presence helpers. Replicate `PresenceTest`. |
+| `W1-1` | `shared/.../playback/{ContextRegistry,QueueBuilder,QueueSections,QueueTimeline,QueueWindow,TransitionFilter}.kt` | `crates/bitchord-queue` + `crates/bitchord-dsp-core` | `done` | 13/13 queue tests + `TransitionFilter` 4th-order Butterworth SVF DSP test passing (`ContextRegistryTest`, `QueueWindowTest`, `QueueSectionsTest`, `QueueTimeline`, `QueueBuilder`). |
+| `W1-2` | `shared/.../data/lyrics/*` (29 files: TTML, EnhancedLRC, SyllableRuns, BackgroundVocals, LyricAlignments, LrcWriter, Translation/Romanization, 17 `LyricsSource` providers + `LyricsRepository`) | `crates/bitchord-lyrics` | `done` | 133/133 tests passing (`WordSyncTest`, `LyricAnimationWindowTest`, `LrcLibTest`, `LrcRedTest`, `LrcWriterTest`, `GeniusTest`, `KuGouTest`, `MusixmatchTest`, `BackgroundVocalTest`, `ProviderLyricsTest`, `NewLyricsSourceTest`, `LyricsLookupKeyTest`, `LyricsRepository` racing/cancellation/dedup, `LyricsTranslator` + Input Tools retry + gzip cache). Clean `YouTubeLyricsBackend` trait ready for Wave 2 `bitchord-innertube`. |
+| `W1-3` | `shared/.../data/canvas/*` + `shared/.../data/presence/*` | `crates/bitchord-model` + `crates/bitchord-integrations` | `done` | `CanvasArtwork` + `SpotifyCanvasQuery` (3 tests in `bitchord-model`) + `Presence` live-install heartbeat with 2s close debounce, reopen cancellation, `close_blocking`, and no-`Origin` header assertion (4/4 tests in `bitchord-integrations` replicating `PresenceTest`). |
 
 ### Wave 2: InnerTube, Stream Extraction, Integrations & Headless CLI Front-Door
 *Depends on `rust/research/youtube-extraction.md`.*
