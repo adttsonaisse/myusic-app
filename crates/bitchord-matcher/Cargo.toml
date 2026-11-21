@@ -1,0 +1,15 @@
+[package]
+name = "bitchord-matcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bitchord-model.workspace = true
+regex.workspace = true
+serde.workspace = true
+unicode-normalization.workspace = true
+
+[lints]
+workspace = true

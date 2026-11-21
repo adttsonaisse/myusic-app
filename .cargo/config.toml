@@ -1,0 +1,9 @@
+# Tuned for Intel Core i3-1220P (10C/12T) + 7.5 GiB RAM on Arch Linux.
+# Keeps peak RAM well below 3 GiB and avoids thermal throttling / swap thrashing.
+
+[build]
+jobs = 4
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,--threads=2"]

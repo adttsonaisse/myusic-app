@@ -1,0 +1,49 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/bitchord-model",
+    "crates/bitchord-jam",
+    "crates/bitchord-dsp-core",
+    "crates/bitchord-matcher",
+]
+# Keep heavy GUI crates (added in Wave 4) out of default-members so core `cargo test`
+# stays fast and low-RAM on Intel Core i3-1220P / 7.5 GiB RAM (ADR-007).
+default-members = [
+    "crates/bitchord-model",
+    "crates/bitchord-jam",
+    "crates/bitchord-dsp-core",
+    "crates/bitchord-matcher",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+rust-version = "1.85"
+
+[workspace.dependencies]
+bitchord-model = { path = "crates/bitchord-model" }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-normalization = "0.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Laptop-friendly compilation profiles (ADR-007)
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = 0
+opt-level = 0
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = "symbols"
