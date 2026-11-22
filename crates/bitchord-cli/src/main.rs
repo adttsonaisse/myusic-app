@@ -699,6 +699,7 @@ async fn cmd_play(args: PlayArgs, json_mode: bool) -> Result<String, String> {
         None
     };
 
+    engine.wait_prebuffer(120, Duration::from_millis(600));
     engine.play();
     let started = Instant::now();
     let max_dur = args

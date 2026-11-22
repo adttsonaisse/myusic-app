@@ -27,11 +27,13 @@ use crate::dsp::{DspChain, EqTuningSnapshot};
 pub const OUTPUT_SAMPLE_RATE: u32 = 48_000;
 /// Canonical stereo channel count.
 pub const OUTPUT_CHANNELS: usize = 2;
-/// Per-deck ring buffer duration (3 seconds of stereo f32 PCM).
-pub const RING_DURATION_SECS: usize = 3;
-/// Per-deck `rtrb` ring capacity in interleaved `f32` samples (~1.15 MiB per deck).
+/// Per-deck ring buffer duration (8 seconds of stereo f32 PCM for deep network jitter immunity).
+pub const RING_DURATION_SECS: usize = 8;
+/// Per-deck `rtrb` ring capacity in interleaved `f32` samples (~3.07 MiB per deck).
 pub const RING_CAPACITY_SAMPLES: usize =
     OUTPUT_SAMPLE_RATE as usize * OUTPUT_CHANNELS * RING_DURATION_SECS;
+/// Tiny click-free fade ramp length (16 frames = 0.33 ms at 48 kHz) applied on rare underruns.
+const UNDERRUN_RAMP_FRAMES: usize = 16;
 /// Capacity of the lock-free control command ring from engine thread to RT thread.
 pub const CMD_RING_CAPACITY: usize = 256;
 /// Fixed per-chunk frame limit inside the RT callback so scratch buffers never resize.
@@ -151,6 +153,8 @@ pub struct RtMixerState {
     volume: f32,
     muted: bool,
     paused: bool,
+    underrun_a: bool,
+    underrun_b: bool,
     metrics: Arc<RtMetrics>,
 }
 
@@ -184,6 +188,8 @@ impl RtMixerState {
             volume: 1.0,
             muted: false,
             paused: true,
+            underrun_a: false,
+            underrun_b: false,
             metrics: Arc::clone(&metrics),
         };
 
@@ -259,10 +265,12 @@ impl RtMixerState {
                         DeckId::A => {
                             drain_ring(&mut self.rx_a);
                             self.dsp_a.flush();
+                            self.underrun_a = false;
                         }
                         DeckId::B => {
                             drain_ring(&mut self.rx_b);
                             self.dsp_b.flush();
+                            self.underrun_b = false;
                         }
                     }
                     self.metrics.reset_played_frames(deck);
@@ -308,8 +316,16 @@ impl RtMixerState {
 
             if use_a {
                 let got = pop_samples(&mut self.rx_a, &mut self.buf_a[..chunk_samples]);
+                if self.underrun_a && got > 0 {
+                    apply_fade_in(&mut self.buf_a[..got]);
+                    self.underrun_a = false;
+                }
                 if got < chunk_samples {
+                    if got > 0 {
+                        apply_fade_out(&mut self.buf_a[..got]);
+                    }
                     self.buf_a[got..chunk_samples].fill(0.0);
+                    self.underrun_a = true;
                     self.metrics.underrun_count.fetch_add(1, Ordering::Relaxed);
                 }
                 if got > 0 {
@@ -322,8 +338,16 @@ impl RtMixerState {
 
             if use_b {
                 let got = pop_samples(&mut self.rx_b, &mut self.buf_b[..chunk_samples]);
+                if self.underrun_b && got > 0 {
+                    apply_fade_in(&mut self.buf_b[..got]);
+                    self.underrun_b = false;
+                }
                 if got < chunk_samples {
+                    if got > 0 {
+                        apply_fade_out(&mut self.buf_b[..got]);
+                    }
                     self.buf_b[got..chunk_samples].fill(0.0);
+                    self.underrun_b = true;
                     self.metrics.underrun_count.fetch_add(1, Ordering::Relaxed);
                 }
                 if got > 0 {
@@ -382,6 +406,37 @@ impl RtMixerState {
             frame_offset += chunk_frames;
         }
         total_frames
+    }
+}
+
+#[inline]
+fn apply_fade_out(samples: &mut [f32]) {
+    let frames = samples.len() / OUTPUT_CHANNELS;
+    let ramp = frames.min(UNDERRUN_RAMP_FRAMES);
+    if ramp == 0 {
+        return;
+    }
+    let start_frame = frames - ramp;
+    for f in 0..ramp {
+        let gain = 1.0 - (f + 1) as f32 / (ramp + 1) as f32;
+        let base = (start_frame + f) * OUTPUT_CHANNELS;
+        samples[base] *= gain;
+        samples[base + 1] *= gain;
+    }
+}
+
+#[inline]
+fn apply_fade_in(samples: &mut [f32]) {
+    let frames = samples.len() / OUTPUT_CHANNELS;
+    let ramp = frames.min(UNDERRUN_RAMP_FRAMES);
+    if ramp == 0 {
+        return;
+    }
+    for f in 0..ramp {
+        let gain = (f + 1) as f32 / (ramp + 1) as f32;
+        let base = f * OUTPUT_CHANNELS;
+        samples[base] *= gain;
+        samples[base + 1] *= gain;
     }
 }
 

@@ -1,18 +1,20 @@
-//! Collapsible grouped navigation rail (`W4-1`) with persistent active shape +
-//! crimson edge marker that survives collapsed icon-rail mode (`R-24`, `R-25`).
+//! Collapsible grouped navigation rail (`W4-1`) with crisp vector SVG icons
+//! (`notes.md` #5) and a persistent active shape + crimson edge marker that
+//! survives collapsed icon-rail mode (`R-24`, `R-25`).
 
 use gpui::prelude::*;
 use gpui::{Context, FontWeight, div, px};
 
 use crate::actions::Route;
 use crate::app::BitChordApp;
-use crate::theme::BitChordTheme;
+use crate::icons;
+use crate::theme::{BitChordTheme, ThemeMode};
 
 impl BitChordApp {
     pub fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme();
         let collapsed = self.sidebar_collapsed;
-        let rail_width = if collapsed { px(68.0) } else { px(224.0) };
+        let rail_width = if collapsed { px(72.0) } else { px(228.0) };
 
         div()
             .w(rail_width)
@@ -30,46 +32,44 @@ impl BitChordApp {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(16.0))
+                    .gap(px(18.0))
                     // Brand header + rail collapse toggle
                     .child(
                         div()
-                            .px(px(6.0))
+                            .px(px(4.0))
                             .flex()
                             .items_center()
                             .justify_between()
                             .child(if collapsed {
                                 div()
-                                    .w(px(28.0))
-                                    .h(px(28.0))
-                                    .rounded(px(7.0))
+                                    .w(px(30.0))
+                                    .h(px(30.0))
+                                    .rounded(px(8.0))
                                     .bg(theme.accent)
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .text_size(px(13.0))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(theme.on_accent)
-                                    .child("B")
+                                    .child(icons::icon(icons::BRAND_WAVE, 17.0, theme.on_accent))
                                     .into_any_element()
                             } else {
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap(px(8.0))
+                                    .gap(px(10.0))
                                     .child(
                                         div()
-                                            .w(px(24.0))
-                                            .h(px(24.0))
-                                            .rounded(px(6.0))
+                                            .w(px(28.0))
+                                            .h(px(28.0))
+                                            .rounded(px(8.0))
                                             .bg(theme.accent)
                                             .flex()
                                             .items_center()
                                             .justify_center()
-                                            .text_size(px(12.0))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(theme.on_accent)
-                                            .child("B"),
+                                            .child(icons::icon(
+                                                icons::BRAND_WAVE,
+                                                16.0,
+                                                theme.on_accent,
+                                            )),
                                     )
                                     .child(
                                         div()
@@ -83,23 +83,27 @@ impl BitChordApp {
                             .child(
                                 div()
                                     .id("sidebar-collapse")
-                                    .w(px(26.0))
-                                    .h(px(26.0))
-                                    .rounded(px(6.0))
+                                    .w(px(28.0))
+                                    .h(px(28.0))
+                                    .rounded(px(7.0))
                                     .flex()
                                     .items_center()
                                     .justify_center()
                                     .cursor_pointer()
-                                    .text_size(px(12.0))
-                                    .text_color(theme.text_muted)
-                                    .hover(move |s| {
-                                        s.bg(theme.surface_hover).text_color(theme.text_primary)
-                                    })
+                                    .hover(move |s| s.bg(theme.surface_hover))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.sidebar_collapsed = !this.sidebar_collapsed;
                                         cx.notify();
                                     }))
-                                    .child(if collapsed { ">" } else { "<" }),
+                                    .child(icons::icon(
+                                        if collapsed {
+                                            icons::SIDEBAR_EXPAND
+                                        } else {
+                                            icons::SIDEBAR_COLLAPSE
+                                        },
+                                        16.0,
+                                        theme.text_muted,
+                                    )),
                             ),
                     )
                     // Group 1: Discover
@@ -109,10 +113,17 @@ impl BitChordApp {
                             .flex_col()
                             .gap(px(4.0))
                             .when(!collapsed, |el| el.child(section_label("DISCOVER", theme)))
-                            .child(self.nav_row("nav-home", "HM", "Home", Route::Home, theme, cx))
+                            .child(self.nav_row(
+                                "nav-home",
+                                icons::HOME,
+                                "Home",
+                                Route::Home,
+                                theme,
+                                cx,
+                            ))
                             .child(self.nav_row(
                                 "nav-search",
-                                "SR",
+                                icons::SEARCH,
                                 "Search",
                                 Route::Search,
                                 theme,
@@ -130,7 +141,7 @@ impl BitChordApp {
                             })
                             .child(self.nav_row(
                                 "nav-library",
-                                "LB",
+                                icons::LIBRARY,
                                 "Library",
                                 Route::Library,
                                 theme,
@@ -138,14 +149,14 @@ impl BitChordApp {
                             ))
                             .child(self.nav_row(
                                 "nav-downloads",
-                                "DL",
+                                icons::DOWNLOAD,
                                 "Downloads",
                                 Route::Downloads,
                                 theme,
                                 cx,
                             )),
                     )
-                    // Group 3: Social & Audio
+                    // Group 3: Stage & Settings
                     .child(
                         div()
                             .flex()
@@ -154,7 +165,7 @@ impl BitChordApp {
                             .when(!collapsed, |el| el.child(section_label("STAGE", theme)))
                             .child(self.nav_row(
                                 "nav-now-playing",
-                                "NP",
+                                icons::DISC,
                                 "Now Playing",
                                 Route::NowPlaying,
                                 theme,
@@ -162,7 +173,7 @@ impl BitChordApp {
                             ))
                             .child(self.nav_row(
                                 "nav-party",
-                                "LT",
+                                icons::USERS,
                                 "Listen Together",
                                 Route::ListenTogether,
                                 theme,
@@ -170,7 +181,7 @@ impl BitChordApp {
                             ))
                             .child(self.nav_row(
                                 "nav-settings",
-                                "ST",
+                                icons::SETTINGS,
                                 "Settings",
                                 Route::Settings,
                                 theme,
@@ -188,9 +199,9 @@ impl BitChordApp {
                         div()
                             .id("sidebar-theme-toggle")
                             .w_full()
-                            .h(px(36.0))
+                            .h(px(38.0))
                             .px(px(10.0))
-                            .rounded(px(8.0))
+                            .rounded(px(9.0))
                             .flex()
                             .items_center()
                             .justify_between()
@@ -206,23 +217,32 @@ impl BitChordApp {
                             }))
                             .child(
                                 div()
-                                    .text_size(px(12.0))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.text_primary)
-                                    .child(if collapsed {
-                                        if self.theme_mode == crate::theme::ThemeMode::Dark {
-                                            "DK"
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .child(icons::icon(
+                                        if self.theme_mode == ThemeMode::Dark {
+                                            icons::MOON
                                         } else {
-                                            "LT"
-                                        }
-                                    } else {
-                                        self.theme_mode.label()
+                                            icons::SUN
+                                        },
+                                        15.0,
+                                        theme.text_primary,
+                                    ))
+                                    .when(!collapsed, |el| {
+                                        el.child(
+                                            div()
+                                                .text_size(px(12.5))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(theme.text_primary)
+                                                .child(self.theme_mode.label()),
+                                        )
                                     }),
                             )
                             .when(!collapsed, |el| {
                                 el.child(
                                     div()
-                                        .text_size(px(11.0))
+                                        .text_size(px(10.5))
                                         .text_color(theme.text_muted)
                                         .child("Ctrl+T"),
                                 )
@@ -234,7 +254,7 @@ impl BitChordApp {
     fn nav_row(
         &self,
         id: &'static str,
-        short_code: &'static str,
+        icon_bytes: &'static [u8],
         label: &'static str,
         target: Route,
         theme: BitChordTheme,
@@ -252,6 +272,11 @@ impl BitChordApp {
         } else {
             theme.text_secondary
         };
+        let icon_col = if active {
+            theme.accent
+        } else {
+            theme.text_muted
+        };
 
         div()
             .id(id)
@@ -259,11 +284,12 @@ impl BitChordApp {
             .w_full()
             .h(px(38.0))
             .px(px(10.0))
-            .rounded(px(8.0))
+            .rounded(px(9.0))
             .bg(bg)
             .flex()
             .items_center()
-            .gap(px(10.0))
+            .when(collapsed, |el| el.justify_center())
+            .gap(px(11.0))
             .cursor_pointer()
             .hover(move |s| {
                 s.bg(if active {
@@ -276,32 +302,20 @@ impl BitChordApp {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.navigate(target.clone(), cx);
             }))
-            // Left crimson active indicator bar (real active-route signal)
+            // Left crimson active indicator bar
             .when(active, |el| {
                 el.child(
                     div()
+                        .absolute()
+                        .left(px(0.0))
+                        .top(px(9.0))
                         .w(px(3.0))
-                        .h(px(18.0))
-                        .rounded(px(2.0))
+                        .h(px(20.0))
+                        .rounded_r(px(3.0))
                         .bg(theme.accent),
                 )
             })
-            .child(
-                div()
-                    .w(px(24.0))
-                    .text_size(px(11.0))
-                    .font_weight(if active {
-                        FontWeight::BOLD
-                    } else {
-                        FontWeight::MEDIUM
-                    })
-                    .text_color(if active {
-                        theme.accent
-                    } else {
-                        theme.text_muted
-                    })
-                    .child(short_code),
-            )
+            .child(icons::icon(icon_bytes, 17.0, icon_col))
             .when(!collapsed, |el| {
                 el.child(
                     div()
@@ -321,7 +335,7 @@ impl BitChordApp {
 fn section_label(text: &'static str, theme: BitChordTheme) -> impl IntoElement {
     div()
         .px(px(10.0))
-        .pb(px(2.0))
+        .pb(px(3.0))
         .text_size(px(10.5))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(theme.text_muted)

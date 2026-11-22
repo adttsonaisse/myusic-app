@@ -1,12 +1,15 @@
 //! Slide-over right Queue drawer (`W4-3`) with selective `backdrop_blur`
-//! (glass surface 2 of 2, `R-10`), `QueueTier` badges, jump-to-track, remove, and clear.
+//! (glass surface 2 of 2, `R-10`), track thumbnails, vector SVG icons,
+//! `QueueTier` badges, jump-to-track, remove, and clear.
 
 use bitchord_model::QueueTier;
 use gpui::prelude::*;
 use gpui::{Context, FontWeight, div, px};
 
 use crate::app::BitChordApp;
+use crate::artwork::song_thumbnail_url;
 use crate::backend::BackendCommand;
+use crate::icons;
 
 impl BitChordApp {
     pub fn render_queue_drawer(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -15,7 +18,7 @@ impl BitChordApp {
         let cur = self.queue.current_index;
 
         div()
-            .w(px(330.0))
+            .w(px(344.0))
             .h_full()
             .flex_shrink_0()
             .bg(theme.glass_drawer)
@@ -35,23 +38,33 @@ impl BitChordApp {
                     .justify_between()
                     .child(
                         div()
-                            .text_size(px(15.0))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(theme.text_primary)
-                            .child(format!("Up Next ({})", items.len())),
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(icons::icon(icons::QUEUE_LIST, 16.0, theme.accent))
+                            .child(
+                                div()
+                                    .text_size(px(15.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(theme.text_primary)
+                                    .child(format!("Up Next ({})", items.len())),
+                            ),
                     )
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(8.0))
+                            .gap(px(6.0))
                             .child(
                                 div()
                                     .id("queue-clear")
-                                    .px(px(8.0))
-                                    .py(px(4.0))
-                                    .rounded(px(5.0))
+                                    .px(px(9.0))
+                                    .py(px(5.0))
+                                    .rounded(px(7.0))
                                     .bg(theme.surface_elevated)
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.0))
                                     .cursor_pointer()
                                     .text_size(px(11.5))
                                     .text_color(theme.text_secondary)
@@ -59,23 +72,25 @@ impl BitChordApp {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.send(BackendCommand::QueueClear, cx);
                                     }))
+                                    .child(icons::icon(icons::TRASH, 12.5, theme.text_muted))
                                     .child("Clear"),
                             )
                             .child(
                                 div()
                                     .id("queue-close")
-                                    .px(px(8.0))
-                                    .py(px(4.0))
-                                    .rounded(px(5.0))
+                                    .w(px(28.0))
+                                    .h(px(28.0))
+                                    .rounded(px(7.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
                                     .cursor_pointer()
-                                    .text_size(px(12.0))
-                                    .text_color(theme.text_muted)
                                     .hover(move |s| s.bg(theme.surface_hover))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.queue_open = false;
                                         cx.notify();
                                     }))
-                                    .child("x"),
+                                    .child(icons::icon(icons::CLOSE, 14.0, theme.text_muted)),
                             ),
                     ),
             )
@@ -102,13 +117,14 @@ impl BitChordApp {
                             QueueTier::Context => "CTX",
                             QueueTier::Autoplay => "AUTO",
                         };
+                        let art = song_thumbnail_url(&song);
 
                         div()
                             .id(("queue-row", idx))
                             .w_full()
                             .px(px(10.0))
                             .py(px(8.0))
-                            .rounded(px(7.0))
+                            .rounded(px(9.0))
                             .bg(if is_cur {
                                 theme.surface_elevated
                             } else {
@@ -117,7 +133,7 @@ impl BitChordApp {
                             .flex()
                             .items_center()
                             .justify_between()
-                            .gap(px(8.0))
+                            .gap(px(10.0))
                             .cursor_pointer()
                             .hover(move |s| s.bg(theme.surface_hover))
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -125,34 +141,49 @@ impl BitChordApp {
                             }))
                             .child(
                                 div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(10.0))
                                     .flex_1()
                                     .min_w(px(0.0))
-                                    .flex()
-                                    .flex_col()
+                                    .child(self.render_art_box(
+                                        art.as_deref(),
+                                        38.0,
+                                        6.0,
+                                        icons::MUSIC_NOTE,
+                                        theme,
+                                    ))
                                     .child(
                                         div()
-                                            .text_size(px(13.0))
-                                            .font_weight(if is_cur {
-                                                FontWeight::SEMIBOLD
-                                            } else {
-                                                FontWeight::NORMAL
-                                            })
-                                            .text_color(if is_cur {
-                                                theme.accent
-                                            } else {
-                                                theme.text_primary
-                                            })
-                                            .overflow_hidden()
-                                            .whitespace_nowrap()
-                                            .child(song.title),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(11.5))
-                                            .text_color(theme.text_muted)
-                                            .overflow_hidden()
-                                            .whitespace_nowrap()
-                                            .child(song.artist),
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .flex()
+                                            .flex_col()
+                                            .child(
+                                                div()
+                                                    .text_size(px(13.0))
+                                                    .font_weight(if is_cur {
+                                                        FontWeight::SEMIBOLD
+                                                    } else {
+                                                        FontWeight::NORMAL
+                                                    })
+                                                    .text_color(if is_cur {
+                                                        theme.accent
+                                                    } else {
+                                                        theme.text_primary
+                                                    })
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .child(song.title),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.5))
+                                                    .text_color(theme.text_muted)
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .child(song.artist),
+                                            ),
                                     ),
                             )
                             .child(
@@ -173,19 +204,22 @@ impl BitChordApp {
                                     .child(
                                         div()
                                             .id(("queue-rm", idx))
-                                            .px(px(6.0))
-                                            .py(px(2.0))
-                                            .rounded(px(4.0))
-                                            .text_size(px(11.0))
-                                            .text_color(theme.text_muted)
-                                            .hover(move |s| {
-                                                s.bg(theme.surface_active).text_color(theme.danger)
-                                            })
+                                            .w(px(24.0))
+                                            .h(px(24.0))
+                                            .rounded(px(6.0))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .hover(move |s| s.bg(theme.surface_active))
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.send(BackendCommand::QueueRemove(idx), cx);
                                                 cx.stop_propagation();
                                             }))
-                                            .child("x"),
+                                            .child(icons::icon(
+                                                icons::CLOSE,
+                                                12.5,
+                                                theme.text_muted,
+                                            )),
                                     ),
                             )
                     }))

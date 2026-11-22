@@ -1,5 +1,6 @@
 //! Settings, 7-band SVF Equalizer, Crossfade, Sleep Timer, Stream Backend,
-//! YouTube Auth (Secret Service), Spotify Importer, and Linux XDG paths (`W4-3`).
+//! YouTube Auth (Secret Service), Spotify Importer, and Linux XDG paths (`W4-3`)
+//! with crisp vector SVG section headers and clean interactive controls.
 
 use bitchord_audio::PRESETS as SLEEP_PRESETS;
 use bitchord_dsp_core::{EqLayout, EqualizerPreset};
@@ -8,6 +9,7 @@ use gpui::{Context, FontWeight, Window, div, px};
 
 use crate::app::BitChordApp;
 use crate::backend::{AppBackend, BackendCommand, StreamBackendChoice};
+use crate::icons;
 use crate::theme::{ActiveTheme, BitChordTheme};
 
 const BAND_LABELS: [&str; EqLayout::MANUAL_COUNT] = [
@@ -47,14 +49,21 @@ impl BitChordApp {
             .max_w(px(860.0))
             .child(
                 div()
-                    .text_size(px(24.0))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme.text_primary)
-                    .child("Settings & Audio DSP"),
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(icons::icon(icons::SETTINGS, 22.0, theme.accent))
+                    .child(
+                        div()
+                            .text_size(px(24.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme.text_primary)
+                            .child("Settings & Audio DSP"),
+                    ),
             )
             // 1. Appearance & Desktop Integration
             .child(
-                section_card("Appearance & Linux Desktop", theme).child(
+                section_card("Appearance & Linux Desktop", icons::SPARKLES, theme).child(
                     div()
                         .flex()
                         .flex_wrap()
@@ -106,7 +115,7 @@ impl BitChordApp {
             )
             // 2. Playback & Crossfade + Stream Backend (ADR-004)
             .child(
-                section_card("Playback, Crossfade & Stream Backend", theme)
+                section_card("Playback, Crossfade & Stream Backend", icons::DISC, theme)
                     .child(
                         div()
                             .flex()
@@ -224,7 +233,7 @@ impl BitChordApp {
             )
             // 3. 7-Band SVF Equalizer
             .child(
-                section_card("Equalizer (10-Slot Float32 SVF)", theme)
+                section_card("Equalizer (10-Slot Float32 SVF)", icons::SLIDERS, theme)
                     .child(
                         div()
                             .flex()
@@ -287,8 +296,8 @@ impl BitChordApp {
                             let db = self.eq_bands_db[band];
                             div()
                                 .w(px(104.0))
-                                .p(px(8.0))
-                                .rounded(px(8.0))
+                                .p(px(9.0))
+                                .rounded(px(10.0))
                                 .bg(theme.surface_elevated)
                                 .border_1()
                                 .border_color(theme.border)
@@ -318,7 +327,7 @@ impl BitChordApp {
                                                 .id(("eq-band-dn", band))
                                                 .w(px(26.0))
                                                 .h(px(24.0))
-                                                .rounded(px(5.0))
+                                                .rounded(px(6.0))
                                                 .bg(theme.surface)
                                                 .flex()
                                                 .items_center()
@@ -342,14 +351,18 @@ impl BitChordApp {
                                                     );
                                                     cx.notify();
                                                 }))
-                                                .child("-"),
+                                                .child(icons::icon(
+                                                    icons::WIN_MIN,
+                                                    12.0,
+                                                    theme.text_primary,
+                                                )),
                                         )
                                         .child(
                                             div()
                                                 .id(("eq-band-up", band))
                                                 .w(px(26.0))
                                                 .h(px(24.0))
-                                                .rounded(px(5.0))
+                                                .rounded(px(6.0))
                                                 .bg(theme.surface)
                                                 .flex()
                                                 .items_center()
@@ -373,7 +386,11 @@ impl BitChordApp {
                                                     );
                                                     cx.notify();
                                                 }))
-                                                .child("+"),
+                                                .child(icons::icon(
+                                                    icons::PLUS,
+                                                    12.0,
+                                                    theme.text_primary,
+                                                )),
                                         ),
                                 )
                         }),
@@ -381,7 +398,7 @@ impl BitChordApp {
             )
             // 4. Monotonic Sleep Timer
             .child(
-                section_card("Sleep Timer", theme).child(
+                section_card("Sleep Timer", icons::TIMER, theme).child(
                     div()
                         .flex()
                         .flex_wrap()
@@ -421,7 +438,7 @@ impl BitChordApp {
             )
             // 5. YouTube Music Auth (Linux Secret Service) + Spotify Playlist Import
             .child(
-                section_card("YouTube Music Auth & Spotify Import", theme)
+                section_card("YouTube Music Auth & Spotify Import", icons::INFO, theme)
                     .child(
                         div()
                             .flex()
@@ -469,7 +486,7 @@ impl BitChordApp {
             )
             // 6. XDG Linux Storage Paths
             .child(
-                section_card("Linux XDG Directories", theme).child(
+                section_card("Linux XDG Directories", icons::FOLDER, theme).child(
                     div()
                         .flex()
                         .flex_col()
@@ -488,10 +505,10 @@ impl BitChordApp {
     }
 }
 
-fn section_card(title: &'static str, theme: BitChordTheme) -> gpui::Div {
+fn section_card(title: &'static str, icon_bytes: &'static [u8], theme: BitChordTheme) -> gpui::Div {
     div()
         .p(px(16.0))
-        .rounded(px(10.0))
+        .rounded(px(12.0))
         .bg(theme.surface)
         .border_1()
         .border_color(theme.border)
@@ -500,10 +517,17 @@ fn section_card(title: &'static str, theme: BitChordTheme) -> gpui::Div {
         .gap(px(12.0))
         .child(
             div()
-                .text_size(px(14.5))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.text_primary)
-                .child(title),
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(icons::icon(icon_bytes, 16.0, theme.accent))
+                .child(
+                    div()
+                        .text_size(px(14.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.text_primary)
+                        .child(title),
+                ),
         )
 }
 
@@ -518,7 +542,7 @@ fn toggle_chip(
         .id(id)
         .h(px(32.0))
         .px(px(12.0))
-        .rounded(px(7.0))
+        .rounded(px(8.0))
         .bg(if active {
             theme.accent_soft
         } else {

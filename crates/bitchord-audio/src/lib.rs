@@ -18,7 +18,8 @@ pub mod sleep_timer;
 pub mod time_stretch;
 
 pub use chunked_source::{
-    ChunkedRangeSource, DEFAULT_CHUNK_BYTES, MAX_CACHE_BYTES, MAX_EMPTY_RANGES, RefusalCallback,
+    ChunkedRangeSource, DEFAULT_CHUNK_BYTES, MAX_CACHE_BYTES, MAX_EMPTY_RANGES,
+    PREFETCH_CHUNKS_AHEAD, RefusalCallback,
 };
 pub use crossfade::{
     BAIL_STEP_MS, CrossfadeGains, CrossfadePhase, CrossfadeState, DeckId, HANDOFF_AT,
@@ -33,7 +34,7 @@ pub use dsp::{
 };
 pub use engine::{
     AudioEngine, AudioSourceSpec, EngineError, HeadlessPlaybackReport, PlaybackSnapshot,
-    PlaybackState,
+    PlaybackState, open_http_decoder,
 };
 pub use mpris::{
     BitChordMprisPlayer, DESKTOP_ENTRY, IDENTITY, LoopStatus, MPRIS_BUS_SUFFIX, MprisCommand,

@@ -7,6 +7,7 @@ use gpui::{Context, FontWeight, Window, div, px};
 
 use crate::app::BitChordApp;
 use crate::backend::BackendCommand;
+use crate::icons;
 
 impl BitChordApp {
     pub fn render_party(&self, _window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -35,10 +36,17 @@ impl BitChordApp {
                     .gap(px(4.0))
                     .child(
                         div()
-                            .text_size(px(24.0))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(theme.text_primary)
-                            .child("Listen Together"),
+                            .flex()
+                            .items_center()
+                            .gap(px(10.0))
+                            .child(icons::icon(icons::USERS, 22.0, theme.accent))
+                            .child(
+                                div()
+                                    .text_size(px(24.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(theme.text_primary)
+                                    .child("Listen Together"),
+                            ),
                     )
                     .child(
                         div()
@@ -51,7 +59,7 @@ impl BitChordApp {
             .child(
                 div()
                     .p(px(16.0))
-                    .rounded(px(10.0))
+                    .rounded(px(12.0))
                     .bg(theme.surface)
                     .border_1()
                     .border_color(theme.border)
@@ -74,14 +82,15 @@ impl BitChordApp {
                             .child(
                                 div()
                                     .id("party-probe-btn")
-                                    .h(px(36.0))
+                                    .h(px(38.0))
                                     .px(px(14.0))
-                                    .rounded(px(8.0))
+                                    .rounded(px(10.0))
                                     .bg(theme.surface_elevated)
                                     .border_1()
                                     .border_color(theme.border)
                                     .flex()
                                     .items_center()
+                                    .gap(px(6.0))
                                     .cursor_pointer()
                                     .text_size(px(12.5))
                                     .text_color(theme.text_primary)
@@ -91,6 +100,7 @@ impl BitChordApp {
                                             this.party_server_input.read(cx).text().to_owned();
                                         this.send(BackendCommand::PartyProbeServer(url), cx);
                                     }))
+                                    .child(icons::icon(icons::REFRESH, 14.0, theme.text_secondary))
                                     .child("Check /healthz"),
                             ),
                     )
@@ -118,7 +128,7 @@ impl BitChordApp {
 
                 div()
                     .p(px(18.0))
-                    .rounded(px(10.0))
+                    .rounded(px(12.0))
                     .bg(theme.surface)
                     .border_1()
                     .border_color(theme.accent)
@@ -156,12 +166,13 @@ impl BitChordApp {
                             .child(
                                 div()
                                     .id("party-leave-btn")
-                                    .h(px(34.0))
+                                    .h(px(36.0))
                                     .px(px(14.0))
-                                    .rounded(px(8.0))
+                                    .rounded(px(9.0))
                                     .bg(theme.danger)
                                     .flex()
                                     .items_center()
+                                    .gap(px(6.0))
                                     .cursor_pointer()
                                     .text_size(px(12.5))
                                     .font_weight(FontWeight::SEMIBOLD)
@@ -169,6 +180,7 @@ impl BitChordApp {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.send(BackendCommand::PartyLeave, cx);
                                     }))
+                                    .child(icons::icon(icons::CLOSE, 14.0, theme.on_accent))
                                     .child("Leave Party"),
                             ),
                     )
@@ -181,7 +193,7 @@ impl BitChordApp {
                                 div()
                                     .px(px(12.0))
                                     .py(px(8.0))
-                                    .rounded(px(6.0))
+                                    .rounded(px(8.0))
                                     .bg(theme.surface_elevated)
                                     .flex()
                                     .items_center()
@@ -195,9 +207,9 @@ impl BitChordApp {
                                     .when(m.is_host, |el| {
                                         el.child(
                                             div()
-                                                .px(px(6.0))
+                                                .px(px(7.0))
                                                 .py(px(2.0))
-                                                .rounded(px(4.0))
+                                                .rounded(px(5.0))
                                                 .bg(theme.accent_soft)
                                                 .text_size(px(10.5))
                                                 .font_weight(FontWeight::BOLD)
@@ -211,7 +223,7 @@ impl BitChordApp {
             } else {
                 div()
                     .p(px(16.0))
-                    .rounded(px(10.0))
+                    .rounded(px(12.0))
                     .bg(theme.surface)
                     .border_1()
                     .border_color(theme.border)
@@ -234,12 +246,13 @@ impl BitChordApp {
                             .child(
                                 div()
                                     .id("party-join-btn")
-                                    .h(px(36.0))
+                                    .h(px(38.0))
                                     .px(px(16.0))
-                                    .rounded(px(8.0))
+                                    .rounded(px(10.0))
                                     .bg(theme.accent)
                                     .flex()
                                     .items_center()
+                                    .gap(px(6.0))
                                     .cursor_pointer()
                                     .text_size(px(13.0))
                                     .font_weight(FontWeight::SEMIBOLD)
@@ -249,19 +262,21 @@ impl BitChordApp {
                                             this.party_code_input.read(cx).text().to_owned();
                                         this.join_party(code, cx);
                                     }))
+                                    .child(icons::icon(icons::USERS, 14.5, theme.on_accent))
                                     .child("Join Room"),
                             )
                             .child(
                                 div()
                                     .id("party-create-btn")
-                                    .h(px(36.0))
+                                    .h(px(38.0))
                                     .px(px(16.0))
-                                    .rounded(px(8.0))
+                                    .rounded(px(10.0))
                                     .bg(theme.surface_elevated)
                                     .border_1()
                                     .border_color(theme.border)
                                     .flex()
                                     .items_center()
+                                    .gap(px(6.0))
                                     .cursor_pointer()
                                     .text_size(px(13.0))
                                     .font_weight(FontWeight::MEDIUM)
@@ -280,6 +295,7 @@ impl BitChordApp {
                                             cx,
                                         );
                                     }))
+                                    .child(icons::icon(icons::PLUS, 14.5, theme.text_secondary))
                                     .child("Create Room"),
                             ),
                     )

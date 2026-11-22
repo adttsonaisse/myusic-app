@@ -1,25 +1,44 @@
 //! Full-bleed Now Playing stage (`W4-3`) over the 64x64 BGRA dynamic artwork
-//! mesh backdrop, combining large cover art, real-time transport/DSP controls,
-//! collapsible measured `NerdStats` telemetry, and Apple-like 60fps word-synced
-//! lyrics via GPUI's variable-height `list()`.
+//! mesh backdrop, combining large cover art, continuous pill scrubber (`notes.md` #4),
+//! vector icon transport/DSP controls (`notes.md` #5), collapsible measured
+//! `NerdStats` telemetry, and smooth auto-scrolling pure-white lyrics (`notes.md` #3).
+
+use std::time::{Duration, Instant};
 
 use bitchord_audio::PlaybackState;
 use bitchord_lyrics::LyricLine;
 use gpui::prelude::*;
-use gpui::{Context, FontWeight, ObjectFit, div, img, list, px, rgba};
+use gpui::{Context, FontWeight, ObjectFit, Rgba, div, img, list, px, rgba};
 
 use crate::app::{BitChordApp, LoadState, format_time_ms};
+use crate::artwork::song_thumbnail_url;
 use crate::backend::BackendCommand;
+use crate::icons;
+use crate::pill_slider::pill_slider;
 use crate::theme::rgba_hex;
 
 const SPEEDS: [f32; 6] = [0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+
+#[inline]
+fn white_alpha(alpha: f32) -> Rgba {
+    let a = (alpha.clamp(0.0, 1.0) * 255.0).round() as u32;
+    rgba(0xFFFF_FF00 | a)
+}
+
+#[inline]
+fn ease_out_cubic(t: f32) -> f32 {
+    let inv = 1.0 - t.clamp(0.0, 1.0);
+    1.0 - inv * inv * inv
+}
 
 impl BitChordApp {
     pub fn render_now_playing(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme();
         let mesh = self.active_mesh_image();
         let song = self.playback.current_song.as_ref();
+        let art_url = song.and_then(song_thumbnail_url);
         let is_playing = self.playback.state == PlaybackState::Playing;
+        let is_buffering = self.playback.state == PlaybackState::Buffering;
         let pos_ms = self.live_position_ms();
         let dur_ms = self.playback.duration_ms;
         let progress = if dur_ms > 0 {
@@ -31,7 +50,7 @@ impl BitChordApp {
         // Text on the darkened Now Playing mesh backdrop stays crisp white (>7:1 contrast).
         let ink_primary = rgba_hex(0xFFFF_FFFF);
         let ink_secondary = rgba_hex(0xFFFF_FFB8);
-        let ink_dim = rgba_hex(0xFFFF_FF66);
+        let ink_dim = rgba_hex(0xFFFF_FF70);
         let surface_chip = rgba_hex(0xFFFF_FF18);
         let surface_chip_hover = rgba_hex(0xFFFF_FF29);
         let chip_border = rgba_hex(0xFFFF_FF24);
@@ -40,18 +59,14 @@ impl BitChordApp {
             .relative()
             .size_full()
             .overflow_hidden()
-            // Layer 0: 64x64 Oklab bilinear-upscaled dynamic artwork mesh backdrop
+            // Layer 0: 64x64 bilinear-upscaled dynamic artwork mesh backdrop
             .child(
                 div()
                     .absolute()
                     .inset_0()
-                    .child(
-                        img(mesh)
-                            .size_full()
-                            .object_fit(ObjectFit::Fill),
-                    ),
+                    .child(img(mesh).size_full().object_fit(ObjectFit::Fill)),
             )
-            // Layer 1: 2-column desktop stage (Artwork + Controls | Word-Synced Lyrics)
+            // Layer 1: 2-column desktop stage (Artwork + Controls | Auto-Scrolling Lyrics)
             .child(
                 div()
                     .relative()
@@ -60,13 +75,13 @@ impl BitChordApp {
                     .py(px(28.0))
                     .flex()
                     .flex_row()
-                    .gap(px(40.0))
+                    .gap(px(44.0))
                     .overflow_hidden()
-                    // Left column: Album art + metadata + scrubber + DSP toggles + Nerd Stats
+                    // Left column: Album art + metadata + continuous pill scrubber + DSP controls
                     .child(
                         div()
                             .id("np-left-scroll")
-                            .w(px(380.0))
+                            .w(px(364.0))
                             .flex_shrink_0()
                             .h_full()
                             .overflow_y_scroll()
@@ -77,36 +92,40 @@ impl BitChordApp {
                             .child(
                                 div()
                                     .id("np-back-btn")
-                                    .w(px(124.0))
-                                    .h(px(30.0))
-                                    .px(px(10.0))
-                                    .rounded(px(6.0))
+                                    .w(px(142.0))
+                                    .h(px(32.0))
+                                    .px(px(11.0))
+                                    .rounded(px(8.0))
                                     .bg(surface_chip)
                                     .border_1()
                                     .border_color(chip_border)
                                     .flex()
                                     .items_center()
+                                    .gap(px(6.0))
                                     .cursor_pointer()
-                                    .text_size(px(12.0))
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::MEDIUM)
                                     .text_color(ink_primary)
                                     .hover(move |s| s.bg(surface_chip_hover))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.route = this.previous_route.clone();
                                         cx.notify();
                                     }))
-                                    .child("< Back to Browse"),
+                                    .child(icons::icon(icons::CHEVRON_LEFT, 15.0, ink_primary))
+                                    .child("Back to Browse"),
                             )
                             // Artwork
                             .child(self.render_art_box(
-                                song.and_then(|s| s.thumbnail_url.as_deref()),
+                                art_url.as_deref(),
                                 320.0,
-                                14.0,
-                                "BC",
+                                16.0,
+                                icons::DISC,
                                 theme,
                             ))
                             // Title + Artist + Album
                             .child(
                                 div()
+                                    .w(px(320.0))
                                     .flex()
                                     .flex_col()
                                     .gap(px(4.0))
@@ -125,9 +144,19 @@ impl BitChordApp {
                                         div()
                                             .text_size(px(14.5))
                                             .text_color(ink_secondary)
-                                            .child(song.map(|s| s.artist.clone()).unwrap_or_else(
-                                                || "Select any song from Home, Search, or Library".to_owned(),
-                                            )),
+                                            .child(if is_buffering {
+                                                format!(
+                                                    "Loading · {}",
+                                                    song.map(|s| s.artist.as_str()).unwrap_or("")
+                                                )
+                                            } else {
+                                                song.map(|s| s.artist.clone()).unwrap_or_else(
+                                                    || {
+                                                        "Select any song from Home, Search, or Library"
+                                                            .to_owned()
+                                                    },
+                                                )
+                                            }),
                                     )
                                     .when_some(
                                         song.and_then(|s| s.album_name.clone()),
@@ -141,47 +170,28 @@ impl BitChordApp {
                                         },
                                     ),
                             )
-                            // Interactive scrubber
+                            // Single continuous smooth pill scrubber (`notes.md` #4)
                             .child(
                                 div()
                                     .w(px(320.0))
                                     .flex()
                                     .flex_col()
-                                    .gap(px(6.0))
-                                    .child(
-                                        div()
-                                            .w_full()
-                                            .h(px(14.0))
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(2.0))
-                                            .children((0usize..32).map(|step| {
-                                                let frac = (step as f32 + 0.5) / 32.0;
-                                                let filled = frac <= progress;
-                                                let target =
-                                                    ((step as f64 / 32.0) * dur_ms as f64) as u64;
-                                                div()
-                                                    .id(("np-seek-seg", step))
-                                                    .flex_1()
-                                                    .h(px(5.0))
-                                                    .rounded(px(2.5))
-                                                    .cursor_pointer()
-                                                    .bg(if filled {
-                                                        ink_primary
-                                                    } else {
-                                                        rgba_hex(0xFFFF_FF30)
-                                                    })
-                                                    .hover(move |s| s.bg(theme.accent))
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        if dur_ms > 0 {
-                                                            this.send(
-                                                                BackendCommand::SeekMs(target),
-                                                                cx,
-                                                            );
-                                                        }
-                                                    }))
-                                            })),
-                                    )
+                                    .gap(px(4.0))
+                                    .child(pill_slider(
+                                        "np-seek-pill",
+                                        progress,
+                                        6.5,
+                                        20.0,
+                                        rgba_hex(0xFFFF_FF30),
+                                        ink_primary,
+                                        self.np_seek_bounds.clone(),
+                                        cx.listener(|this, &frac: &f32, _w, cx| {
+                                            this.seek_fraction(frac, false, cx);
+                                        }),
+                                        cx.listener(|this, &frac: &f32, _w, cx| {
+                                            this.seek_fraction(frac, true, cx);
+                                        }),
+                                    ))
                                     .child(
                                         div()
                                             .flex()
@@ -192,7 +202,7 @@ impl BitChordApp {
                                             .child(format_time_ms(dur_ms)),
                                     ),
                             )
-                            // Transport row
+                            // Vector icon transport row
                             .child(
                                 div()
                                     .w(px(320.0))
@@ -201,57 +211,126 @@ impl BitChordApp {
                                     .justify_between()
                                     .child(
                                         div()
-                                            .id("np-prev")
-                                            .px(px(14.0))
+                                            .id("np-shuffle")
+                                            .w(px(38.0))
                                             .h(px(38.0))
-                                            .rounded(px(8.0))
+                                            .rounded(px(10.0))
+                                            .bg(if self.queue.shuffle {
+                                                surface_chip_hover
+                                            } else {
+                                                gpui::transparent_black()
+                                            })
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .hover(move |s| s.bg(surface_chip_hover))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.send(BackendCommand::ToggleShuffle, cx);
+                                            }))
+                                            .child(icons::icon(
+                                                icons::SHUFFLE,
+                                                17.0,
+                                                if self.queue.shuffle {
+                                                    ink_primary
+                                                } else {
+                                                    ink_dim
+                                                },
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("np-prev")
+                                            .w(px(44.0))
+                                            .h(px(44.0))
+                                            .rounded(px(12.0))
                                             .bg(surface_chip)
                                             .flex()
                                             .items_center()
+                                            .justify_center()
                                             .cursor_pointer()
-                                            .text_color(ink_primary)
                                             .hover(move |s| s.bg(surface_chip_hover))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.send(BackendCommand::PrevTrack, cx);
                                             }))
-                                            .child("Prev"),
+                                            .child(icons::icon(icons::SKIP_PREV, 20.0, ink_primary)),
                                     )
                                     .child(
                                         div()
                                             .id("np-play-pause")
-                                            .px(px(26.0))
-                                            .h(px(42.0))
-                                            .rounded(px(21.0))
-                                            .bg(theme.accent)
+                                            .w(px(54.0))
+                                            .h(px(54.0))
+                                            .rounded_full()
+                                            .bg(ink_primary)
                                             .flex()
                                             .items_center()
+                                            .justify_center()
                                             .cursor_pointer()
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(theme.on_accent)
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.send(BackendCommand::PlayPause, cx);
                                             }))
-                                            .child(if is_playing { "Pause" } else { "Play" }),
+                                            .child(icons::icon(
+                                                if is_playing {
+                                                    icons::PAUSE
+                                                } else {
+                                                    icons::PLAY
+                                                },
+                                                22.0,
+                                                rgba_hex(0x0D0D_0FFF),
+                                            )),
                                     )
                                     .child(
                                         div()
                                             .id("np-next")
-                                            .px(px(14.0))
-                                            .h(px(38.0))
-                                            .rounded(px(8.0))
+                                            .w(px(44.0))
+                                            .h(px(44.0))
+                                            .rounded(px(12.0))
                                             .bg(surface_chip)
                                             .flex()
                                             .items_center()
+                                            .justify_center()
                                             .cursor_pointer()
-                                            .text_color(ink_primary)
                                             .hover(move |s| s.bg(surface_chip_hover))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.send(BackendCommand::NextTrack, cx);
                                             }))
-                                            .child("Next"),
+                                            .child(icons::icon(icons::SKIP_NEXT, 20.0, ink_primary)),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("np-repeat")
+                                            .w(px(38.0))
+                                            .h(px(38.0))
+                                            .rounded(px(10.0))
+                                            .bg(if self.queue.repeat_all || self.queue.repeat_one {
+                                                surface_chip_hover
+                                            } else {
+                                                gpui::transparent_black()
+                                            })
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .hover(move |s| s.bg(surface_chip_hover))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.send(BackendCommand::CycleRepeat, cx);
+                                            }))
+                                            .child(icons::icon(
+                                                if self.queue.repeat_one {
+                                                    icons::REPEAT_ONE
+                                                } else {
+                                                    icons::REPEAT
+                                                },
+                                                17.0,
+                                                if self.queue.repeat_all || self.queue.repeat_one {
+                                                    ink_primary
+                                                } else {
+                                                    ink_dim
+                                                },
+                                            )),
                                     ),
                             )
-                            // Quick DSP chips: Speed, Skip Silence, Spatial, Nerd Stats
+                            // Quick DSP chips: Speed, Skip Silence, Spatial, Stats for Nerds
                             .child(
                                 div()
                                     .w(px(320.0))
@@ -262,13 +341,14 @@ impl BitChordApp {
                                         div()
                                             .id("np-speed")
                                             .px(px(10.0))
-                                            .h(px(28.0))
-                                            .rounded(px(6.0))
+                                            .h(px(30.0))
+                                            .rounded(px(8.0))
                                             .bg(surface_chip)
                                             .border_1()
                                             .border_color(chip_border)
                                             .flex()
                                             .items_center()
+                                            .gap(px(5.0))
                                             .cursor_pointer()
                                             .text_size(px(11.5))
                                             .text_color(ink_primary)
@@ -282,22 +362,23 @@ impl BitChordApp {
                                                     .unwrap_or(SPEEDS[0]);
                                                 this.send(BackendCommand::SetSpeed(next), cx);
                                             }))
-                                            .child(format!("{:.2}x Speed", self.playback.speed)),
+                                            .child(icons::icon(icons::TIMER, 13.0, ink_secondary))
+                                            .child(format!("{:.2}x", self.playback.speed)),
                                     )
                                     .child(
                                         div()
                                             .id("np-skip-silence")
                                             .px(px(10.0))
-                                            .h(px(28.0))
-                                            .rounded(px(6.0))
+                                            .h(px(30.0))
+                                            .rounded(px(8.0))
                                             .bg(if self.playback.skip_silence {
-                                                theme.accent_soft
+                                                rgba_hex(0xFFFF_FF30)
                                             } else {
                                                 surface_chip
                                             })
                                             .border_1()
                                             .border_color(if self.playback.skip_silence {
-                                                theme.accent
+                                                ink_primary
                                             } else {
                                                 chip_border
                                             })
@@ -306,6 +387,7 @@ impl BitChordApp {
                                             .cursor_pointer()
                                             .text_size(px(11.5))
                                             .text_color(ink_primary)
+                                            .hover(move |s| s.bg(surface_chip_hover))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.send(
                                                     BackendCommand::SetSkipSilence(
@@ -320,24 +402,26 @@ impl BitChordApp {
                                         div()
                                             .id("np-spatial")
                                             .px(px(10.0))
-                                            .h(px(28.0))
-                                            .rounded(px(6.0))
+                                            .h(px(30.0))
+                                            .rounded(px(8.0))
                                             .bg(if self.playback.spatial_audio {
-                                                theme.accent_soft
+                                                rgba_hex(0xFFFF_FF30)
                                             } else {
                                                 surface_chip
                                             })
                                             .border_1()
                                             .border_color(if self.playback.spatial_audio {
-                                                theme.accent
+                                                ink_primary
                                             } else {
                                                 chip_border
                                             })
                                             .flex()
                                             .items_center()
+                                            .gap(px(5.0))
                                             .cursor_pointer()
                                             .text_size(px(11.5))
                                             .text_color(ink_primary)
+                                            .hover(move |s| s.bg(surface_chip_hover))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.send(
                                                     BackendCommand::SetSpatial(
@@ -346,35 +430,43 @@ impl BitChordApp {
                                                     cx,
                                                 );
                                             }))
+                                            .child(icons::icon(
+                                                icons::SPARKLES,
+                                                13.0,
+                                                ink_secondary,
+                                            ))
                                             .child("Spatial"),
                                     )
                                     .child(
                                         div()
                                             .id("np-nerd-toggle")
                                             .px(px(10.0))
-                                            .h(px(28.0))
-                                            .rounded(px(6.0))
+                                            .h(px(30.0))
+                                            .rounded(px(8.0))
                                             .bg(if self.nerd_stats_open {
-                                                theme.accent_soft
+                                                rgba_hex(0xFFFF_FF30)
                                             } else {
                                                 surface_chip
                                             })
                                             .border_1()
                                             .border_color(if self.nerd_stats_open {
-                                                theme.accent
+                                                ink_primary
                                             } else {
                                                 chip_border
                                             })
                                             .flex()
                                             .items_center()
+                                            .gap(px(5.0))
                                             .cursor_pointer()
                                             .text_size(px(11.5))
                                             .text_color(ink_primary)
+                                            .hover(move |s| s.bg(surface_chip_hover))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.nerd_stats_open = !this.nerd_stats_open;
                                                 cx.notify();
                                             }))
-                                            .child("Stats for Nerds"),
+                                            .child(icons::icon(icons::INFO, 13.0, ink_secondary))
+                                            .child("Stats"),
                                     ),
                             )
                             // Collapsible measured NerdStats panel
@@ -384,7 +476,7 @@ impl BitChordApp {
                                     div()
                                         .w(px(320.0))
                                         .p(px(12.0))
-                                        .rounded(px(8.0))
+                                        .rounded(px(10.0))
                                         .bg(rgba_hex(0x0000_0078))
                                         .border_1()
                                         .border_color(chip_border)
@@ -422,15 +514,21 @@ impl BitChordApp {
                                 )
                             }),
                     )
-                    // Right column: Apple-like Word-Synced Lyrics Stage
+                    // Right column: Smooth Auto-Scrolling Pure-White Lyrics Stage (`notes.md` #3)
                     .child(
                         div()
+                            .id("lyrics-stage")
                             .flex_1()
                             .min_w(px(0.0))
                             .h_full()
                             .flex()
                             .flex_col()
                             .gap(px(12.0))
+                            // Pause auto-scroll gracefully for 4s when the user manually scrolls lyrics.
+                            .on_scroll_wheel(cx.listener(|this, _ev, _w, _cx| {
+                                this.lyrics_manual_scroll_until =
+                                    Some(Instant::now() + Duration::from_secs(4));
+                            }))
                             // Lyrics header bar (provider provenance + translation button)
                             .child(
                                 div()
@@ -442,6 +540,7 @@ impl BitChordApp {
                                             .flex()
                                             .items_center()
                                             .gap(px(10.0))
+                                            .child(icons::icon(icons::LYRICS, 18.0, ink_primary))
                                             .child(
                                                 div()
                                                     .text_size(px(16.0))
@@ -461,7 +560,7 @@ impl BitChordApp {
                                                         div()
                                                             .px(px(8.0))
                                                             .py(px(2.0))
-                                                            .rounded(px(5.0))
+                                                            .rounded_full()
                                                             .bg(surface_chip)
                                                             .text_size(px(11.0))
                                                             .text_color(ink_secondary)
@@ -473,22 +572,23 @@ impl BitChordApp {
                                     .child(
                                         div()
                                             .id("lyrics-translate-en")
-                                            .px(px(10.0))
-                                            .h(px(28.0))
-                                            .rounded(px(6.0))
+                                            .px(px(11.0))
+                                            .h(px(30.0))
+                                            .rounded(px(8.0))
                                             .bg(if self.show_translated_lyrics {
-                                                theme.accent_soft
+                                                rgba_hex(0xFFFF_FF30)
                                             } else {
                                                 surface_chip
                                             })
                                             .border_1()
                                             .border_color(if self.show_translated_lyrics {
-                                                theme.accent
+                                                ink_primary
                                             } else {
                                                 chip_border
                                             })
                                             .flex()
                                             .items_center()
+                                            .gap(px(6.0))
                                             .cursor_pointer()
                                             .text_size(px(11.5))
                                             .text_color(ink_primary)
@@ -506,6 +606,11 @@ impl BitChordApp {
                                                 }
                                                 cx.notify();
                                             }))
+                                            .child(icons::icon(
+                                                icons::TRANSLATE,
+                                                14.0,
+                                                ink_primary,
+                                            ))
                                             .child(if self.show_translated_lyrics {
                                                 let lang = match &self.lyrics {
                                                     LoadState::Ready(p) => {
@@ -527,7 +632,9 @@ impl BitChordApp {
                                     .items_center()
                                     .text_size(px(15.0))
                                     .text_color(ink_secondary)
-                                    .child("Play a track to fetch synchronized lyrics across 17 providers.")
+                                    .child(
+                                        "Play a track to fetch synchronized lyrics across 17 providers.",
+                                    )
                                     .into_any_element(),
                                 LoadState::Loading => div()
                                     .flex_1()
@@ -563,14 +670,15 @@ impl BitChordApp {
                                             return div().into_any_element();
                                         };
                                         let pos_ms = this.live_position_ms() as i64;
-                                        let next_time = payload
-                                            .lines
-                                            .get(idx + 1)
-                                            .map(|l| l.time_ms)
-                                            .unwrap_or(i64::MAX);
-                                        let is_active =
-                                            pos_ms >= line.time_ms && pos_ms < next_time;
-                                        let is_past = pos_ms >= next_time;
+                                        let is_active = this.active_lyric_idx == Some(idx);
+                                        let was_prev_active = this.prev_lyric_idx == Some(idx);
+                                        let is_past = this
+                                            .active_lyric_idx
+                                            .is_some_and(|act| idx < act);
+                                        let transition_t = ease_out_cubic(
+                                            this.lyric_transition_at.elapsed().as_secs_f32()
+                                                / 0.42,
+                                        );
                                         let translated_text = if this.show_translated_lyrics {
                                             payload
                                                 .translated_lines
@@ -586,7 +694,9 @@ impl BitChordApp {
                                             line,
                                             pos_ms,
                                             is_active,
+                                            was_prev_active,
                                             is_past,
+                                            transition_t,
                                             translated_text,
                                             cx,
                                         )
@@ -602,58 +712,80 @@ impl BitChordApp {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_lyric_line_row(
     idx: usize,
     line: &LyricLine,
     pos_ms: i64,
     is_active: bool,
+    was_prev_active: bool,
     is_past: bool,
+    transition_t: f32,
     translated_text: Option<String>,
     cx: &mut Context<BitChordApp>,
 ) -> impl IntoElement {
     let seek_ms = line.time_ms.max(0) as u64;
-    let base_color = if is_active {
-        rgba(0xFFFF_FFFF)
+
+    // Smooth pure-white opacity & horizontal focus glide (zero harsh red color jumps!).
+    let line_alpha = if is_active {
+        0.48 + 0.52 * transition_t
+    } else if was_prev_active {
+        1.0 - 0.66 * transition_t
     } else if is_past {
-        rgba(0xFFFF_FF66)
+        0.34
     } else {
-        rgba(0xFFFF_FF8C)
+        0.46
+    };
+    let left_pad = if is_active {
+        14.0 + 7.0 * transition_t
+    } else if was_prev_active {
+        14.0 + 7.0 * (1.0 - transition_t)
+    } else {
+        14.0
+    };
+    let focus_bg_alpha = if is_active {
+        0.075 * transition_t
+    } else if was_prev_active {
+        0.075 * (1.0 - transition_t)
+    } else {
+        0.0
     };
 
     let content = if !line.words.is_empty() && is_active {
-        // Word-by-word & syllable-accurate illumination using `LyricWord::chars_sung_at`
+        // Continuous liquid pure-white luminance sweep across each word as it is sung.
         div()
             .flex()
             .flex_wrap()
-            .gap_x(px(7.0))
-            .gap_y(px(2.0))
+            .gap_x(px(7.5))
+            .gap_y(px(3.0))
             .children(line.words.iter().map(|word| {
                 let total_chars = word.text.chars().count().max(1) as f32;
                 let sung = word.chars_sung_at(pos_ms);
-                let frac = (sung / total_chars).clamp(0.0, 1.0);
-                let word_color = if frac >= 0.85 {
-                    rgba(0xFFFF_FFFF)
-                } else if frac > 0.05 {
-                    rgba(0xFA2D_48FF) // live active word sweep in BitChord crimson
-                } else {
-                    rgba(0xFFFF_FF75)
-                };
+                let frac = ease_out_cubic((sung / total_chars).clamp(0.0, 1.0));
+                let word_alpha = (0.42 + 0.58 * frac).max(0.45 * transition_t);
                 div()
-                    .text_size(px(24.0))
+                    .text_size(px(25.0))
                     .font_weight(FontWeight::BOLD)
-                    .text_color(word_color)
+                    .text_color(white_alpha(word_alpha))
                     .child(word.text.clone())
             }))
             .into_any_element()
     } else {
+        let size = if is_active {
+            21.0 + 4.0 * transition_t
+        } else if was_prev_active {
+            21.0 + 4.0 * (1.0 - transition_t)
+        } else {
+            20.5
+        };
         div()
-            .text_size(if is_active { px(24.0) } else { px(20.0) })
+            .text_size(px(size))
             .font_weight(if is_active {
                 FontWeight::BOLD
             } else {
                 FontWeight::SEMIBOLD
             })
-            .text_color(base_color)
+            .text_color(white_alpha(line_alpha))
             .child(line.text.clone())
             .into_any_element()
     };
@@ -661,23 +793,27 @@ fn render_lyric_line_row(
     div()
         .id(("lyric-line", idx))
         .w_full()
-        .py(px(10.0))
-        .px(px(12.0))
-        .rounded(px(8.0))
+        .py(px(12.0))
+        .pl(px(left_pad))
+        .pr(px(14.0))
+        .rounded(px(12.0))
+        .bg(white_alpha(focus_bg_alpha))
         .cursor_pointer()
-        .hover(|s| s.bg(rgba_hex(0xFFFF_FF10)))
+        .hover(|s| s.bg(rgba_hex(0xFFFF_FF14)))
         .on_click(cx.listener(move |this, _, _, cx| {
+            // Clicking any line immediately resumes auto-scroll and seeks cleanly.
+            this.lyrics_manual_scroll_until = None;
             this.send(BackendCommand::SeekMs(seek_ms), cx);
         }))
         .flex()
         .flex_col()
-        .gap(px(4.0))
+        .gap(px(5.0))
         .child(content)
         .when_some(translated_text, |el, tr| {
             el.child(
                 div()
                     .text_size(px(14.0))
-                    .text_color(rgba(0xFFFF_FFA8))
+                    .text_color(white_alpha(if is_active { 0.78 } else { 0.42 }))
                     .child(tr),
             )
         })

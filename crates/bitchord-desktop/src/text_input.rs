@@ -2,7 +2,8 @@
 //!
 //! Uses `.key_context("TextInput")` so global single-key player shortcuts
 //! (`space`, `m`, `q`, `l`) never hijack typing, handles Wayland/X11 `key_char`
-//! commits, Ctrl+V paste, Ctrl+U clear, Backspace, Escape blur, and Enter submit.
+//! commits, Ctrl+V paste, Ctrl+U clear, Backspace, Escape blur, Enter submit,
+//! and live `Changed(String)` emissions for debounced search suggestions.
 
 use gpui::prelude::*;
 use gpui::{
@@ -15,6 +16,7 @@ use crate::theme::{ActiveTheme, BitChordTheme, ThemeMode};
 /// Events emitted by [`TextInput`] to its parent view.
 #[derive(Debug, Clone)]
 pub enum TextInputEvent {
+    Changed(String),
     Submitted(String),
 }
 
@@ -69,6 +71,7 @@ impl TextInput {
         }
         if ks.key == "backspace" {
             if self.value.pop().is_some() {
+                cx.emit(TextInputEvent::Changed(self.value.clone()));
                 cx.notify();
             }
             cx.stop_propagation();
@@ -79,6 +82,7 @@ impl TextInput {
                 "u" => {
                     if !self.value.is_empty() {
                         self.value.clear();
+                        cx.emit(TextInputEvent::Changed(self.value.clone()));
                         cx.notify();
                     }
                     cx.stop_propagation();
@@ -90,6 +94,7 @@ impl TextInput {
                     {
                         let single_line = text.replace(['\r', '\n'], " ");
                         self.value.push_str(&single_line);
+                        cx.emit(TextInputEvent::Changed(self.value.clone()));
                         cx.notify();
                     }
                     cx.stop_propagation();
@@ -106,6 +111,7 @@ impl TextInput {
             && !ch.chars().all(char::is_control)
         {
             self.value.push_str(ch);
+            cx.emit(TextInputEvent::Changed(self.value.clone()));
             cx.notify();
             cx.stop_propagation();
         }
@@ -147,11 +153,11 @@ impl TextInput {
                 }),
             )
             .w_full()
-            .h(px(36.0))
-            .px(px(12.0))
+            .h(px(38.0))
+            .px(px(13.0))
             .flex()
             .items_center()
-            .rounded(px(8.0))
+            .rounded(px(10.0))
             .bg(theme.surface_elevated)
             .border_1()
             .border_color(border_col)

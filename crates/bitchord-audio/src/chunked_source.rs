@@ -1,23 +1,38 @@
-//! Bounded HTTP `Range` [`MediaSource`] defeating `googlevideo.com`'s ~15.5 kB/s
-//! unbounded stream throttling (`ChunkedDataSource.kt`).
+//! Progressive-streaming, read-ahead bounded HTTP `Range` [`MediaSource`]
+//! defeating `googlevideo.com`'s ~15.5 kB/s unbounded stream throttling while
+//! eliminating startup stalls and chunk-boundary audio dropouts.
 //!
-//! Fetches bounded `1 MiB` ranges (capped by `PlayerClient::range_bytes_for(url)`
-//! and `clen`), verifies `206 Partial Content`, caches recent chunks in memory for
-//! instant backward seeks, retries truncated ranges up to `MAX_EMPTY_RANGES = 3`,
-//! and reports HTTP `403`/`404`/`410` refusals back to `StreamResolver`.
+//! Architecture:
+//! - Uses bounded `128 KiB` ranges (capped by `PlayerClient::range_bytes_for(url)`
+//!   and `clen`), completing rapidly even on 200 KB/s links and keeping EOF Cues/moov
+//!   seeks small.
+//! - Streams each chunk progressively via `resp.chunk().await` into a shared
+//!   `Mutex + Condvar` buffer so `symphonia` parses headers and starts decoding
+//!   at first-byte TTFB (~150 ms) instead of blocking on a full 1 MiB download.
+//! - Proactively prefetches the next `PREFETCH_CHUNKS_AHEAD = 2` chunks
+//!   (`256 KiB`, ~14 seconds of Opus audio) asynchronously on Tokio so crossing
+//!   chunk boundaries never stalls the decode thread.
+//! - Cancels all in-flight Tokio fetch tasks immediately on `Drop`, caches recent
+//!   chunks up to `MAX_CACHE_BYTES = 32 MiB` for instant backward seeks, retries
+//!   truncated ranges up to `MAX_EMPTY_RANGES = 3`, and reports HTTP `403`/`404`/`410`
+//!   refusals back to `StreamResolver`.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use bitchord_innertube::{PlayerClient, ResolvedStream};
 use reqwest::Client;
 use symphonia::core::io::MediaSource;
 use tokio::runtime::Handle;
+use tokio::task::JoinHandle;
 
-/// Default bounded range request size (1 MiB, matching `linux-audio-engine.md` §4).
-pub const DEFAULT_CHUNK_BYTES: u64 = 1_048_576;
+/// Default bounded range request size (128 KiB — fast TTFB + small EOF cue seeks).
+pub const DEFAULT_CHUNK_BYTES: u64 = 131_072;
+/// Number of upcoming sequential chunks prefetched asynchronously ahead of read cursor.
+pub const PREFETCH_CHUNKS_AHEAD: u64 = 2;
 /// Maximum consecutive empty/truncated range attempts before signaling EOF.
 pub const MAX_EMPTY_RANGES: usize = 3;
 /// Maximum in-memory cached chunk bytes per active stream (32 MiB).
@@ -27,19 +42,81 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// Refusal callback invoked when an HTTP range fetch receives 403/404/410.
 pub type RefusalCallback = Arc<dyn Fn(&str, u16) + Send + Sync>;
 
-/// Seekable HTTP range [`MediaSource`] for `symphonia` on the decode thread.
+struct ChunkBuffer {
+    bytes: Vec<u8>,
+    done: bool,
+    header_ready: bool,
+    discovered_total: Option<u64>,
+    error: Option<(io::ErrorKind, String)>,
+}
+
+struct ChunkSlot {
+    state: Mutex<ChunkBuffer>,
+    ready: Condvar,
+}
+
+impl ChunkSlot {
+    fn new(expected_capacity: usize) -> Self {
+        Self {
+            state: Mutex::new(ChunkBuffer {
+                bytes: Vec::with_capacity(expected_capacity.min(262_144)),
+                done: false,
+                header_ready: false,
+                discovered_total: None,
+                error: None,
+            }),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn finish_with_error(&self, kind: io::ErrorKind, msg: String) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.error = Some((kind, msg));
+        guard.header_ready = true;
+        guard.done = true;
+        self.ready.notify_all();
+    }
+
+    fn finish_ok(&self) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.header_ready = true;
+        guard.done = true;
+        self.ready.notify_all();
+    }
+}
+
+/// Ensures any waiting reader wakes up even if the Tokio task is aborted/cancelled.
+struct SlotCompletionGuard(Arc<ChunkSlot>);
+
+impl Drop for SlotCompletionGuard {
+    fn drop(&mut self) {
+        let mut guard = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !guard.done {
+            guard.header_ready = true;
+            guard.done = true;
+            self.0.ready.notify_all();
+        }
+    }
+}
+
+struct ActiveChunk {
+    slot: Arc<ChunkSlot>,
+    task: JoinHandle<()>,
+}
+
+/// Seekable, progressive-streaming, read-ahead HTTP range [`MediaSource`] for `symphonia`.
 pub struct ChunkedRangeSource {
     http: Client,
     rt: Handle,
     url: String,
-    headers: Vec<(String, String)>,
+    headers: Arc<Vec<(String, String)>>,
     total_len: Option<u64>,
     chunk_bytes: u64,
     pos: u64,
-    cache: BTreeMap<u64, Vec<u8>>,
+    chunks: BTreeMap<u64, ActiveChunk>,
     cache_order: VecDeque<u64>,
-    cached_bytes: usize,
     on_refused: Option<RefusalCallback>,
+    cancel: Arc<AtomicBool>,
 }
 
 impl ChunkedRangeSource {
@@ -75,14 +152,15 @@ impl ChunkedRangeSource {
         )
     }
 
-    /// Creates a `ChunkedRangeSource` with explicit parameters, probing total byte length
-    /// via a single bounded range if `total_len` is `None`.
+    /// Creates a `ChunkedRangeSource` with explicit parameters, starting chunk 0
+    /// immediately when `total_len` is unknown so total byte length is discovered
+    /// without wasting a second request.
     pub fn new(
         http: Client,
         rt: Handle,
         url: String,
         headers: Vec<(String, String)>,
-        mut total_len: Option<u64>,
+        total_len: Option<u64>,
         chunk_bytes: u64,
         on_refused: Option<RefusalCallback>,
     ) -> Result<Self, io::Error> {
@@ -91,160 +169,302 @@ impl ChunkedRangeSource {
             http,
             rt,
             url,
-            headers,
+            headers: Arc::new(headers),
             total_len,
             chunk_bytes,
             pos: 0,
-            cache: BTreeMap::new(),
+            chunks: BTreeMap::new(),
             cache_order: VecDeque::new(),
-            cached_bytes: 0,
             on_refused,
+            cancel: Arc::new(AtomicBool::new(false)),
         };
 
-        if total_len.is_none() {
-            // Prime chunk 0 and learn total_len from Content-Range / Content-Length.
-            let (data, discovered_total) = src.fetch_range(0, chunk_bytes.min(65_536))?;
-            total_len = discovered_total.or(Some(data.len() as u64));
-            src.total_len = total_len;
-            if !data.is_empty()
-                && data.len() as u64 == chunk_bytes.min(total_len.unwrap_or(u64::MAX))
-            {
-                src.insert_cache(0, data);
+        if src.total_len.is_none() {
+            // Prime chunk 0 and wait only for its HTTP response headers (or error)
+            // to learn total_len from Content-Range / Content-Length.
+            if let Some(slot) = src.ensure_chunk_started(0) {
+                let mut guard = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+                while !guard.header_ready && !guard.done {
+                    guard = slot.ready.wait(guard).unwrap_or_else(|e| e.into_inner());
+                }
+                if let Some((kind, ref msg)) = guard.error {
+                    return Err(io::Error::new(kind, msg.clone()));
+                }
+                if let Some(discovered) = guard.discovered_total {
+                    src.total_len = Some(discovered);
+                } else {
+                    while !guard.done {
+                        guard = slot.ready.wait(guard).unwrap_or_else(|e| e.into_inner());
+                    }
+                    if let Some((kind, ref msg)) = guard.error {
+                        return Err(io::Error::new(kind, msg.clone()));
+                    }
+                    src.total_len = guard.discovered_total.or(Some(guard.bytes.len() as u64));
+                }
             }
         }
         Ok(src)
     }
 
-    fn insert_cache(&mut self, chunk_idx: u64, data: Vec<u8>) {
-        if let Some(old) = self.cache.remove(&chunk_idx) {
-            self.cached_bytes = self.cached_bytes.saturating_sub(old.len());
-            if let Some(pos) = self.cache_order.iter().position(|&k| k == chunk_idx) {
-                self.cache_order.remove(pos);
-            }
-        }
-        while self.cached_bytes.saturating_add(data.len()) > MAX_CACHE_BYTES {
-            let Some(evict) = self.cache_order.pop_front() else {
-                break;
-            };
-            if let Some(removed) = self.cache.remove(&evict) {
-                self.cached_bytes = self.cached_bytes.saturating_sub(removed.len());
-            }
-        }
-        self.cached_bytes = self.cached_bytes.saturating_add(data.len());
-        self.cache.insert(chunk_idx, data);
-        self.cache_order.push_back(chunk_idx);
-    }
-
-    fn fetch_chunk(&mut self, chunk_idx: u64) -> io::Result<()> {
-        if self.cache.contains_key(&chunk_idx) {
-            return Ok(());
+    fn ensure_chunk_started(&mut self, chunk_idx: u64) -> Option<Arc<ChunkSlot>> {
+        if let Some(existing) = self.chunks.get(&chunk_idx) {
+            return Some(Arc::clone(&existing.slot));
         }
         let start = chunk_idx.saturating_mul(self.chunk_bytes);
         let max_len = match self.total_len {
-            Some(total) if start >= total => return Ok(()),
+            Some(total) if start >= total => return None,
             Some(total) => self.chunk_bytes.min(total - start),
             None => self.chunk_bytes,
         };
 
-        let mut acc = Vec::with_capacity(max_len as usize);
-        let mut cursor = start;
-        let mut remaining = max_len;
-        let mut empty_attempts = 0usize;
-
-        while remaining > 0 {
-            let (part, discovered_total) = self.fetch_range(cursor, remaining)?;
-            if self.total_len.is_none()
-                && let Some(total) = discovered_total
-            {
-                self.total_len = Some(total);
-            }
-            if part.is_empty() {
-                empty_attempts += 1;
-                if empty_attempts >= MAX_EMPTY_RANGES {
-                    break;
-                }
-                continue;
-            }
-            empty_attempts = 0;
-            let got = part.len() as u64;
-            acc.extend_from_slice(&part);
-            cursor = cursor.saturating_add(got);
-            remaining = remaining.saturating_sub(got);
-            if let Some(total) = self.total_len
-                && cursor >= total
-            {
-                break;
-            }
-        }
-
-        if !acc.is_empty() {
-            self.insert_cache(chunk_idx, acc);
-        }
-        Ok(())
-    }
-
-    fn fetch_range(&self, start: u64, len: u64) -> io::Result<(Vec<u8>, Option<u64>)> {
-        let end_inclusive = start.saturating_add(len.saturating_sub(1));
-        let range_header = format!("bytes={start}-{end_inclusive}");
+        let slot = Arc::new(ChunkSlot::new(max_len as usize));
+        let slot_task = Arc::clone(&slot);
         let http = self.http.clone();
         let url = self.url.clone();
-        let headers = self.headers.clone();
+        let headers = Arc::clone(&self.headers);
         let on_refused = self.on_refused.clone();
+        let cancel = Arc::clone(&self.cancel);
+        let known_total = self.total_len;
 
-        self.rt.block_on(async move {
-            let mut req = http
-                .get(&url)
-                .timeout(REQUEST_TIMEOUT)
-                .header(reqwest::header::RANGE, range_header);
-            for (k, v) in &headers {
-                req = req.header(k.as_str(), v.as_str());
-            }
-            let resp = req
-                .send()
-                .await
-                .map_err(|e| io::Error::other(format!("HTTP range error: {e}")))?;
+        let task = self.rt.spawn(async move {
+            let _guard = SlotCompletionGuard(Arc::clone(&slot_task));
+            fetch_chunk_streaming(
+                http,
+                url,
+                headers,
+                start,
+                max_len,
+                known_total,
+                on_refused,
+                cancel,
+                slot_task,
+            )
+            .await;
+        });
 
-            let status = resp.status().as_u16();
-            if matches!(status, 403 | 404 | 410) {
-                if let Some(cb) = &on_refused {
-                    cb(&url, status);
-                }
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("stream range refused with HTTP {status}"),
-                ));
-            }
-            if status == 416 {
-                return Ok((Vec::new(), None));
-            }
-            if status == 200 && start > 0 {
-                // Server ignored Range and returned offset 0 — never splice into middle!
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "server answered 200 OK instead of 206 Partial Content for ranged seek",
-                ));
-            }
-            if status != 206 && status != 200 {
-                return Err(io::Error::other(format!("unexpected HTTP status {status}")));
-            }
-
-            let total = if status == 206 {
-                resp.headers()
-                    .get(reqwest::header::CONTENT_RANGE)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.rsplit_once('/'))
-                    .and_then(|(_, tot)| tot.parse::<u64>().ok())
-            } else {
-                resp.content_length()
-            };
-
-            let bytes = resp
-                .bytes()
-                .await
-                .map_err(|e| io::Error::other(format!("HTTP range body error: {e}")))?;
-            Ok((bytes.to_vec(), total))
-        })
+        self.chunks.insert(
+            chunk_idx,
+            ActiveChunk {
+                slot: Arc::clone(&slot),
+                task,
+            },
+        );
+        self.cache_order.push_back(chunk_idx);
+        self.evict_if_needed(chunk_idx);
+        Some(slot)
     }
+
+    fn prefetch_ahead(&mut self, current_chunk: u64) {
+        let Some(total) = self.total_len else {
+            return;
+        };
+        for step in 1..=PREFETCH_CHUNKS_AHEAD {
+            let next_idx = current_chunk.saturating_add(step);
+            if next_idx.saturating_mul(self.chunk_bytes) >= total {
+                break;
+            }
+            let _ = self.ensure_chunk_started(next_idx);
+        }
+    }
+
+    fn evict_if_needed(&mut self, protected_chunk: u64) {
+        let mut total_cached: usize = self
+            .chunks
+            .values()
+            .map(|c| {
+                c.slot
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .bytes
+                    .len()
+            })
+            .sum();
+
+        if total_cached <= MAX_CACHE_BYTES {
+            return;
+        }
+
+        let protected_end = protected_chunk.saturating_add(PREFETCH_CHUNKS_AHEAD);
+        let mut kept = VecDeque::with_capacity(self.cache_order.len());
+        while let Some(idx) = self.cache_order.pop_front() {
+            if total_cached <= MAX_CACHE_BYTES || (idx >= protected_chunk && idx <= protected_end) {
+                kept.push_back(idx);
+                continue;
+            }
+            let can_evict = self
+                .chunks
+                .get(&idx)
+                .is_some_and(|c| c.slot.state.lock().unwrap_or_else(|e| e.into_inner()).done);
+            if can_evict && let Some(removed) = self.chunks.remove(&idx) {
+                let bytes_len = removed
+                    .slot
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .bytes
+                    .len();
+                total_cached = total_cached.saturating_sub(bytes_len);
+            } else {
+                kept.push_back(idx);
+            }
+        }
+        self.cache_order = kept;
+    }
+}
+
+impl Drop for ChunkedRangeSource {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        for chunk in self.chunks.values() {
+            chunk.task.abort();
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_chunk_streaming(
+    http: Client,
+    url: String,
+    headers: Arc<Vec<(String, String)>>,
+    start: u64,
+    max_len: u64,
+    mut known_total: Option<u64>,
+    on_refused: Option<RefusalCallback>,
+    cancel: Arc<AtomicBool>,
+    slot: Arc<ChunkSlot>,
+) {
+    let mut cursor = start;
+    let mut remaining = max_len;
+    let mut empty_attempts = 0usize;
+
+    while remaining > 0 && !cancel.load(Ordering::Acquire) {
+        let end_inclusive = cursor.saturating_add(remaining.saturating_sub(1));
+        let range_header = format!("bytes={cursor}-{end_inclusive}");
+
+        let mut req = http
+            .get(&url)
+            .timeout(REQUEST_TIMEOUT)
+            .header(reqwest::header::RANGE, range_header);
+        for (k, v) in headers.iter() {
+            req = req.header(k.as_str(), v.as_str());
+        }
+
+        let mut resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                slot.finish_with_error(io::ErrorKind::Other, format!("HTTP range error: {e}"));
+                return;
+            }
+        };
+
+        let status = resp.status().as_u16();
+        if matches!(status, 403 | 404 | 410) {
+            if let Some(cb) = &on_refused {
+                cb(&url, status);
+            }
+            slot.finish_with_error(
+                io::ErrorKind::PermissionDenied,
+                format!("stream range refused with HTTP {status}"),
+            );
+            return;
+        }
+        if status == 416 {
+            slot.finish_ok();
+            return;
+        }
+        if status == 200 && cursor > 0 {
+            slot.finish_with_error(
+                io::ErrorKind::InvalidData,
+                "server answered 200 OK instead of 206 Partial Content for ranged seek".to_owned(),
+            );
+            return;
+        }
+        if status != 206 && status != 200 {
+            slot.finish_with_error(
+                io::ErrorKind::Other,
+                format!("unexpected HTTP status {status}"),
+            );
+            return;
+        }
+
+        let discovered_total = if status == 206 {
+            resp.headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.rsplit_once('/'))
+                .and_then(|(_, tot)| tot.parse::<u64>().ok())
+        } else {
+            resp.content_length()
+        };
+
+        if known_total.is_none()
+            && let Some(tot) = discovered_total
+        {
+            known_total = Some(tot);
+        }
+
+        {
+            let mut guard = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.discovered_total.is_none() {
+                guard.discovered_total = known_total;
+            }
+            guard.header_ready = true;
+            slot.ready.notify_all();
+        }
+
+        let mut got_this_req = 0u64;
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                slot.finish_ok();
+                return;
+            }
+            match resp.chunk().await {
+                Ok(Some(piece)) => {
+                    if piece.is_empty() {
+                        continue;
+                    }
+                    let take = (piece.len() as u64).min(remaining) as usize;
+                    if take > 0 {
+                        let mut guard = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.bytes.extend_from_slice(&piece[..take]);
+                        slot.ready.notify_all();
+                        got_this_req = got_this_req.saturating_add(take as u64);
+                        cursor = cursor.saturating_add(take as u64);
+                        remaining = remaining.saturating_sub(take as u64);
+                    }
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    slot.finish_with_error(
+                        io::ErrorKind::Other,
+                        format!("HTTP range body error: {e}"),
+                    );
+                    return;
+                }
+            }
+        }
+
+        if got_this_req == 0 {
+            empty_attempts += 1;
+            if empty_attempts >= MAX_EMPTY_RANGES {
+                break;
+            }
+            continue;
+        }
+        empty_attempts = 0;
+
+        if let Some(total) = known_total
+            && cursor >= total
+        {
+            break;
+        }
+    }
+
+    slot.finish_ok();
 }
 
 impl Read for ChunkedRangeSource {
@@ -260,19 +480,36 @@ impl Read for ChunkedRangeSource {
 
         let chunk_idx = self.pos / self.chunk_bytes;
         let offset_in_chunk = (self.pos % self.chunk_bytes) as usize;
-        self.fetch_chunk(chunk_idx)?;
 
-        let Some(chunk) = self.cache.get(&chunk_idx) else {
+        let Some(slot) = self.ensure_chunk_started(chunk_idx) else {
             return Ok(0);
         };
-        if offset_in_chunk >= chunk.len() {
-            return Ok(0);
+        // Trigger non-blocking background prefetch of upcoming sequential chunks.
+        self.prefetch_ahead(chunk_idx);
+
+        let mut guard = slot.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if self.total_len.is_none()
+                && let Some(tot) = guard.discovered_total
+            {
+                self.total_len = Some(tot);
+            }
+            if offset_in_chunk < guard.bytes.len() {
+                let avail = &guard.bytes[offset_in_chunk..];
+                let to_copy = buf.len().min(avail.len());
+                buf[..to_copy].copy_from_slice(&avail[..to_copy]);
+                drop(guard);
+                self.pos = self.pos.saturating_add(to_copy as u64);
+                return Ok(to_copy);
+            }
+            if let Some((kind, ref msg)) = guard.error {
+                return Err(io::Error::new(kind, msg.clone()));
+            }
+            if guard.done {
+                return Ok(0);
+            }
+            guard = slot.ready.wait(guard).unwrap_or_else(|e| e.into_inner());
         }
-        let avail = &chunk[offset_in_chunk..];
-        let to_copy = buf.len().min(avail.len());
-        buf[..to_copy].copy_from_slice(&avail[..to_copy]);
-        self.pos = self.pos.saturating_add(to_copy as u64);
-        Ok(to_copy)
     }
 }
 
@@ -316,6 +553,7 @@ impl MediaSource for ChunkedRangeSource {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+    use std::time::Instant;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -338,40 +576,44 @@ mod tests {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     break;
                 };
-                let mut buf = [0u8; 2048];
-                let n = sock.read(&mut buf).await.unwrap_or(0);
-                if n == 0 {
-                    continue;
-                }
-                let req_text = String::from_utf8_lossy(&buf[..n]);
-                req_counter.fetch_add(1, Ordering::Relaxed);
+                let req_counter = Arc::clone(&req_counter);
+                let data = Arc::clone(&data);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    let req_text = String::from_utf8_lossy(&buf[..n]);
+                    req_counter.fetch_add(1, Ordering::Relaxed);
 
-                if req_text.contains("/forbidden") {
-                    let _ = sock
-                        .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                        .await;
-                    continue;
-                }
+                    if req_text.contains("/forbidden") {
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                        return;
+                    }
 
-                let range_line = req_text
-                    .lines()
-                    .find(|l| l.to_ascii_lowercase().starts_with("range:"))
-                    .unwrap_or("Range: bytes=0-4095");
-                let bounds = range_line.split('=').nth(1).unwrap_or("0-4095").trim();
-                let (s_str, e_str) = bounds.split_once('-').unwrap_or(("0", "4095"));
-                let start: usize = s_str.parse().unwrap_or(0);
-                let end: usize = e_str
-                    .parse::<usize>()
-                    .unwrap_or(data.len() - 1)
-                    .min(data.len() - 1);
-                let slice = &data[start..=end];
-                let header = format!(
-                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    data.len(),
-                    slice.len()
-                );
-                let _ = sock.write_all(header.as_bytes()).await;
-                let _ = sock.write_all(slice).await;
+                    let range_line = req_text
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                        .unwrap_or("Range: bytes=0-4095");
+                    let bounds = range_line.split('=').nth(1).unwrap_or("0-4095").trim();
+                    let (s_str, e_str) = bounds.split_once('-').unwrap_or(("0", "4095"));
+                    let start: usize = s_str.parse().unwrap_or(0);
+                    let end: usize = e_str
+                        .parse::<usize>()
+                        .unwrap_or(data.len() - 1)
+                        .min(data.len() - 1);
+                    let slice = &data[start..=end];
+                    let header = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        data.len(),
+                        slice.len()
+                    );
+                    let _ = sock.write_all(header.as_bytes()).await;
+                    let _ = sock.write_all(slice).await;
+                });
             }
         });
 
@@ -435,6 +677,58 @@ mod tests {
         assert!(err.is_err());
         assert_eq!(refused_code.load(Ordering::Relaxed), 403);
 
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn streams_first_bytes_before_chunk_finishes_downloading() {
+        // Simulates a throttled server delivering the first 512 B immediately,
+        // pausing 250 ms, then sending the remaining 3584 B.
+        // Progressive read() MUST return the first bytes immediately (<100 ms),
+        // NOT wait for the full chunk to finish!
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let head = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4095/4096\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n";
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&[0xABu8; 512]).await;
+                let _ = sock.flush().await;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let _ = sock.write_all(&[0xCDu8; 3584]).await;
+            }
+        });
+
+        let handle = Handle::current();
+        let url = format!("http://127.0.0.1:{}/slow.bin", addr.port());
+        let elapsed_first_read = tokio::task::spawn_blocking(move || {
+            let mut src = ChunkedRangeSource::new(
+                Client::new(),
+                handle,
+                url,
+                Vec::new(),
+                Some(4_096),
+                4_096,
+                None,
+            )
+            .expect("create");
+            let t0 = Instant::now();
+            let mut first = [0u8; 64];
+            src.read_exact(&mut first).expect("first read");
+            assert_eq!(first, [0xABu8; 64]);
+            t0.elapsed()
+        })
+        .await
+        .expect("join");
+
+        assert!(
+            elapsed_first_read < Duration::from_millis(180),
+            "expected progressive first read before 250ms stall, took {:?}",
+            elapsed_first_read
+        );
         let _ = server.await;
     }
 }

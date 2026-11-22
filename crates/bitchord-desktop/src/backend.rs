@@ -7,14 +7,16 @@
 //! keeps playback, gapless preload, Listen Together, scrobbling, and MPRIS2 alive.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_channel::{Receiver, Sender};
 use bitchord_audio::{
-    AudioEngine, EqTuningSnapshot, MprisCommand, MprisService, MprisState, PlaybackSnapshot,
-    PlaybackState, PlaybackStatus, build_mpris_metadata,
+    AudioDecoder, AudioEngine, EqTuningSnapshot, MprisCommand, MprisService, MprisState,
+    PlaybackSnapshot, PlaybackState, PlaybackStatus, RefusalCallback, build_mpris_metadata,
+    open_http_decoder,
 };
 use bitchord_dsp_core::{EqCurve, EqLayout, EqualizerPreset, manual_curve};
 use bitchord_innertube::{
@@ -44,6 +46,8 @@ use bitchord_storage::{
 use gpui::Global;
 use reqwest::Client;
 use tokio::runtime::Handle;
+
+use crate::artwork::song_thumbnail_url;
 
 /// Selection of stream resolver mode (`ADR-004`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -105,6 +109,14 @@ pub struct LyricsPayload {
     pub translated_lang: Option<String>,
 }
 
+/// Live search suggestions + matching tracks/albums/artists while typing (`notes.md` #7).
+#[derive(Debug, Clone, Default)]
+pub struct SearchSuggestionsPayload {
+    pub query: String,
+    pub queries: Vec<String>,
+    pub items: Vec<SearchResult>,
+}
+
 /// Inbound command sent by GPUI views, shortcuts, or tray menu to the backend.
 #[derive(Debug, Clone)]
 pub enum BackendCommand {
@@ -113,6 +125,10 @@ pub enum BackendCommand {
         query: String,
         filter: SearchFilter,
     },
+    SearchSuggest(String),
+    RecordSearchSelection(SearchHistoryEntity),
+    RemoveSearchHistory(String),
+    ClearSearchHistory,
     LoadDetail {
         browse_id: String,
         kind: BrowseType,
@@ -192,6 +208,7 @@ pub enum BackendEvent {
         query: String,
         result: Result<Vec<SearchResult>, String>,
     },
+    SearchSuggestionsLoaded(SearchSuggestionsPayload),
     DetailLoading,
     DetailLoaded(Result<DetailPayload, String>),
     LyricsLoading,
@@ -273,6 +290,61 @@ struct PartyRuntime {
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
+enum InternalTrackMsg {
+    Ready {
+        generation: u64,
+        song: Song,
+        decoder: Box<AudioDecoder>,
+        loudness_db: Option<f64>,
+        source_label: String,
+    },
+    Failed {
+        generation: u64,
+        song_title: String,
+        error: String,
+    },
+    PreloadReady {
+        generation: u64,
+        song: Song,
+        decoder: Box<AudioDecoder>,
+        loudness_db: Option<f64>,
+        source_label: String,
+    },
+}
+
+fn build_stream_resolver(
+    http: &Arc<Client>,
+    innertube: &Arc<InnertubeClient>,
+    uploads: &Arc<UploadedTracks>,
+    choice: StreamBackendChoice,
+) -> Arc<StreamResolver> {
+    let backend: Arc<dyn StreamBackend> = match choice {
+        StreamBackendChoice::NativeOnly => {
+            Arc::new(NativeStreamBackend::new(Arc::clone(innertube)))
+        }
+        #[cfg(feature = "ytdlp-bridge")]
+        StreamBackendChoice::YtDlpOnly => Arc::new(YtDlpStreamBackend::new()),
+        StreamBackendChoice::Auto => {
+            #[cfg(feature = "ytdlp-bridge")]
+            {
+                Arc::new(FallbackStreamBackend::new(
+                    NativeStreamBackend::new(Arc::clone(innertube)),
+                    YtDlpStreamBackend::new(),
+                ))
+            }
+            #[cfg(not(feature = "ytdlp-bridge"))]
+            {
+                Arc::new(NativeStreamBackend::new(Arc::clone(innertube)))
+            }
+        }
+    };
+    Arc::new(StreamResolver::new(
+        Arc::clone(http),
+        backend,
+        Arc::clone(uploads),
+    ))
+}
+
 fn run_backend_thread(
     rt: Handle,
     http: Client,
@@ -313,6 +385,10 @@ fn run_backend_thread(
     let uploads = Arc::new(UploadedTracks::default());
     let settings_store = SettingsStore::new(paths.settings_file());
 
+    // Persistent StreamResolver keeps the 20-minute URL cache & refused-profile exclusions warm!
+    let mut resolver =
+        build_stream_resolver(&http_arc, &innertube, &uploads, StreamBackendChoice::Auto);
+
     // Load saved YouTube Music cookie from Linux Secret Service (best-effort).
     let secret_store = rt.block_on(KeyringSecretStore::open()).ok();
     if let Some(ref store) = secret_store
@@ -328,7 +404,9 @@ fn run_backend_thread(
         None => (None, None),
     };
 
-    let mut backend_choice = StreamBackendChoice::Auto;
+    let (track_tx, track_rx) = async_channel::bounded::<InternalTrackMsg>(16);
+    let load_gen = Arc::new(AtomicU64::new(0));
+
     let mut queue_items: Vec<Song> = Vec::new();
     let mut current_index: Option<usize> = None;
     let mut shuffle = false;
@@ -344,28 +422,39 @@ fn run_backend_thread(
 
     let mut last_tick = std::time::Instant::now();
     let mut last_state = PlaybackState::Stopped;
+    let mut last_song_vid: Option<String> = None;
     let mut last_published_pos_ms = 0u64;
 
     loop {
-        // 1. Drain inbound commands (non-blocking while playing, bounded wait when idle).
+        // 1. Wait reactively for either an inbound UI command or an off-thread track load completion.
         let wait_ms = if engine.snapshot().state == PlaybackState::Playing {
-            40
+            35
         } else {
-            100
+            90
         };
-        let cmd_opt = rt.block_on(async {
-            tokio::time::timeout(Duration::from_millis(wait_ms), cmd_rx.recv())
-                .await
-                .ok()
-                .and_then(Result::ok)
-        });
-
         let mut cmds = Vec::new();
-        if let Some(c) = cmd_opt {
-            cmds.push(c);
-        }
+        let mut track_msgs = Vec::new();
+
+        rt.block_on(async {
+            tokio::select! {
+                res = cmd_rx.recv() => {
+                    if let Ok(c) = res {
+                        cmds.push(c);
+                    }
+                }
+                res = track_rx.recv() => {
+                    if let Ok(m) = res {
+                        track_msgs.push(m);
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => {}
+            }
+        });
         while let Ok(c) = cmd_rx.try_recv() {
             cmds.push(c);
+        }
+        while let Ok(m) = track_rx.try_recv() {
+            track_msgs.push(m);
         }
 
         // 2. Drain inbound MPRIS2 D-Bus commands.
@@ -375,7 +464,10 @@ fn run_backend_thread(
                     MprisCommand::Play => engine.play(),
                     MprisCommand::Pause => engine.pause(),
                     MprisCommand::PlayPause => engine.toggle_play_pause(),
-                    MprisCommand::Stop => engine.stop(),
+                    MprisCommand::Stop => {
+                        load_gen.fetch_add(1, Ordering::AcqRel);
+                        engine.stop();
+                    }
                     MprisCommand::Next => cmds.push(BackendCommand::NextTrack),
                     MprisCommand::Previous => cmds.push(BackendCommand::PrevTrack),
                     MprisCommand::SetVolume(v) => cmds.push(BackendCommand::SetVolume(v as f32)),
@@ -391,14 +483,121 @@ fn run_backend_thread(
             }
         }
 
-        // 3. Process all queued commands.
+        // 3. Apply completed off-thread track loads / preloads.
+        for msg in track_msgs {
+            match msg {
+                InternalTrackMsg::Ready {
+                    generation,
+                    song,
+                    decoder,
+                    loudness_db,
+                    source_label,
+                } => {
+                    if load_gen.load(Ordering::Acquire) != generation {
+                        continue; // Superseded by a newer user click!
+                    }
+                    match engine.load_prepared_decoder(
+                        *decoder,
+                        song.clone(),
+                        loudness_db,
+                        Some(&source_label),
+                    ) {
+                        Ok(info) => {
+                            // Brief prebuffer (~100 ms PCM) guarantees 0 initial PipeWire underruns.
+                            engine.wait_prebuffer(100, Duration::from_millis(450));
+                            engine.play();
+                            let snap = engine.snapshot();
+                            last_state = snap.state;
+                            last_song_vid = Some(song.video_id.clone());
+                            last_published_pos_ms = snap.position_ms;
+                            let _ = evt_tx
+                                .try_send(BackendEvent::PlaybackUpdated(Box::new(snap.clone())));
+                            let _ = evt_tx.try_send(BackendEvent::StatusNotice(format!(
+                                "Playing {} - {}",
+                                song.title, song.artist
+                            )));
+
+                            record_track_started(
+                                &rt,
+                                &paths,
+                                &song,
+                                info.duration_ms,
+                                settings.discord_rpc_enabled,
+                                &snap,
+                                &evt_tx,
+                            );
+
+                            // Quietly pre-resolve & preload the next track in the queue onto standby deck.
+                            if let Some(next_idx) = compute_next_index(
+                                current_index,
+                                queue_items.len(),
+                                repeat_all,
+                                repeat_one,
+                                true,
+                            ) && Some(next_idx) != current_index
+                                && let Some(next_song) = queue_items.get(next_idx).cloned()
+                            {
+                                spawn_preload_next(
+                                    generation,
+                                    Arc::clone(&load_gen),
+                                    &rt,
+                                    Arc::clone(&http_arc),
+                                    Arc::clone(&resolver),
+                                    next_song,
+                                    track_tx.clone(),
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            let _ = evt_tx.try_send(BackendEvent::ErrorNotice(format!(
+                                "Playback failed for \"{}\": {err}",
+                                song.title
+                            )));
+                        }
+                    }
+                }
+                InternalTrackMsg::Failed {
+                    generation,
+                    song_title,
+                    error,
+                } => {
+                    if load_gen.load(Ordering::Acquire) != generation {
+                        continue;
+                    }
+                    let _ = evt_tx.try_send(BackendEvent::ErrorNotice(format!(
+                        "Playback failed for \"{song_title}\": {error}"
+                    )));
+                    let _ =
+                        evt_tx.try_send(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                }
+                InternalTrackMsg::PreloadReady {
+                    generation,
+                    song,
+                    decoder,
+                    loudness_db,
+                    source_label,
+                } => {
+                    if load_gen.load(Ordering::Acquire) != generation {
+                        continue;
+                    }
+                    let _ = engine.preload_prepared_decoder(
+                        *decoder,
+                        song,
+                        loudness_db,
+                        Some(&source_label),
+                    );
+                }
+            }
+        }
+
+        // 4. Process all queued commands.
         for cmd in cmds {
             match cmd {
                 BackendCommand::Shutdown => {
+                    load_gen.fetch_add(1, Ordering::AcqRel);
                     engine.stop();
                     if let Some(pr) = party_runtime.take() {
-                        pr.stop_flag
-                            .store(true, std::sync::atomic::Ordering::Release);
+                        pr.stop_flag.store(true, Ordering::Release);
                     }
                     return;
                 }
@@ -419,25 +618,43 @@ fn run_backend_thread(
                     let _ = evt_tx.try_send(BackendEvent::SearchLoading {
                         query: trimmed.clone(),
                     });
-                    if let Ok(db) = LibraryDb::open(&paths.db_file()) {
-                        let _ = db.record_search_history(&SearchHistoryEntity {
-                            id: trimmed.clone(),
-                            title: trimmed.clone(),
-                            subtitle: "Search".to_owned(),
-                            artwork_url: None,
-                            entity_type: EntityType::Other,
-                            timestamp: unix_now_ms(),
-                        });
-                    }
-                    emit_library_snapshot(&paths, &evt_tx);
                     let repo = Arc::clone(&yt_repo);
                     let tx = evt_tx.clone();
+                    let paths_c = paths.clone();
                     rt.spawn(async move {
                         let res = repo
                             .search(&trimmed, filter, false)
                             .await
                             .map(|p| p.rows)
                             .map_err(|e| e.to_string());
+
+                        // Record query search enriched with top result's artwork & metadata when available!
+                        if let Ok(ref rows) = res {
+                            let (art_url, subtitle) = match rows.first() {
+                                Some(SearchResult::TopTrack { song })
+                                | Some(SearchResult::Track { song }) => (
+                                    song_thumbnail_url(song),
+                                    format!("Search · Top: {} - {}", song.title, song.artist),
+                                ),
+                                Some(SearchResult::Browse { item }) => (
+                                    item.thumbnail_url.clone(),
+                                    format!("Search · {}", item.title),
+                                ),
+                                None => (None, "Search query".to_owned()),
+                            };
+                            if let Ok(db) = LibraryDb::open(&paths_c.db_file()) {
+                                let _ = db.record_search_history(&SearchHistoryEntity {
+                                    id: format!("q:{trimmed}"),
+                                    title: trimmed.clone(),
+                                    subtitle,
+                                    artwork_url: art_url,
+                                    entity_type: EntityType::Other,
+                                    timestamp: unix_now_ms(),
+                                });
+                            }
+                            emit_library_snapshot(&paths_c, &tx);
+                        }
+
                         let _ = tx
                             .send(BackendEvent::SearchLoaded {
                                 query: trimmed,
@@ -445,6 +662,54 @@ fn run_backend_thread(
                             })
                             .await;
                     });
+                }
+                BackendCommand::SearchSuggest(query) => {
+                    let trimmed = query.trim().to_owned();
+                    if trimmed.len() < 2 {
+                        let _ = evt_tx.try_send(BackendEvent::SearchSuggestionsLoaded(
+                            SearchSuggestionsPayload::default(),
+                        ));
+                        continue;
+                    }
+                    let repo = Arc::clone(&yt_repo);
+                    let tx = evt_tx.clone();
+                    rt.spawn(async move {
+                        let (queries_res, typeahead_res) = tokio::join!(
+                            repo.search_suggestions(&trimmed),
+                            repo.search_typeahead(&trimmed)
+                        );
+                        let queries = queries_res.unwrap_or_default();
+                        let mut items = typeahead_res.map(|p| p.rows).unwrap_or_default();
+                        items.truncate(6);
+                        let _ = tx
+                            .send(BackendEvent::SearchSuggestionsLoaded(
+                                SearchSuggestionsPayload {
+                                    query: trimmed,
+                                    queries,
+                                    items,
+                                },
+                            ))
+                            .await;
+                    });
+                }
+                BackendCommand::RecordSearchSelection(mut entity) => {
+                    entity.timestamp = unix_now_ms();
+                    if let Ok(db) = LibraryDb::open(&paths.db_file()) {
+                        let _ = db.record_search_history(&entity);
+                    }
+                    emit_library_snapshot(&paths, &evt_tx);
+                }
+                BackendCommand::RemoveSearchHistory(id) => {
+                    if let Ok(db) = LibraryDb::open(&paths.db_file()) {
+                        let _ = db.remove_search_history(&id);
+                    }
+                    emit_library_snapshot(&paths, &evt_tx);
+                }
+                BackendCommand::ClearSearchHistory => {
+                    if let Ok(db) = LibraryDb::open(&paths.db_file()) {
+                        let _ = db.clear_search_history();
+                    }
+                    emit_library_snapshot(&paths, &evt_tx);
                 }
                 BackendCommand::LoadDetail {
                     browse_id,
@@ -527,18 +792,16 @@ fn run_backend_thread(
                         &evt_tx,
                     );
                     if let Some(song) = current_index.and_then(|i| queue_items.get(i)).cloned() {
-                        load_and_play_song(
+                        start_async_song_load(
                             &mut engine,
+                            &load_gen,
                             &rt,
                             &http_arc,
-                            &innertube,
-                            &uploads,
-                            backend_choice,
-                            &paths,
+                            &resolver,
                             &lyrics_repo,
                             &current_lyrics,
-                            settings.discord_rpc_enabled,
                             song,
+                            &track_tx,
                             &evt_tx,
                         );
                     }
@@ -557,18 +820,16 @@ fn run_backend_thread(
                             &evt_tx,
                         );
                         if let Some(s) = queue_items.first().cloned() {
-                            load_and_play_song(
+                            start_async_song_load(
                                 &mut engine,
+                                &load_gen,
                                 &rt,
                                 &http_arc,
-                                &innertube,
-                                &uploads,
-                                backend_choice,
-                                &paths,
+                                &resolver,
                                 &lyrics_repo,
                                 &current_lyrics,
-                                settings.discord_rpc_enabled,
                                 s,
+                                &track_tx,
                                 &evt_tx,
                             );
                         }
@@ -603,18 +864,16 @@ fn run_backend_thread(
                             &evt_tx,
                         );
                         let song = queue_items[idx].clone();
-                        load_and_play_song(
+                        start_async_song_load(
                             &mut engine,
+                            &load_gen,
                             &rt,
                             &http_arc,
-                            &innertube,
-                            &uploads,
-                            backend_choice,
-                            &paths,
+                            &resolver,
                             &lyrics_repo,
                             &current_lyrics,
-                            settings.discord_rpc_enabled,
                             song,
+                            &track_tx,
                             &evt_tx,
                         );
                     }
@@ -625,6 +884,7 @@ fn run_backend_thread(
                         if let Some(cur) = current_index {
                             if queue_items.is_empty() {
                                 current_index = None;
+                                load_gen.fetch_add(1, Ordering::AcqRel);
                                 engine.stop();
                             } else if idx < cur {
                                 current_index = Some(cur - 1);
@@ -632,18 +892,16 @@ fn run_backend_thread(
                                 let next_i = cur.min(queue_items.len() - 1);
                                 current_index = Some(next_i);
                                 let song = queue_items[next_i].clone();
-                                load_and_play_song(
+                                start_async_song_load(
                                     &mut engine,
+                                    &load_gen,
                                     &rt,
                                     &http_arc,
-                                    &innertube,
-                                    &uploads,
-                                    backend_choice,
-                                    &paths,
+                                    &resolver,
                                     &lyrics_repo,
                                     &current_lyrics,
-                                    settings.discord_rpc_enabled,
                                     song,
+                                    &track_tx,
                                     &evt_tx,
                                 );
                             }
@@ -661,6 +919,7 @@ fn run_backend_thread(
                 BackendCommand::QueueClear => {
                     queue_items.clear();
                     current_index = None;
+                    load_gen.fetch_add(1, Ordering::AcqRel);
                     engine.stop();
                     emit_queue(
                         &queue_items,
@@ -736,18 +995,16 @@ fn run_backend_thread(
                             &evt_tx,
                         );
                         let song = queue_items[next_idx].clone();
-                        load_and_play_song(
+                        start_async_song_load(
                             &mut engine,
+                            &load_gen,
                             &rt,
                             &http_arc,
-                            &innertube,
-                            &uploads,
-                            backend_choice,
-                            &paths,
+                            &resolver,
                             &lyrics_repo,
                             &current_lyrics,
-                            settings.discord_rpc_enabled,
                             song,
+                            &track_tx,
                             &evt_tx,
                         );
                     }
@@ -773,18 +1030,16 @@ fn run_backend_thread(
                             &evt_tx,
                         );
                         if let Some(song) = queue_items.get(prev).cloned() {
-                            load_and_play_song(
+                            start_async_song_load(
                                 &mut engine,
+                                &load_gen,
                                 &rt,
                                 &http_arc,
-                                &innertube,
-                                &uploads,
-                                backend_choice,
-                                &paths,
+                                &resolver,
                                 &lyrics_repo,
                                 &current_lyrics,
-                                settings.discord_rpc_enabled,
                                 song,
+                                &track_tx,
                                 &evt_tx,
                             );
                         }
@@ -996,7 +1251,7 @@ fn run_backend_thread(
                     ));
                 }
                 BackendCommand::SetStreamBackend(choice) => {
-                    backend_choice = choice;
+                    resolver = build_stream_resolver(&http_arc, &innertube, &uploads, choice);
                     let _ = evt_tx.try_send(BackendEvent::StatusNotice(format!(
                         "Stream resolver set to {}",
                         choice.label()
@@ -1030,7 +1285,9 @@ fn run_backend_thread(
                                     let _ = db.upsert_playlist(&LocalPlaylist {
                                         id: pl_id.clone(),
                                         title: title.clone(),
-                                        description: format!("Imported from Spotify ({imported_count} tracks)"),
+                                        description: format!(
+                                            "Imported from Spotify ({imported_count} tracks)"
+                                        ),
                                         thumbnail_url: None,
                                         source: "spotify".to_owned(),
                                         created_at: now,
@@ -1088,8 +1345,7 @@ fn run_backend_thread(
                     nickname,
                 } => {
                     if let Some(prev) = party_runtime.take() {
-                        prev.stop_flag
-                            .store(true, std::sync::atomic::Ordering::Release);
+                        prev.stop_flag.store(true, Ordering::Release);
                     }
                     settings.listen_together_server = server_url.clone();
                     settings.listen_together_nickname = nickname.clone();
@@ -1140,8 +1396,7 @@ fn run_backend_thread(
                     let code = parse_invite_url(Some(&code_or_url))
                         .unwrap_or_else(|| code_or_url.trim().to_uppercase());
                     if let Some(prev) = party_runtime.take() {
-                        prev.stop_flag
-                            .store(true, std::sync::atomic::Ordering::Release);
+                        prev.stop_flag.store(true, Ordering::Release);
                     }
                     settings.listen_together_server = server_url.clone();
                     settings.listen_together_nickname = nickname.clone();
@@ -1186,8 +1441,7 @@ fn run_backend_thread(
                 }
                 BackendCommand::PartyLeave => {
                     if let Some(pr) = party_runtime.take() {
-                        pr.stop_flag
-                            .store(true, std::sync::atomic::Ordering::Release);
+                        pr.stop_flag.store(true, Ordering::Release);
                         let _ = rt.block_on(pr.client.leave_party(&pr.code, &pr.token));
                     }
                     let cleared = ListenTogetherState::default();
@@ -1200,14 +1454,79 @@ fn run_backend_thread(
             }
         }
 
-        // 4. Advance audio engine clock (crossfade, gapless, sleep timer).
+        // 5. Advance audio engine clock (crossfade, gapless, sleep timer).
         let elapsed_ms = last_tick.elapsed().as_millis().min(250) as u64;
         last_tick = std::time::Instant::now();
         engine.tick(elapsed_ms.max(1));
 
         let snap = engine.snapshot();
 
-        // Auto-advance queue when track cleanly finishes.
+        // Detect gapless/crossfade automatic deck handoff to the preloaded standby song!
+        if snap.state == PlaybackState::Playing
+            && let Some(ref active_song) = snap.current_song
+            && last_song_vid.as_deref() != Some(active_song.video_id.as_str())
+        {
+            last_song_vid = Some(active_song.video_id.clone());
+            if let Some(next_idx) = compute_next_index(
+                current_index,
+                queue_items.len(),
+                repeat_all,
+                repeat_one,
+                true,
+            ) && queue_items
+                .get(next_idx)
+                .is_some_and(|s| s.video_id == active_song.video_id)
+            {
+                current_index = Some(next_idx);
+                emit_queue(
+                    &queue_items,
+                    current_index,
+                    shuffle,
+                    repeat_all,
+                    repeat_one,
+                    &evt_tx,
+                );
+            }
+            record_track_started(
+                &rt,
+                &paths,
+                active_song,
+                (snap.duration_ms > 0).then_some(snap.duration_ms),
+                settings.discord_rpc_enabled,
+                &snap,
+                &evt_tx,
+            );
+            spawn_lyrics_lookup(
+                &rt,
+                &lyrics_repo,
+                &current_lyrics,
+                active_song.clone(),
+                snap.duration_ms,
+                &evt_tx,
+            );
+            let cur_gen = load_gen.load(Ordering::Acquire);
+            if let Some(upcoming_idx) = compute_next_index(
+                current_index,
+                queue_items.len(),
+                repeat_all,
+                repeat_one,
+                true,
+            ) && Some(upcoming_idx) != current_index
+                && let Some(next_song) = queue_items.get(upcoming_idx).cloned()
+            {
+                spawn_preload_next(
+                    cur_gen,
+                    Arc::clone(&load_gen),
+                    &rt,
+                    Arc::clone(&http_arc),
+                    Arc::clone(&resolver),
+                    next_song,
+                    track_tx.clone(),
+                );
+            }
+        }
+
+        // Auto-advance queue when track cleanly finishes without a preloaded standby deck.
         if snap.state == PlaybackState::Ended
             && last_state == PlaybackState::Playing
             && let Some(next_idx) = compute_next_index(
@@ -1228,25 +1547,23 @@ fn run_backend_thread(
                 &evt_tx,
             );
             let song = queue_items[next_idx].clone();
-            load_and_play_song(
+            start_async_song_load(
                 &mut engine,
+                &load_gen,
                 &rt,
                 &http_arc,
-                &innertube,
-                &uploads,
-                backend_choice,
-                &paths,
+                &resolver,
                 &lyrics_repo,
                 &current_lyrics,
-                settings.discord_rpc_enabled,
                 song,
+                &track_tx,
                 &evt_tx,
             );
         }
 
         let snap = engine.snapshot();
         let state_changed = snap.state != last_state;
-        let pos_changed = snap.position_ms.abs_diff(last_published_pos_ms) >= 120;
+        let pos_changed = snap.position_ms.abs_diff(last_published_pos_ms) >= 100;
         if state_changed || (snap.state == PlaybackState::Playing && pos_changed) {
             last_state = snap.state;
             last_published_pos_ms = snap.position_ms;
@@ -1285,144 +1602,272 @@ fn run_backend_thread(
     }
 }
 
+/// Immediately updates UI to `Buffering` for `song`, starts parallel lyrics lookup,
+/// and resolves + opens the audio decoder asynchronously off the backend control loop.
 #[allow(clippy::too_many_arguments)]
-fn load_and_play_song(
+fn start_async_song_load(
     engine: &mut AudioEngine,
+    load_gen: &Arc<AtomicU64>,
     rt: &Handle,
     http: &Arc<Client>,
-    innertube: &Arc<InnertubeClient>,
-    uploads: &Arc<UploadedTracks>,
-    backend_choice: StreamBackendChoice,
-    paths: &AppPaths,
+    resolver: &Arc<StreamResolver>,
     lyrics_repo: &Arc<LyricsRepository>,
     current_lyrics: &Arc<Mutex<Option<LyricsPayload>>>,
-    discord_enabled: bool,
     song: Song,
+    track_tx: &Sender<InternalTrackMsg>,
     evt_tx: &Sender<BackendEvent>,
 ) {
+    let generation = load_gen.fetch_add(1, Ordering::AcqRel) + 1;
+    engine.stop();
+
+    // Publish an instant Buffering snapshot so the bottom bar & Now Playing respond in <1 ms!
+    let mut buffering_snap = engine.snapshot();
+    buffering_snap.state = PlaybackState::Buffering;
+    buffering_snap.duration_ms = duration_millis(song.duration_text.as_deref());
+    buffering_snap.position_ms = 0;
+    buffering_snap.current_song = Some(song.clone());
+    let _ = evt_tx.try_send(BackendEvent::PlaybackUpdated(Box::new(buffering_snap)));
     let _ = evt_tx.try_send(BackendEvent::StatusNotice(format!(
         "Loading {} - {}",
         song.title, song.artist
     )));
 
-    let load_res = if let Some(ref local) = song.local_path
-        && Path::new(local).exists()
-    {
-        engine
-            .load_file(Path::new(local), song.clone(), None)
-            .map_err(|e| e.to_string())
-    } else if Path::new(&song.video_id).exists() {
-        engine
-            .load_file(Path::new(&song.video_id), song.clone(), None)
-            .map_err(|e| e.to_string())
-    } else {
-        let backend: Arc<dyn StreamBackend> = match backend_choice {
-            StreamBackendChoice::NativeOnly => {
-                Arc::new(NativeStreamBackend::new(Arc::clone(innertube)))
-            }
-            #[cfg(feature = "ytdlp-bridge")]
-            StreamBackendChoice::YtDlpOnly => Arc::new(YtDlpStreamBackend::new()),
-            StreamBackendChoice::Auto => {
-                #[cfg(feature = "ytdlp-bridge")]
-                {
-                    Arc::new(FallbackStreamBackend::new(
-                        NativeStreamBackend::new(Arc::clone(innertube)),
-                        YtDlpStreamBackend::new(),
-                    ))
-                }
-                #[cfg(not(feature = "ytdlp-bridge"))]
-                {
-                    Arc::new(NativeStreamBackend::new(Arc::clone(innertube)))
-                }
-            }
-        };
-        let resolver = StreamResolver::new(Arc::clone(http), backend, Arc::clone(uploads));
-        let req = ResolveRequest::for_playback(&song.video_id, u32::MAX);
-        match rt.block_on(resolver.resolve(req)) {
-            Ok(stream) => engine
-                .load_stream((**http).clone(), rt.clone(), stream, song.clone(), None)
-                .map_err(|e| e.to_string()),
-            Err(err) => Err(err.to_string()),
+    // Start 17-source lyrics race immediately in parallel with stream loading!
+    let est_dur_ms = duration_millis(song.duration_text.as_deref());
+    spawn_lyrics_lookup(
+        rt,
+        lyrics_repo,
+        current_lyrics,
+        song.clone(),
+        est_dur_ms,
+        evt_tx,
+    );
+
+    let gen_ref = Arc::clone(load_gen);
+    let http_c = Arc::clone(http);
+    let resolver_c = Arc::clone(resolver);
+    let rt_c = rt.clone();
+    let tx = track_tx.clone();
+
+    rt.spawn(async move {
+        let prepared =
+            prepare_track_decoder(&http_c, &rt_c, &resolver_c, &song, &gen_ref, generation).await;
+        if gen_ref.load(Ordering::Acquire) != generation {
+            return;
         }
-    };
-
-    match load_res {
-        Ok(info) => {
-            engine.play();
-            let snap = engine.snapshot();
-            let _ = evt_tx.try_send(BackendEvent::PlaybackUpdated(Box::new(snap.clone())));
-
-            // Record song & play in local SQLite library.
-            if let Ok(db) = LibraryDb::open(&paths.db_file()) {
-                let _ = db.upsert_song(&song);
-                let dur = info
-                    .duration_ms
-                    .unwrap_or_else(|| duration_millis(song.duration_text.as_deref()))
-                    as i64;
-                let _ = db.record_play(&song.video_id, unix_now_ms(), dur);
-            }
-            emit_library_snapshot(paths, evt_tx);
-
-            // Best-effort Discord Unix IPC Rich Presence.
-            if discord_enabled {
-                let quality_line = discord_audio_quality_line(snap.nerd_stats.as_ref());
-                let state_text = match quality_line {
-                    Some(q) => format!("{} · {q}", song.artist),
-                    None => song.artist.clone(),
-                };
-                let activity = DiscordActivity::listening(song.title.clone(), state_text);
-                rt.spawn(async move {
-                    if let Ok(mut client) = DiscordIpcClient::connect_default().await {
-                        let _ = client.set_activity(&activity).await;
-                    }
-                });
-            }
-
-            // Spawn asynchronous 17-source lyrics lookup for the active track.
-            *current_lyrics.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            let vid = song.video_id.clone();
-            let _ = evt_tx.try_send(BackendEvent::LyricsLoading);
-            let repo = Arc::clone(lyrics_repo);
-            let tx = evt_tx.clone();
-            let lyrics_slot = Arc::clone(current_lyrics);
-            let dur_ms = info
-                .duration_ms
-                .unwrap_or_else(|| duration_millis(song.duration_text.as_deref()))
-                as i64;
-            rt.spawn(async move {
-                let mut req = LyricsRequest::new(&song.video_id, &song.title, &song.artist, dur_ms);
-                req.album = song.album_name.as_deref();
-                req.prioritize_syllable_sync = true;
-                let res = match repo.lyrics(&req, &LyricsCallbacks::default()).await {
-                    Some(found) => {
-                        let payload = LyricsPayload {
-                            video_id: vid.clone(),
-                            source: found.source,
-                            lines: found.lines,
-                            translated_lines: None,
-                            translated_lang: None,
-                        };
-                        *lyrics_slot.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(payload.clone());
-                        Ok(payload)
-                    }
-                    None => Err("No synced or plain lyrics available for this track.".to_owned()),
-                };
+        match prepared {
+            Ok((decoder, loudness_db, source_label)) => {
                 let _ = tx
-                    .send(BackendEvent::LyricsLoaded {
-                        video_id: vid,
-                        result: res,
+                    .send(InternalTrackMsg::Ready {
+                        generation,
+                        song,
+                        decoder: Box::new(decoder),
+                        loudness_db,
+                        source_label,
                     })
                     .await;
-            });
+            }
+            Err(error) => {
+                let _ = tx
+                    .send(InternalTrackMsg::Failed {
+                        generation,
+                        song_title: song.title,
+                        error,
+                    })
+                    .await;
+            }
         }
-        Err(err) => {
-            let _ = evt_tx.try_send(BackendEvent::ErrorNotice(format!(
-                "Playback failed for \"{}\": {err}",
-                song.title
-            )));
+    });
+}
+
+fn spawn_preload_next(
+    generation: u64,
+    load_gen: Arc<AtomicU64>,
+    rt: &Handle,
+    http: Arc<Client>,
+    resolver: Arc<StreamResolver>,
+    next_song: Song,
+    track_tx: Sender<InternalTrackMsg>,
+) {
+    let rt_c = rt.clone();
+    rt.spawn(async move {
+        // Brief courtesy delay so the current track's initial chunks have full bandwidth priority.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        if load_gen.load(Ordering::Acquire) != generation {
+            return;
+        }
+        if let Ok((decoder, loudness_db, source_label)) =
+            prepare_track_decoder(&http, &rt_c, &resolver, &next_song, &load_gen, generation).await
+            && load_gen.load(Ordering::Acquire) == generation
+        {
+            let _ = track_tx
+                .send(InternalTrackMsg::PreloadReady {
+                    generation,
+                    song: next_song,
+                    decoder: Box::new(decoder),
+                    loudness_db,
+                    source_label,
+                })
+                .await;
+        }
+    });
+}
+
+async fn prepare_track_decoder(
+    http: &Arc<Client>,
+    rt: &Handle,
+    resolver: &Arc<StreamResolver>,
+    song: &Song,
+    load_gen: &Arc<AtomicU64>,
+    generation: u64,
+) -> Result<(AudioDecoder, Option<f64>, String), String> {
+    // 1. Local file path (instant, offline).
+    if let Some(ref local) = song.local_path
+        && Path::new(local).exists()
+    {
+        let p = PathBuf::from(local);
+        let dec = tokio::task::spawn_blocking(move || AudioDecoder::open_path(&p))
+            .await
+            .map_err(|e| format!("decode task join error: {e}"))?
+            .map_err(|e| e.to_string())?;
+        return Ok((dec, None, "Local".to_owned()));
+    }
+    if Path::new(&song.video_id).exists() {
+        let p = PathBuf::from(&song.video_id);
+        let dec = tokio::task::spawn_blocking(move || AudioDecoder::open_path(&p))
+            .await
+            .map_err(|e| format!("decode task join error: {e}"))?
+            .map_err(|e| e.to_string())?;
+        return Ok((dec, None, "Local".to_owned()));
+    }
+
+    // 2. Remote YouTube Music stream with automatic 403/404/410 profile-refusal retry.
+    let mut last_err = String::new();
+    for attempt in 0..2 {
+        if load_gen.load(Ordering::Acquire) != generation {
+            return Err("cancelled".to_owned());
+        }
+        let req = ResolveRequest::for_playback(&song.video_id, u32::MAX);
+        let stream = resolver.resolve(req).await.map_err(|e| e.to_string())?;
+
+        if load_gen.load(Ordering::Acquire) != generation {
+            return Err("cancelled".to_owned());
+        }
+
+        let refused_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let refused_cb_flag = Arc::clone(&refused_flag);
+        let resolver_cb = Arc::clone(resolver);
+        let vid_cb = song.video_id.clone();
+        let profile_cb = stream.profile_id.clone();
+        let on_refused: RefusalCallback = Arc::new(move |url, _status| {
+            refused_cb_flag.store(true, Ordering::Release);
+            resolver_cb.on_playback_refused(&vid_cb, &profile_cb, url);
+        });
+
+        let http_clone = (**http).clone();
+        let rt_clone = rt.clone();
+        let loudness = stream.loudness_db;
+        let label = stream.client_name.clone();
+        let stream_clone = stream.clone();
+
+        let open_res = tokio::task::spawn_blocking(move || {
+            open_http_decoder(http_clone, rt_clone, &stream_clone, Some(on_refused))
+        })
+        .await
+        .map_err(|e| format!("decoder open join error: {e}"))?;
+
+        match open_res {
+            Ok(dec) => return Ok((dec, loudness, label)),
+            Err(err) => {
+                last_err = err.to_string();
+                let was_refused = refused_flag.load(Ordering::Acquire)
+                    || last_err.contains("HTTP 403")
+                    || last_err.contains("HTTP 404")
+                    || last_err.contains("HTTP 410");
+                if was_refused && attempt == 0 {
+                    resolver.on_playback_refused(&song.video_id, &stream.profile_id, &stream.url);
+                    continue;
+                }
+                return Err(last_err);
+            }
         }
     }
+    Err(last_err)
+}
+
+fn record_track_started(
+    rt: &Handle,
+    paths: &AppPaths,
+    song: &Song,
+    duration_ms: Option<u64>,
+    discord_enabled: bool,
+    snap: &PlaybackSnapshot,
+    evt_tx: &Sender<BackendEvent>,
+) {
+    if let Ok(db) = LibraryDb::open(&paths.db_file()) {
+        let _ = db.upsert_song(song);
+        let dur =
+            duration_ms.unwrap_or_else(|| duration_millis(song.duration_text.as_deref())) as i64;
+        let _ = db.record_play(&song.video_id, unix_now_ms(), dur);
+    }
+    emit_library_snapshot(paths, evt_tx);
+
+    if discord_enabled {
+        let quality_line = discord_audio_quality_line(snap.nerd_stats.as_ref());
+        let state_text = match quality_line {
+            Some(q) => format!("{} · {q}", song.artist),
+            None => song.artist.clone(),
+        };
+        let activity = DiscordActivity::listening(song.title.clone(), state_text);
+        rt.spawn(async move {
+            if let Ok(mut client) = DiscordIpcClient::connect_default().await {
+                let _ = client.set_activity(&activity).await;
+            }
+        });
+    }
+}
+
+fn spawn_lyrics_lookup(
+    rt: &Handle,
+    lyrics_repo: &Arc<LyricsRepository>,
+    current_lyrics: &Arc<Mutex<Option<LyricsPayload>>>,
+    song: Song,
+    duration_ms: u64,
+    evt_tx: &Sender<BackendEvent>,
+) {
+    *current_lyrics.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    let vid = song.video_id.clone();
+    let _ = evt_tx.try_send(BackendEvent::LyricsLoading);
+    let repo = Arc::clone(lyrics_repo);
+    let tx = evt_tx.clone();
+    let lyrics_slot = Arc::clone(current_lyrics);
+    let dur_ms = duration_ms as i64;
+
+    rt.spawn(async move {
+        let mut req = LyricsRequest::new(&song.video_id, &song.title, &song.artist, dur_ms);
+        req.album = song.album_name.as_deref();
+        req.prioritize_syllable_sync = true;
+        let res = match repo.lyrics(&req, &LyricsCallbacks::default()).await {
+            Some(found) => {
+                let payload = LyricsPayload {
+                    video_id: vid.clone(),
+                    source: found.source,
+                    lines: found.lines,
+                    translated_lines: None,
+                    translated_lang: None,
+                };
+                *lyrics_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(payload.clone());
+                Ok(payload)
+            }
+            None => Err("No synced or plain lyrics available for this track.".to_owned()),
+        };
+        let _ = tx
+            .send(BackendEvent::LyricsLoaded {
+                video_id: vid,
+                result: res,
+            })
+            .await;
+    });
 }
 
 fn spawn_party_ws_loop(
@@ -1450,7 +1895,7 @@ fn spawn_party_ws_loop(
 
         match client_c.connect_ws(&code_c, &token_c).await {
             Ok(mut ws) => {
-                while !stop_c.load(std::sync::atomic::Ordering::Acquire) {
+                while !stop_c.load(Ordering::Acquire) {
                     match tokio::time::timeout(Duration::from_millis(250), ws.next_frame()).await {
                         Ok(Ok(Some(frame))) => {
                             let effects = session.apply_server_frame(frame, unix_now_ms());

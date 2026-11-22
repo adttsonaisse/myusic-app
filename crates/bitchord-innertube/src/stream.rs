@@ -1223,7 +1223,7 @@ async fn probe_stream_url(http: &Client, stream: &ResolvedStream) -> ProbeOutcom
     let max_span = stream
         .range_chunk_bytes
         .unwrap_or(AUTH_BOUNDARY_BYTES)
-        .min(64 * 1024);
+        .min(PROBE_READ_BYTES as u64);
     let mut end = start.saturating_add(max_span.saturating_sub(1));
     if let Some(len) = clen
         && len > 0

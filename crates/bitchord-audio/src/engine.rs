@@ -121,6 +121,8 @@ pub enum AudioSourceSpec {
         stream: Box<ResolvedStream>,
         on_refused: Option<RefusalCallback>,
     },
+    /// Already-opened decoder (allows non-blocking off-thread header probing).
+    PreparedDecoder(Box<AudioDecoder>),
 }
 
 struct WorkerShared {
@@ -404,6 +406,70 @@ impl AudioEngine {
         self.send_active_solo_gains();
         self.state = PlaybackState::Paused;
         Ok(info)
+    }
+
+    /// Loads an already-opened [`AudioDecoder`] onto the active deck without
+    /// blocking on HTTP range header probing on the calling thread.
+    pub fn load_prepared_decoder(
+        &mut self,
+        decoder: AudioDecoder,
+        song: Song,
+        loudness_db: Option<f64>,
+        source_label: Option<&str>,
+    ) -> Result<DecodedStreamInfo, EngineError> {
+        let active = self.crossfade.active_deck;
+        self.stop();
+        let info = self.load_into_deck(
+            active,
+            AudioSourceSpec::PreparedDecoder(Box::new(decoder)),
+            song,
+            loudness_db,
+            source_label,
+        )?;
+        self.send_active_solo_gains();
+        self.state = PlaybackState::Paused;
+        Ok(info)
+    }
+
+    /// Preloads an already-opened [`AudioDecoder`] onto the standby deck for
+    /// instant gapless or crossfade transitions.
+    pub fn preload_prepared_decoder(
+        &mut self,
+        decoder: AudioDecoder,
+        song: Song,
+        loudness_db: Option<f64>,
+        source_label: Option<&str>,
+    ) -> Result<DecodedStreamInfo, EngineError> {
+        let standby = self.crossfade.active_deck.other();
+        self.load_into_deck(
+            standby,
+            AudioSourceSpec::PreparedDecoder(Box::new(decoder)),
+            song,
+            loudness_db,
+            source_label,
+        )
+    }
+
+    /// Waits briefly until the active deck has decoded at least `min_ms` of PCM
+    /// into its `rtrb` ring (or hits EOF / error / `timeout`), preventing startup
+    /// underruns when unpausing PipeWire output.
+    pub fn wait_prebuffer(&self, min_ms: u64, timeout: Duration) {
+        let active = self.crossfade.active_deck;
+        let slot = self.deck(active);
+        if !slot.is_loaded() {
+            return;
+        }
+        let target_frames = (u64::from(self.output_sample_rate()) * min_ms) / 1_000;
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if slot.pushed_frames() >= target_frames
+                || slot.eof_reached()
+                || slot.last_error().is_some()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
     }
 
     /// Preloads a local file onto the standby deck for gapless or crossfade transition.
@@ -944,6 +1010,24 @@ impl Drop for AudioEngine {
     }
 }
 
+/// Opens a [`ChunkedRangeSource`]-backed [`AudioDecoder`] for a resolved HTTP stream
+/// off-thread so the caller can hand the ready decoder to [`AudioEngine::load_prepared_decoder`].
+pub fn open_http_decoder(
+    http: Client,
+    rt: Handle,
+    stream: &ResolvedStream,
+    on_refused: Option<RefusalCallback>,
+) -> Result<AudioDecoder, EngineError> {
+    let mut hint = Hint::new();
+    if !stream.ext.is_empty() {
+        hint.with_extension(&stream.ext);
+    } else if let Some(ext) = mime_to_extension(&stream.mime_type) {
+        hint.with_extension(ext);
+    }
+    let source = ChunkedRangeSource::from_resolved(http, rt, stream, on_refused)?;
+    Ok(AudioDecoder::open_source(Box::new(source), hint)?)
+}
+
 fn open_decoder_for_spec(spec: AudioSourceSpec) -> Result<AudioDecoder, EngineError> {
     match spec {
         AudioSourceSpec::LocalFile(path) => Ok(AudioDecoder::open_path(&path)?),
@@ -962,16 +1046,8 @@ fn open_decoder_for_spec(spec: AudioSourceSpec) -> Result<AudioDecoder, EngineEr
             rt,
             stream,
             on_refused,
-        } => {
-            let mut hint = Hint::new();
-            if !stream.ext.is_empty() {
-                hint.with_extension(&stream.ext);
-            } else if let Some(ext) = mime_to_extension(&stream.mime_type) {
-                hint.with_extension(ext);
-            }
-            let source = ChunkedRangeSource::from_resolved(http, rt, &stream, on_refused)?;
-            Ok(AudioDecoder::open_source(Box::new(source), hint)?)
-        }
+        } => open_http_decoder(http, rt, &stream, on_refused),
+        AudioSourceSpec::PreparedDecoder(dec) => Ok(*dec),
     }
 }
 

@@ -1,12 +1,15 @@
 //! Local Music Library + Offline Downloads screens (`W4-2`) backed by SQLite
-//! `LibraryDb`, `lofty` local tag scanning, and `DownloadStore`.
+//! `LibraryDb`, `lofty` local tag scanning, `DownloadStore`, track thumbnails,
+//! and vector SVG icons.
 
 use bitchord_model::{PlaybackSourceType, Song};
 use gpui::prelude::*;
 use gpui::{Context, FontWeight, Window, div, px, uniform_list};
 
 use crate::app::BitChordApp;
+use crate::artwork::song_thumbnail_url;
 use crate::backend::BackendCommand;
+use crate::icons;
 
 impl BitChordApp {
     pub fn render_library(&self, _window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -34,10 +37,17 @@ impl BitChordApp {
                             .gap(px(3.0))
                             .child(
                                 div()
-                                    .text_size(px(24.0))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(theme.text_primary)
-                                    .child("Library"),
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(10.0))
+                                    .child(icons::icon(icons::LIBRARY, 22.0, theme.accent))
+                                    .child(
+                                        div()
+                                            .text_size(px(24.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(theme.text_primary)
+                                            .child("Library"),
+                                    ),
                             )
                             .child(
                                 div()
@@ -52,14 +62,15 @@ impl BitChordApp {
                     .child(
                         div()
                             .id("lib-refresh")
-                            .h(px(32.0))
-                            .px(px(12.0))
-                            .rounded(px(6.0))
+                            .h(px(34.0))
+                            .px(px(13.0))
+                            .rounded(px(8.0))
                             .bg(theme.surface_elevated)
                             .border_1()
                             .border_color(theme.border)
                             .flex()
                             .items_center()
+                            .gap(px(6.0))
                             .cursor_pointer()
                             .text_size(px(12.5))
                             .text_color(theme.text_primary)
@@ -67,6 +78,7 @@ impl BitChordApp {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.send(BackendCommand::RefreshLibrary, cx);
                             }))
+                            .child(icons::icon(icons::REFRESH, 14.0, theme.text_secondary))
                             .child("Refresh"),
                     ),
             )
@@ -74,13 +86,14 @@ impl BitChordApp {
             .child(
                 div()
                     .p(px(12.0))
-                    .rounded(px(10.0))
+                    .rounded(px(12.0))
                     .bg(theme.surface)
                     .border_1()
                     .border_color(theme.border)
                     .flex()
                     .items_center()
                     .gap(px(10.0))
+                    .child(icons::icon(icons::FOLDER, 16.0, theme.text_secondary))
                     .child(
                         div()
                             .text_size(px(12.5))
@@ -92,12 +105,13 @@ impl BitChordApp {
                     .child(
                         div()
                             .id("lib-scan-btn")
-                            .h(px(36.0))
-                            .px(px(14.0))
-                            .rounded(px(8.0))
+                            .h(px(38.0))
+                            .px(px(15.0))
+                            .rounded(px(10.0))
                             .bg(theme.accent)
                             .flex()
                             .items_center()
+                            .gap(px(7.0))
                             .cursor_pointer()
                             .text_size(px(13.0))
                             .font_weight(FontWeight::SEMIBOLD)
@@ -106,6 +120,7 @@ impl BitChordApp {
                                 let path = this.folder_input.read(cx).text().to_owned();
                                 this.scan_folder(path, cx);
                             }))
+                            .child(icons::icon(icons::FOLDER, 14.5, theme.on_accent))
                             .child("Scan Local Audio"),
                     ),
             )
@@ -124,8 +139,12 @@ impl BitChordApp {
                                 .bg(theme.surface)
                                 .border_1()
                                 .border_color(theme.border)
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
                                 .text_size(px(12.5))
                                 .text_color(theme.text_primary)
+                                .child(icons::icon(icons::DISC, 13.5, theme.text_muted))
                                 .child(format!("{} ({})", pl.title, pl.source))
                         })),
                 )
@@ -134,7 +153,7 @@ impl BitChordApp {
             .child(if song_count == 0 {
                 div()
                     .p(px(24.0))
-                    .rounded(px(10.0))
+                    .rounded(px(12.0))
                     .bg(theme.surface)
                     .border_1()
                     .border_color(theme.border)
@@ -175,13 +194,14 @@ impl BitChordApp {
                                 let is_local = song.local_path.is_some();
                                 let songs_c = all_songs.clone();
                                 let next_s = song.clone();
+                                let art = song_thumbnail_url(&song);
 
                                 div()
                                     .id(("lib-row", idx))
                                     .w_full()
-                                    .h(px(52.0))
+                                    .h(px(58.0))
                                     .px(px(12.0))
-                                    .rounded(px(8.0))
+                                    .rounded(px(10.0))
                                     .bg(if is_cur {
                                         t.surface_elevated
                                     } else {
@@ -205,34 +225,54 @@ impl BitChordApp {
                                     }))
                                     .child(
                                         div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(12.0))
                                             .flex_1()
                                             .min_w(px(0.0))
-                                            .flex()
-                                            .flex_col()
+                                            .child(this.render_art_box(
+                                                art.as_deref(),
+                                                42.0,
+                                                7.0,
+                                                icons::MUSIC_NOTE,
+                                                t,
+                                            ))
                                             .child(
                                                 div()
-                                                    .text_size(px(13.5))
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(if is_cur {
-                                                        t.accent
-                                                    } else {
-                                                        t.text_primary
-                                                    })
-                                                    .overflow_hidden()
-                                                    .whitespace_nowrap()
-                                                    .child(song.title.clone()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(12.0))
-                                                    .text_color(t.text_muted)
-                                                    .overflow_hidden()
-                                                    .whitespace_nowrap()
-                                                    .child(if let Some(ref al) = song.album_name {
-                                                        format!("{} · {al}", song.artist)
-                                                    } else {
-                                                        song.artist.clone()
-                                                    }),
+                                                    .flex_1()
+                                                    .min_w(px(0.0))
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap(px(2.0))
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(13.5))
+                                                            .font_weight(FontWeight::MEDIUM)
+                                                            .text_color(if is_cur {
+                                                                t.accent
+                                                            } else {
+                                                                t.text_primary
+                                                            })
+                                                            .overflow_hidden()
+                                                            .whitespace_nowrap()
+                                                            .child(song.title.clone()),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(12.0))
+                                                            .text_color(t.text_muted)
+                                                            .overflow_hidden()
+                                                            .whitespace_nowrap()
+                                                            .child(
+                                                                if let Some(ref al) =
+                                                                    song.album_name
+                                                                {
+                                                                    format!("{} · {al}", song.artist)
+                                                                } else {
+                                                                    song.artist.clone()
+                                                                },
+                                                            ),
+                                                    ),
                                             ),
                                     )
                                     .child(
@@ -242,9 +282,9 @@ impl BitChordApp {
                                             .gap(px(10.0))
                                             .child(
                                                 div()
-                                                    .px(px(6.0))
+                                                    .px(px(7.0))
                                                     .py(px(2.0))
-                                                    .rounded(px(4.0))
+                                                    .rounded(px(5.0))
                                                     .bg(t.surface_elevated)
                                                     .text_size(px(10.5))
                                                     .text_color(t.text_muted)
@@ -253,12 +293,15 @@ impl BitChordApp {
                                             .child(
                                                 div()
                                                     .id(("lib-next", idx))
-                                                    .px(px(8.0))
-                                                    .py(px(4.0))
-                                                    .rounded(px(5.0))
+                                                    .px(px(9.0))
+                                                    .py(px(5.0))
+                                                    .rounded(px(7.0))
                                                     .bg(t.surface_elevated)
                                                     .border_1()
                                                     .border_color(t.border)
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(4.0))
                                                     .text_size(px(11.0))
                                                     .text_color(t.text_secondary)
                                                     .hover(move |st| st.bg(t.surface_active))
@@ -273,7 +316,12 @@ impl BitChordApp {
                                                             cx.stop_propagation();
                                                         },
                                                     ))
-                                                    .child("+ Next"),
+                                                    .child(icons::icon(
+                                                        icons::PLUS,
+                                                        12.0,
+                                                        t.text_secondary,
+                                                    ))
+                                                    .child("Next"),
                                             ),
                                     )
                             })
@@ -305,10 +353,17 @@ impl BitChordApp {
                     .gap(px(4.0))
                     .child(
                         div()
-                            .text_size(px(24.0))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(theme.text_primary)
-                            .child("Offline Downloads"),
+                            .flex()
+                            .items_center()
+                            .gap(px(10.0))
+                            .child(icons::icon(icons::DOWNLOAD, 22.0, theme.accent))
+                            .child(
+                                div()
+                                    .text_size(px(24.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(theme.text_primary)
+                                    .child("Offline Downloads"),
+                            ),
                     )
                     .child(
                         div()
@@ -320,7 +375,7 @@ impl BitChordApp {
             .child(if count == 0 {
                 div()
                     .p(px(24.0))
-                    .rounded(px(10.0))
+                    .rounded(px(12.0))
                     .bg(theme.surface)
                     .border_1()
                     .border_color(theme.border)
@@ -358,6 +413,7 @@ impl BitChordApp {
                         );
                         song.album_name = rec.album_name.clone();
                         song.local_path = Some(rec.uri.clone());
+                        let art = song_thumbnail_url(&song);
                         let fmt_label = rec
                             .download_format
                             .clone()
@@ -366,15 +422,16 @@ impl BitChordApp {
                         div()
                             .id(("dl-row", idx))
                             .w_full()
-                            .h(px(54.0))
+                            .h(px(60.0))
                             .px(px(12.0))
-                            .rounded(px(8.0))
+                            .rounded(px(10.0))
                             .bg(theme.surface)
                             .border_1()
                             .border_color(theme.border)
                             .flex()
                             .items_center()
                             .justify_between()
+                            .gap(px(12.0))
                             .cursor_pointer()
                             .hover(move |st| st.bg(theme.surface_hover))
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -390,26 +447,41 @@ impl BitChordApp {
                             .child(
                                 div()
                                     .flex()
-                                    .flex_col()
+                                    .items_center()
+                                    .gap(px(12.0))
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .child(self.render_art_box(
+                                        art.as_deref(),
+                                        42.0,
+                                        7.0,
+                                        icons::MUSIC_NOTE,
+                                        theme,
+                                    ))
                                     .child(
                                         div()
-                                            .text_size(px(13.5))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(theme.text_primary)
-                                            .child(rec.title),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(12.0))
-                                            .text_color(theme.text_muted)
-                                            .child(rec.artist),
+                                            .flex()
+                                            .flex_col()
+                                            .child(
+                                                div()
+                                                    .text_size(px(13.5))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(theme.text_primary)
+                                                    .child(rec.title),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(12.0))
+                                                    .text_color(theme.text_muted)
+                                                    .child(rec.artist),
+                                            ),
                                     ),
                             )
                             .child(
                                 div()
                                     .px(px(8.0))
                                     .py(px(3.0))
-                                    .rounded(px(5.0))
+                                    .rounded(px(6.0))
                                     .bg(theme.surface_elevated)
                                     .text_size(px(11.0))
                                     .text_color(theme.text_secondary)

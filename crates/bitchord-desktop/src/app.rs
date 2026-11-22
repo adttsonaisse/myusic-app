@@ -1,18 +1,25 @@
 //! Root GPUI window view [`BitChordApp`] coordinating navigation, theme,
-//! bounded LRU artwork cache, backend event consumption, and view routing.
+//! bounded LRU artwork cache with automatic lazy viewport loading, smooth
+//! auto-scrolling lyrics, debounced search suggestions, backend event
+//! consumption, and view routing.
 
-use std::collections::HashSet;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use bitchord_audio::{PlaybackSnapshot, PlaybackState};
 use bitchord_dsp_core::{EqLayout, EqualizerPreset};
 use bitchord_integrations::ListenTogetherState;
-use bitchord_model::{BrowseType, HomeFeed, PlaybackSourceType, SearchFilter, SearchResult, Song};
+use bitchord_model::{
+    BrowseItem, BrowseType, EntityType, HomeFeed, PlaybackSourceType, SearchFilter,
+    SearchHistoryEntity, SearchResult, Song,
+};
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Decorations, Entity, FocusHandle, Focusable, ListAlignment, ListState, ObjectFit,
-    Render, Task, Window, div, img, px,
+    App, Bounds, Context, Decorations, Entity, FocusHandle, Focusable, ListAlignment, ListOffset,
+    ListState, ObjectFit, Pixels, Render, Task, Window, div, img, px,
 };
 
 use crate::actions::{
@@ -20,11 +27,12 @@ use crate::actions::{
     SeekForward, ToggleLyrics, ToggleMute, ToggleNowPlaying, ToggleQueue, ToggleTheme, VolumeDown,
     VolumeUp,
 };
-use crate::artwork::{ArtworkCache, fetch_and_decode_artwork};
+use crate::artwork::{ArtworkCache, fetch_and_decode_artwork, song_thumbnail_url};
 use crate::backend::{
     AppBackend, BackendCommand, BackendEvent, DetailPayload, LibrarySnapshot, LyricsPayload,
-    QueueViewSnapshot, StreamBackendChoice,
+    QueueViewSnapshot, SearchSuggestionsPayload, StreamBackendChoice,
 };
+use crate::icons;
 use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme::{ArtworkPalette, BitChordTheme, ThemeMode};
 
@@ -55,15 +63,29 @@ pub struct BitChordApp {
     pub playback_synced_at: Instant,
     pub queue: QueueViewSnapshot,
 
+    // Continuous pill slider bounds & drag seek throttling (`notes.md` #4)
+    pub bar_seek_bounds: Rc<Cell<Bounds<Pixels>>>,
+    pub np_seek_bounds: Rc<Cell<Bounds<Pixels>>>,
+    pub vol_slider_bounds: Rc<Cell<Bounds<Pixels>>>,
+    pub last_drag_seek_at: Instant,
+
     // Screen data (explicit Loading / Empty / Error states)
     pub home: LoadState<HomeFeed>,
     pub search_filter: SearchFilter,
     pub search_results: LoadState<Vec<SearchResult>>,
+    pub search_suggestions: SearchSuggestionsPayload,
+    pub search_input_text: String,
+    pub search_suggestions_open: bool,
     pub last_search_query: String,
     pub detail: LoadState<DetailPayload>,
     pub lyrics: LoadState<LyricsPayload>,
     pub lyrics_list_state: ListState,
     pub show_translated_lyrics: bool,
+    pub active_lyric_idx: Option<usize>,
+    pub prev_lyric_idx: Option<usize>,
+    pub lyric_transition_at: Instant,
+    pub lyrics_last_frame_at: Instant,
+    pub lyrics_manual_scroll_until: Option<Instant>,
     pub library: LibrarySnapshot,
     pub party: ListenTogetherState,
     pub party_probe_status: Option<String>,
@@ -78,6 +100,7 @@ pub struct BitChordApp {
     // Artwork LRU cache + active Now Playing mesh backdrop
     pub artwork_cache: ArtworkCache,
     pub default_mesh: std::sync::Arc<gpui::RenderImage>,
+    pending_art_urls: RefCell<Vec<String>>,
 
     // Transient feedback banner
     pub status_notice: Option<String>,
@@ -95,8 +118,9 @@ pub struct BitChordApp {
     // Subscriptions & background tasks owned by the window
     _subscriptions: Vec<gpui::Subscription>,
     _event_task: Task<()>,
-    _art_tasks: Vec<Task<()>>,
-    _requested_urls: HashSet<String>,
+    art_tasks: HashMap<String, Task<()>>,
+    search_suggest_task: Option<Task<()>>,
+    notice_clear_task: Option<Task<()>>,
 }
 
 impl BitChordApp {
@@ -147,21 +171,30 @@ impl BitChordApp {
             cx.new(|cx| TextInput::new("https://open.spotify.com/playlist/...", cx));
 
         let mut subscriptions = Vec::new();
-        subscriptions.push(cx.subscribe(&search_input, |this, _, event, cx| {
-            let TextInputEvent::Submitted(query) = event;
-            this.submit_search(query.clone(), cx);
-        }));
+        subscriptions.push(
+            cx.subscribe(&search_input, |this, _, event, cx| match event {
+                TextInputEvent::Changed(query) => {
+                    this.on_search_query_changed(query.clone(), cx);
+                }
+                TextInputEvent::Submitted(query) => {
+                    this.submit_search(query.clone(), cx);
+                }
+            }),
+        );
         subscriptions.push(cx.subscribe(&folder_input, |this, _, event, cx| {
-            let TextInputEvent::Submitted(path) = event;
-            this.scan_folder(path.clone(), cx);
+            if let TextInputEvent::Submitted(path) = event {
+                this.scan_folder(path.clone(), cx);
+            }
         }));
         subscriptions.push(cx.subscribe(&party_code_input, |this, _, event, cx| {
-            let TextInputEvent::Submitted(code) = event;
-            this.join_party(code.clone(), cx);
+            if let TextInputEvent::Submitted(code) = event {
+                this.join_party(code.clone(), cx);
+            }
         }));
         subscriptions.push(cx.subscribe(&spotify_input, |this, _, event, cx| {
-            let TextInputEvent::Submitted(url) = event;
-            this.import_spotify(url.clone(), cx);
+            if let TextInputEvent::Submitted(url) = event {
+                this.import_spotify(url.clone(), cx);
+            }
         }));
 
         // Consume discrete backend events without polling timers (`gpui-linux.md` §3.3).
@@ -209,6 +242,7 @@ impl BitChordApp {
         backend.send(BackendCommand::LoadHome);
         backend.send(BackendCommand::RefreshLibrary);
 
+        let now = Instant::now();
         Self {
             focus_handle,
             theme_mode: initial_theme,
@@ -221,16 +255,28 @@ impl BitChordApp {
             pipewire_active: true,
             audio_banner: None,
             playback,
-            playback_synced_at: Instant::now(),
+            playback_synced_at: now,
             queue: QueueViewSnapshot::default(),
+            bar_seek_bounds: Rc::new(Cell::new(Bounds::default())),
+            np_seek_bounds: Rc::new(Cell::new(Bounds::default())),
+            vol_slider_bounds: Rc::new(Cell::new(Bounds::default())),
+            last_drag_seek_at: now,
             home: LoadState::Loading,
             search_filter: SearchFilter::Songs,
             search_results: LoadState::Idle,
+            search_suggestions: SearchSuggestionsPayload::default(),
+            search_input_text: String::new(),
+            search_suggestions_open: false,
             last_search_query: String::new(),
             detail: LoadState::Idle,
             lyrics: LoadState::Idle,
-            lyrics_list_state: ListState::new(0, ListAlignment::Top, px(220.0)),
+            lyrics_list_state: ListState::new(0, ListAlignment::Top, px(260.0)),
             show_translated_lyrics: false,
+            active_lyric_idx: None,
+            prev_lyric_idx: None,
+            lyric_transition_at: now,
+            lyrics_last_frame_at: now,
+            lyrics_manual_scroll_until: None,
             library: LibrarySnapshot::default(),
             party: ListenTogetherState::default(),
             party_probe_status: None,
@@ -241,6 +287,7 @@ impl BitChordApp {
             discord_rpc_enabled: backend.initial_settings.discord_rpc_enabled,
             artwork_cache: ArtworkCache::default(),
             default_mesh: ArtworkPalette::default().build_mesh_render_image(),
+            pending_art_urls: RefCell::new(Vec::new()),
             status_notice: None,
             error_notice: None,
             search_input,
@@ -252,8 +299,9 @@ impl BitChordApp {
             spotify_input,
             _subscriptions: subscriptions,
             _event_task: event_task,
-            _art_tasks: Vec::new(),
-            _requested_urls: HashSet::new(),
+            art_tasks: HashMap::new(),
+            search_suggest_task: None,
+            notice_clear_task: None,
         }
     }
 
@@ -279,6 +327,24 @@ impl BitChordApp {
         } else {
             est
         }
+    }
+
+    /// Seeks immediately on click, or throttled (~90 ms) while dragging a pill scrubber.
+    pub fn seek_fraction(&mut self, frac: f32, is_drag: bool, cx: &mut Context<Self>) {
+        let dur_ms = self.playback.duration_ms;
+        if dur_ms == 0 {
+            return;
+        }
+        let clamped = frac.clamp(0.0, 1.0);
+        let target_ms = (f64::from(clamped) * dur_ms as f64).round() as u64;
+        // Optimistically update local position so the continuous pill follows pointer at 60fps.
+        self.playback.position_ms = target_ms;
+        self.playback_synced_at = Instant::now();
+        if !is_drag || self.last_drag_seek_at.elapsed() >= Duration::from_millis(90) {
+            self.last_drag_seek_at = Instant::now();
+            self.send(BackendCommand::SeekMs(target_ms), cx);
+        }
+        cx.notify();
     }
 
     pub fn navigate(&mut self, next: Route, cx: &mut Context<Self>) {
@@ -317,11 +383,49 @@ impl BitChordApp {
         );
     }
 
+    /// Debounces live YouTube Music query + song typeahead suggestions as the user types.
+    pub fn on_search_query_changed(&mut self, query: String, cx: &mut Context<Self>) {
+        self.search_input_text = query.clone();
+        let trimmed = query.trim().to_owned();
+        if trimmed.is_empty() {
+            self.search_suggest_task = None;
+            self.search_suggestions = SearchSuggestionsPayload::default();
+            self.search_suggestions_open = false;
+            self.search_results = LoadState::Idle;
+            self.last_search_query.clear();
+            cx.notify();
+            return;
+        }
+        if trimmed.len() < 2 {
+            self.search_suggest_task = None;
+            self.search_suggestions = SearchSuggestionsPayload::default();
+            self.search_suggestions_open = false;
+            cx.notify();
+            return;
+        }
+        self.search_suggestions_open = true;
+        let q = trimmed.clone();
+        self.search_suggest_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(200))
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                if app.search_input_text.trim() == q {
+                    app.send(BackendCommand::SearchSuggest(q), cx);
+                }
+            });
+        }));
+        cx.notify();
+    }
+
     pub fn submit_search(&mut self, query: String, cx: &mut Context<Self>) {
         let trimmed = query.trim().to_owned();
         if trimmed.is_empty() {
             return;
         }
+        self.search_input_text = trimmed.clone();
+        self.search_suggestions_open = false;
+        self.search_suggest_task = None;
         self.last_search_query = trimmed.clone();
         self.search_results = LoadState::Loading;
         self.navigate(Route::Search, cx);
@@ -330,6 +434,50 @@ impl BitChordApp {
                 query: trimmed,
                 filter: self.search_filter,
             },
+            cx,
+        );
+    }
+
+    pub fn record_song_search_selection(&self, song: &Song, cx: &App) {
+        let mut subtitle = song.artist.clone();
+        if let Some(ref dur) = song.duration_text
+            && !dur.is_empty()
+        {
+            subtitle = format!("{} · {dur}", song.artist);
+        }
+        self.send(
+            BackendCommand::RecordSearchSelection(SearchHistoryEntity {
+                id: song.video_id.clone(),
+                title: song.title.clone(),
+                subtitle,
+                artwork_url: song_thumbnail_url(song),
+                entity_type: EntityType::Track,
+                timestamp: 0,
+            }),
+            cx,
+        );
+    }
+
+    pub fn record_browse_search_selection(&self, item: &BrowseItem, cx: &App) {
+        let entity_type = match item.r#type {
+            BrowseType::Album => EntityType::Album,
+            BrowseType::Artist => EntityType::Artist,
+            BrowseType::Playlist => EntityType::Playlist,
+            BrowseType::Other => EntityType::Other,
+        };
+        self.send(
+            BackendCommand::RecordSearchSelection(SearchHistoryEntity {
+                id: item.browse_id.clone(),
+                title: item.title.clone(),
+                subtitle: if item.subtitle.is_empty() {
+                    format!("{:?}", item.r#type)
+                } else {
+                    item.subtitle.clone()
+                },
+                artwork_url: item.thumbnail_url.clone(),
+                entity_type,
+                timestamp: 0,
+            }),
             cx,
         );
     }
@@ -388,43 +536,125 @@ impl BitChordApp {
         self.send(BackendCommand::ImportSpotifyPlaylist(url_or_id), cx);
     }
 
+    /// Starts an asynchronous artwork download without ever aborting other in-flight tasks.
     pub fn ensure_artwork_loaded(&mut self, url: &str, cx: &mut Context<Self>) {
-        if url.is_empty() || !self.artwork_cache.begin_fetch(url) {
+        let Some(normalized) = self.artwork_cache.begin_fetch(url) else {
             return;
-        }
+        };
         let backend = cx.global::<AppBackend>().clone();
         let http = backend.http.clone();
         let cache_dir = backend.paths.cache_dir.clone();
-        let url_owned = url.to_owned();
+        let key_for_task = normalized.clone();
 
         let task = cx.spawn(async move |this, cx| {
-            let url_for_fetch = url_owned.clone();
+            let url_for_fetch = key_for_task.clone();
             let res = gpui_ce_tokio::Tokio::spawn(cx, async move {
                 fetch_and_decode_artwork(&http, &cache_dir, &url_for_fetch).await
             })
             .await;
 
             let _ = this.update(cx, |app, cx| {
+                app.art_tasks.remove(&key_for_task);
                 match res {
                     Ok(Ok(art)) => {
-                        let evicted = app.artwork_cache.insert(url_owned, art);
+                        let evicted = app.artwork_cache.insert(key_for_task, art);
                         for old in evicted {
                             cx.drop_image(old.image, None);
                             cx.drop_image(old.mesh, None);
                         }
                     }
                     _ => {
-                        app.artwork_cache.mark_failed(&url_owned);
+                        app.artwork_cache.mark_failed(&key_for_task);
                     }
                 }
                 cx.notify();
             });
         });
-        // Keep bounded task handles so eviction doesn't leak handles.
-        if self._art_tasks.len() >= 96 {
-            self._art_tasks.clear();
+        self.art_tasks.insert(normalized, task);
+    }
+
+    fn flush_pending_artwork(&mut self, cx: &mut Context<Self>) {
+        let queued: Vec<String> = self.pending_art_urls.borrow_mut().drain(..).collect();
+        for url in queued {
+            self.ensure_artwork_loaded(&url, cx);
         }
-        self._art_tasks.push(task);
+    }
+
+    fn schedule_notice_auto_clear(&mut self, cx: &mut Context<Self>) {
+        self.notice_clear_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(3)).await;
+            let _ = this.update(cx, |app, cx| {
+                app.status_notice = None;
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Smoothly auto-scrolls the Now Playing lyrics list whenever the active verse advances
+    /// (`notes.md` #3), respecting temporary manual user scrolling.
+    fn sync_lyrics_scroll(&mut self) -> bool {
+        if self.route != Route::NowPlaying {
+            return false;
+        }
+        let LoadState::Ready(ref payload) = self.lyrics else {
+            return false;
+        };
+        if payload.lines.is_empty() {
+            return false;
+        }
+
+        let pos_ms = self.live_position_ms() as i64;
+        let active_idx = payload.lines.iter().rposition(|l| pos_ms >= l.time_ms);
+
+        let now = Instant::now();
+        let dt = now
+            .duration_since(self.lyrics_last_frame_at)
+            .as_secs_f32()
+            .clamp(0.001, 0.05);
+        self.lyrics_last_frame_at = now;
+
+        if active_idx != self.active_lyric_idx {
+            self.prev_lyric_idx = self.active_lyric_idx;
+            self.active_lyric_idx = active_idx;
+            self.lyric_transition_at = now;
+        }
+
+        let mut animating = self.lyric_transition_at.elapsed() < Duration::from_millis(520);
+        let manual_paused = self
+            .lyrics_manual_scroll_until
+            .is_some_and(|until| now < until);
+
+        if !manual_paused && let Some(idx) = active_idx {
+            let vp = self.lyrics_list_state.viewport_bounds();
+            let vp_h = f32::from(vp.size.height);
+            if vp_h > 40.0 {
+                // Keep active verse comfortably positioned ~28% down the lyrics viewport.
+                let target_y = vp.origin.y + px(vp_h * 0.28);
+                if let Some(item_b) = self.lyrics_list_state.bounds_for_item(idx) {
+                    let delta = f32::from(item_b.origin.y - target_y);
+                    if delta.abs() > 0.75 {
+                        // Exponential ease-out: silky ~320 ms glide on verse change!
+                        let alpha = 1.0 - (-9.0 * dt).exp();
+                        let step = if delta.abs() < 1.5 {
+                            delta
+                        } else {
+                            delta * alpha
+                        };
+                        self.lyrics_list_state.scroll_by(px(step));
+                        animating = true;
+                    }
+                } else {
+                    // Active line is off-screen (e.g., seek jump or opened mid-track):
+                    // jump close so next frame glides smoothly into exact 28% focal alignment.
+                    self.lyrics_list_state.scroll_to(ListOffset {
+                        item_ix: idx.saturating_sub(2),
+                        offset_in_item: px(0.0),
+                    });
+                    animating = true;
+                }
+            }
+        }
+        animating
     }
 
     fn handle_backend_event(&mut self, evt: BackendEvent, cx: &mut Context<Self>) {
@@ -441,28 +671,41 @@ impl BitChordApp {
             BackendEvent::PlaybackUpdated(snap) => {
                 let snap = *snap;
                 if let Some(ref song) = snap.current_song
-                    && let Some(ref art) = song.thumbnail_url
+                    && let Some(url) = song_thumbnail_url(song)
                 {
-                    let url = art.clone();
                     self.ensure_artwork_loaded(&url, cx);
                 }
                 self.playback = snap;
                 self.playback_synced_at = Instant::now();
             }
             BackendEvent::QueueUpdated(q) => {
+                let urls: Vec<String> = q
+                    .items
+                    .iter()
+                    .take(24)
+                    .filter_map(song_thumbnail_url)
+                    .collect();
                 self.queue = q;
+                for u in urls {
+                    self.ensure_artwork_loaded(&u, cx);
+                }
             }
             BackendEvent::HomeLoading => {
                 self.home = LoadState::Loading;
             }
             BackendEvent::HomeLoaded(res) => match res {
                 Ok(feed) => {
-                    // Warm thumbnails for the first visible shelf items.
+                    // Warm visible thumbnails across all home shelves (bounded by artwork semaphore).
                     let mut prefetch = Vec::new();
-                    for shelf in feed.shelves.iter().take(3) {
-                        for item in shelf.items.iter().take(6) {
+                    for shelf in &feed.shelves {
+                        for item in shelf.items.iter().take(10) {
                             if let Some(ref u) = item.thumbnail_url {
                                 prefetch.push(u.clone());
+                            } else if let Some(ref vid) = item.video_id {
+                                let tmp = Song::new(vid.clone(), "", "", None);
+                                if let Some(fb) = song_thumbnail_url(&tmp) {
+                                    prefetch.push(fb);
+                                }
                             }
                         }
                     }
@@ -485,10 +728,10 @@ impl BitChordApp {
                     Ok(rows) => {
                         let urls: Vec<String> =
                             rows.iter()
-                                .take(12)
+                                .take(24)
                                 .filter_map(|r| match r {
                                     SearchResult::TopTrack { song }
-                                    | SearchResult::Track { song } => song.thumbnail_url.clone(),
+                                    | SearchResult::Track { song } => song_thumbnail_url(song),
                                     SearchResult::Browse { item } => item.thumbnail_url.clone(),
                                 })
                                 .collect();
@@ -502,18 +745,49 @@ impl BitChordApp {
                     }
                 }
             }
+            BackendEvent::SearchSuggestionsLoaded(payload) => {
+                if payload.query.is_empty()
+                    || self
+                        .search_input_text
+                        .trim()
+                        .eq_ignore_ascii_case(&payload.query)
+                {
+                    let urls: Vec<String> = payload
+                        .items
+                        .iter()
+                        .filter_map(|r| match r {
+                            SearchResult::TopTrack { song } | SearchResult::Track { song } => {
+                                song_thumbnail_url(song)
+                            }
+                            SearchResult::Browse { item } => item.thumbnail_url.clone(),
+                        })
+                        .collect();
+                    self.search_suggestions = payload;
+                    for u in urls {
+                        self.ensure_artwork_loaded(&u, cx);
+                    }
+                }
+            }
             BackendEvent::DetailLoading => {
                 self.detail = LoadState::Loading;
             }
             BackendEvent::DetailLoaded(res) => match res {
                 Ok(payload) => {
+                    let mut urls = Vec::new();
                     if let Some(ref h) = payload.header
                         && let Some(ref u) = h.thumbnail_url
                     {
-                        let url = u.clone();
-                        self.ensure_artwork_loaded(&url, cx);
+                        urls.push(u.clone());
+                    }
+                    for s in payload.songs.iter().take(24) {
+                        if let Some(u) = song_thumbnail_url(s) {
+                            urls.push(u);
+                        }
                     }
                     self.detail = LoadState::Ready(payload);
+                    for u in urls {
+                        self.ensure_artwork_loaded(&u, cx);
+                    }
                 }
                 Err(err) => {
                     self.detail = LoadState::Error(err);
@@ -521,7 +795,10 @@ impl BitChordApp {
             },
             BackendEvent::LyricsLoading => {
                 self.lyrics = LoadState::Loading;
-                self.lyrics_list_state = ListState::new(0, ListAlignment::Top, px(220.0));
+                self.active_lyric_idx = None;
+                self.prev_lyric_idx = None;
+                self.lyrics_manual_scroll_until = None;
+                self.lyrics_list_state = ListState::new(0, ListAlignment::Top, px(260.0));
             }
             BackendEvent::LyricsLoaded { video_id, result } => {
                 let current_vid = self
@@ -535,18 +812,37 @@ impl BitChordApp {
                 match result {
                     Ok(payload) => {
                         let count = payload.lines.len();
+                        self.active_lyric_idx = None;
+                        self.prev_lyric_idx = None;
+                        self.lyrics_manual_scroll_until = None;
                         self.lyrics_list_state =
-                            ListState::new(count, ListAlignment::Top, px(220.0));
+                            ListState::new(count, ListAlignment::Top, px(260.0));
                         self.lyrics = LoadState::Ready(payload);
                     }
                     Err(err) => {
                         self.lyrics = LoadState::Error(err);
-                        self.lyrics_list_state = ListState::new(0, ListAlignment::Top, px(220.0));
+                        self.active_lyric_idx = None;
+                        self.prev_lyric_idx = None;
+                        self.lyrics_list_state = ListState::new(0, ListAlignment::Top, px(260.0));
                     }
                 }
             }
             BackendEvent::LibraryLoaded(lib) => {
+                let mut urls = Vec::new();
+                for h in &lib.search_history {
+                    if let Some(ref u) = h.artwork_url {
+                        urls.push(u.clone());
+                    }
+                }
+                for s in lib.songs.iter().take(18) {
+                    if let Some(u) = song_thumbnail_url(s) {
+                        urls.push(u);
+                    }
+                }
                 self.library = lib;
+                for u in urls {
+                    self.ensure_artwork_loaded(&u, cx);
+                }
             }
             BackendEvent::PartyServerProbed {
                 server,
@@ -563,8 +859,15 @@ impl BitChordApp {
                 self.party = *state;
             }
             BackendEvent::StatusNotice(msg) => {
-                self.status_notice = Some(msg);
-                self.error_notice = None;
+                // Keep transient status banners quiet for routine play/loading transitions
+                // (already reflected cleanly in the bottom player bar).
+                if msg.starts_with("Playing ") || msg.starts_with("Loading ") {
+                    self.error_notice = None;
+                } else {
+                    self.status_notice = Some(msg);
+                    self.error_notice = None;
+                    self.schedule_notice_auto_clear(cx);
+                }
             }
             BackendEvent::ErrorNotice(msg) => {
                 self.error_notice = Some(msg);
@@ -577,50 +880,56 @@ impl BitChordApp {
         self.playback
             .current_song
             .as_ref()
-            .and_then(|s| s.thumbnail_url.as_deref())
-            .and_then(|u| self.artwork_cache.get(u))
+            .and_then(song_thumbnail_url)
+            .and_then(|u| self.artwork_cache.get(&u))
             .map(|a| a.mesh.clone())
             .unwrap_or_else(|| self.default_mesh.clone())
     }
 
+    /// Renders an album/track cover thumbnail (with automatic on-demand lazy loading
+    /// for any visible URL not yet in cache) and crisp vector SVG fallback.
     pub fn render_art_box(
         &self,
         url: Option<&str>,
         size_px: f32,
         radius_px: f32,
-        fallback_glyph: &str,
+        fallback_icon: &'static [u8],
         theme: BitChordTheme,
     ) -> impl IntoElement {
-        if let Some(art) = url.and_then(|u| self.artwork_cache.get(u)) {
-            div()
-                .w(px(size_px))
-                .h(px(size_px))
-                .rounded(px(radius_px))
-                .overflow_hidden()
-                .flex_shrink_0()
-                .bg(theme.surface_elevated)
-                .child(
-                    img(art.image.clone())
-                        .w(px(size_px))
-                        .h(px(size_px))
-                        .object_fit(ObjectFit::Cover),
-                )
-        } else {
-            div()
-                .w(px(size_px))
-                .h(px(size_px))
-                .rounded(px(radius_px))
-                .flex_shrink_0()
-                .bg(theme.surface_elevated)
-                .border_1()
-                .border_color(theme.border)
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px((size_px * 0.34).clamp(11.0, 28.0)))
-                .text_color(theme.text_muted)
-                .child(fallback_glyph.to_owned())
+        if let Some(u) = url {
+            if let Some(art) = self.artwork_cache.get(u) {
+                return div()
+                    .w(px(size_px))
+                    .h(px(size_px))
+                    .rounded(px(radius_px))
+                    .overflow_hidden()
+                    .flex_shrink_0()
+                    .bg(theme.surface_elevated)
+                    .child(
+                        img(art.image.clone())
+                            .w(px(size_px))
+                            .h(px(size_px))
+                            .object_fit(ObjectFit::Cover),
+                    );
+            }
+            if !self.artwork_cache.is_settled(u) {
+                self.pending_art_urls.borrow_mut().push(u.to_owned());
+            }
         }
+
+        let icon_sz = (size_px * 0.40).clamp(14.0, 44.0);
+        div()
+            .w(px(size_px))
+            .h(px(size_px))
+            .rounded(px(radius_px))
+            .flex_shrink_0()
+            .bg(theme.surface_elevated)
+            .border_1()
+            .border_color(theme.border)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(icons::icon(fallback_icon, icon_sz, theme.text_muted))
     }
 
     // ---- GPUI Action Handlers -----------------------------------------------
@@ -703,7 +1012,10 @@ impl BitChordApp {
     }
 
     fn on_escape_close(&mut self, _: &CloseWindowAction, _w: &mut Window, cx: &mut Context<Self>) {
-        if self.queue_open {
+        if self.search_suggestions_open {
+            self.search_suggestions_open = false;
+            cx.notify();
+        } else if self.queue_open {
             self.queue_open = false;
             cx.notify();
         } else if self.route == Route::NowPlaying {
@@ -729,8 +1041,11 @@ impl Render for BitChordApp {
         let theme = self.theme();
         let is_csd = matches!(window.window_decorations(), Decorations::Client { .. });
 
-        // Drive smooth 60fps frames ONLY when Now Playing word-synced lyrics are visible & playing.
-        if self.route == Route::NowPlaying && self.playback.state == PlaybackState::Playing {
+        // Smoothly drive lyrics auto-scroll & verse transitions when Now Playing is visible.
+        let lyrics_animating = self.sync_lyrics_scroll();
+        if self.route == Route::NowPlaying
+            && (self.playback.state == PlaybackState::Playing || lyrics_animating)
+        {
             window.request_animation_frame();
         }
 
@@ -744,6 +1059,16 @@ impl Render for BitChordApp {
             Route::Settings => self.render_settings(window, cx).into_any_element(),
             Route::NowPlaying => self.render_now_playing(cx).into_any_element(),
         };
+
+        let titlebar = self.render_titlebar(is_csd, cx).into_any_element();
+        let sidebar = self.render_sidebar(cx).into_any_element();
+        let queue_drawer = self
+            .queue_open
+            .then(|| self.render_queue_drawer(cx).into_any_element());
+        let player_bar = self.render_player_bar(cx).into_any_element();
+
+        // Flush any newly rendered visible artwork URLs queued lazily during render_art_box().
+        self.flush_pending_artwork(cx);
 
         div()
             .id("bitchord-root")
@@ -771,7 +1096,7 @@ impl Render for BitChordApp {
             .text_color(theme.text_primary)
             .overflow_hidden()
             // Top bar (adapts automatically to Wayland CSD vs X11/server titlebar)
-            .child(self.render_titlebar(is_csd, cx))
+            .child(titlebar)
             // Middle body: sidebar rail + active route content + optional Queue slide-over drawer
             .child(
                 div()
@@ -782,7 +1107,7 @@ impl Render for BitChordApp {
                     .flex()
                     .flex_row()
                     .overflow_hidden()
-                    .child(self.render_sidebar(cx))
+                    .child(sidebar)
                     .child(
                         div()
                             .relative()
@@ -824,17 +1149,23 @@ impl Render for BitChordApp {
                                         .child(
                                             div()
                                                 .id("dismiss-error")
-                                                .px(px(8.0))
-                                                .py(px(2.0))
-                                                .rounded(px(4.0))
+                                                .w(px(24.0))
+                                                .h(px(24.0))
+                                                .rounded(px(6.0))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
                                                 .cursor_pointer()
-                                                .text_color(theme.text_secondary)
                                                 .hover(move |s| s.bg(theme.surface_hover))
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.error_notice = None;
                                                     cx.notify();
                                                 }))
-                                                .child("Dismiss"),
+                                                .child(icons::icon(
+                                                    icons::CLOSE,
+                                                    14.0,
+                                                    theme.text_secondary,
+                                                )),
                                         ),
                                 )
                             })
@@ -856,16 +1187,23 @@ impl Render for BitChordApp {
                                         .child(
                                             div()
                                                 .id("dismiss-notice")
-                                                .px(px(8.0))
-                                                .py(px(2.0))
-                                                .rounded(px(4.0))
+                                                .w(px(22.0))
+                                                .h(px(22.0))
+                                                .rounded(px(5.0))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
                                                 .cursor_pointer()
                                                 .hover(move |s| s.bg(theme.surface_hover))
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.status_notice = None;
                                                     cx.notify();
                                                 }))
-                                                .child("Close"),
+                                                .child(icons::icon(
+                                                    icons::CLOSE,
+                                                    13.0,
+                                                    theme.text_muted,
+                                                )),
                                         ),
                                 )
                             })
@@ -878,10 +1216,10 @@ impl Render for BitChordApp {
                                     .child(content_area),
                             ),
                     )
-                    .when(self.queue_open, |el| el.child(self.render_queue_drawer(cx))),
+                    .when_some(queue_drawer, |el, drawer| el.child(drawer)),
             )
             // Persistent bottom floating Now Playing bar (glass surface 1 of 2)
-            .child(self.render_player_bar(cx))
+            .child(player_bar)
     }
 }
 

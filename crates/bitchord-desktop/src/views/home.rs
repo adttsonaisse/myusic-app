@@ -1,5 +1,6 @@
 //! Home feed screen (`W4-2`) showing live YouTube Music InnerTube shelves
-//! plus recent local library tracks with distinct loading, empty, and error states.
+//! plus recent local library tracks with vector SVG icons, automatic lazy
+//! cover-art loading, and distinct loading, empty, and error states.
 
 use bitchord_model::{BrowseType, PlaybackSourceType, Song};
 use gpui::prelude::*;
@@ -7,7 +8,9 @@ use gpui::{Context, FontWeight, div, px};
 
 use crate::actions::Route;
 use crate::app::{BitChordApp, LoadState};
+use crate::artwork::song_thumbnail_url;
 use crate::backend::BackendCommand;
+use crate::icons;
 
 impl BitChordApp {
     pub fn render_home(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -55,14 +58,15 @@ impl BitChordApp {
                             .child(
                                 div()
                                     .id("home-refresh")
-                                    .h(px(34.0))
+                                    .h(px(36.0))
                                     .px(px(14.0))
-                                    .rounded(px(8.0))
+                                    .rounded(px(9.0))
                                     .bg(theme.surface_elevated)
                                     .border_1()
                                     .border_color(theme.border)
                                     .flex()
                                     .items_center()
+                                    .gap(px(7.0))
                                     .cursor_pointer()
                                     .text_size(px(13.0))
                                     .font_weight(FontWeight::MEDIUM)
@@ -71,17 +75,19 @@ impl BitChordApp {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.send(BackendCommand::LoadHome, cx);
                                     }))
+                                    .child(icons::icon(icons::REFRESH, 14.5, theme.text_secondary))
                                     .child("Refresh Feed"),
                             )
                             .child(
                                 div()
                                     .id("home-open-library")
-                                    .h(px(34.0))
+                                    .h(px(36.0))
                                     .px(px(14.0))
-                                    .rounded(px(8.0))
+                                    .rounded(px(9.0))
                                     .bg(theme.accent)
                                     .flex()
                                     .items_center()
+                                    .gap(px(7.0))
                                     .cursor_pointer()
                                     .text_size(px(13.0))
                                     .font_weight(FontWeight::SEMIBOLD)
@@ -89,6 +95,7 @@ impl BitChordApp {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.navigate(Route::Library, cx);
                                     }))
+                                    .child(icons::icon(icons::LIBRARY, 14.5, theme.on_accent))
                                     .child("Local Music"),
                             ),
                     ),
@@ -104,7 +111,7 @@ impl BitChordApp {
                         .gap(px(10.0))
                         .child(
                             div()
-                                .text_size(px(17.0))
+                                .text_size(px(17.5))
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(theme.text_primary)
                                 .child("Recent & Local Library"),
@@ -118,12 +125,12 @@ impl BitChordApp {
                                     let all = songs.clone();
                                     let title = song.title.clone();
                                     let artist = song.artist.clone();
-                                    let art_url = song.thumbnail_url.clone();
+                                    let art_url = song_thumbnail_url(&song);
                                     div()
                                         .id(("home-local-card", idx))
-                                        .w(px(280.0))
+                                        .w(px(286.0))
                                         .p(px(10.0))
-                                        .rounded(px(10.0))
+                                        .rounded(px(12.0))
                                         .bg(theme.surface)
                                         .border_1()
                                         .border_color(theme.border)
@@ -144,9 +151,9 @@ impl BitChordApp {
                                         }))
                                         .child(self.render_art_box(
                                             art_url.as_deref(),
-                                            46.0,
-                                            6.0,
-                                            "TR",
+                                            48.0,
+                                            8.0,
+                                            icons::MUSIC_NOTE,
                                             theme,
                                         ))
                                         .child(
@@ -174,6 +181,7 @@ impl BitChordApp {
                                                         .child(artist),
                                                 ),
                                         )
+                                        .child(icons::icon(icons::PLAY, 13.0, theme.text_muted))
                                 })),
                         ),
                 )
@@ -182,7 +190,7 @@ impl BitChordApp {
             .child(match &self.home {
                 LoadState::Idle | LoadState::Loading => div()
                     .p(px(24.0))
-                    .rounded(px(10.0))
+                    .rounded(px(12.0))
                     .bg(theme.surface)
                     .border_1()
                     .border_color(theme.border)
@@ -192,7 +200,7 @@ impl BitChordApp {
                     .into_any_element(),
                 LoadState::Error(err) => div()
                     .p(px(20.0))
-                    .rounded(px(10.0))
+                    .rounded(px(12.0))
                     .bg(theme.surface)
                     .border_1()
                     .border_color(theme.danger)
@@ -216,14 +224,15 @@ impl BitChordApp {
                         div()
                             .id("home-retry")
                             .w(px(110.0))
-                            .h(px(32.0))
-                            .rounded(px(6.0))
+                            .h(px(34.0))
+                            .rounded(px(8.0))
                             .bg(theme.surface_elevated)
                             .border_1()
                             .border_color(theme.border)
                             .flex()
                             .items_center()
                             .justify_center()
+                            .gap(px(6.0))
                             .cursor_pointer()
                             .text_size(px(12.5))
                             .text_color(theme.text_primary)
@@ -231,12 +240,13 @@ impl BitChordApp {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.send(BackendCommand::LoadHome, cx);
                             }))
+                            .child(icons::icon(icons::REFRESH, 13.5, theme.text_primary))
                             .child("Retry"),
                     )
                     .into_any_element(),
                 LoadState::Ready(feed) if feed.shelves.is_empty() => div()
                     .p(px(24.0))
-                    .rounded(px(10.0))
+                    .rounded(px(12.0))
                     .bg(theme.surface)
                     .border_1()
                     .border_color(theme.border)
@@ -303,6 +313,7 @@ impl BitChordApp {
                                                     item.subtitle.clone(),
                                                     item.thumbnail_url.clone(),
                                                 );
+                                                let art = song_thumbnail_url(&s);
                                                 let list_for_play = if shelf_songs.is_empty() {
                                                     vec![s.clone()]
                                                 } else {
@@ -315,9 +326,9 @@ impl BitChordApp {
                                                 let src_title = shelf_title.clone();
                                                 div()
                                                     .id(("home-track", s_idx * 100 + i_idx))
-                                                    .w(px(164.0))
-                                                    .p(px(10.0))
-                                                    .rounded(px(10.0))
+                                                    .w(px(166.0))
+                                                    .p(px(11.0))
+                                                    .rounded(px(12.0))
                                                     .bg(theme.surface)
                                                     .border_1()
                                                     .border_color(theme.border)
@@ -337,10 +348,10 @@ impl BitChordApp {
                                                         );
                                                     }))
                                                     .child(self.render_art_box(
-                                                        s.thumbnail_url.as_deref(),
+                                                        art.as_deref(),
                                                         142.0,
-                                                        8.0,
-                                                        "TR",
+                                                        9.0,
+                                                        icons::MUSIC_NOTE,
                                                         theme,
                                                     ))
                                                     .child(
@@ -374,9 +385,9 @@ impl BitChordApp {
                                                 };
                                                 div()
                                                     .id(("home-browse", s_idx * 100 + i_idx))
-                                                    .w(px(164.0))
-                                                    .p(px(10.0))
-                                                    .rounded(px(10.0))
+                                                    .w(px(166.0))
+                                                    .p(px(11.0))
+                                                    .rounded(px(12.0))
                                                     .bg(theme.surface)
                                                     .border_1()
                                                     .border_color(theme.border)
@@ -399,8 +410,8 @@ impl BitChordApp {
                                                     .child(self.render_art_box(
                                                         item.thumbnail_url.as_deref(),
                                                         142.0,
-                                                        8.0,
-                                                        "PL",
+                                                        9.0,
+                                                        icons::DISC,
                                                         theme,
                                                     ))
                                                     .child(

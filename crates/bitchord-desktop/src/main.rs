@@ -7,6 +7,8 @@ mod actions;
 mod app;
 mod artwork;
 mod backend;
+mod icons;
+mod pill_slider;
 mod text_input;
 mod theme;
 mod views;
