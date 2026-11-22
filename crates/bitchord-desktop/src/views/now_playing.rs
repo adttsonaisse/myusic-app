@@ -490,9 +490,12 @@ impl BitChordApp {
                                             ns.and_then(|n| n.mime_type.as_deref()).unwrap_or("-")
                                         ))
                                         .child(format!(
-                                            "Sample rate: {} Hz · Bit depth: {}",
+                                            "Sample rate: {} · Bit depth: {}",
                                             ns.and_then(|n| n.sample_rate_hz)
-                                                .map(|r| r.to_string())
+                                                .map(|r| {
+                                                    bitchord_integrations::megahertz_label(r)
+                                                        .unwrap_or_else(|| format!("{r} Hz"))
+                                                })
                                                 .unwrap_or_else(|| "-".to_owned()),
                                             ns.and_then(|n| n.bit_depth)
                                                 .map(|b| format!("{b}-bit"))

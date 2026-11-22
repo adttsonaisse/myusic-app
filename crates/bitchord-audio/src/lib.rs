@@ -8,6 +8,7 @@ pub mod alsa_output;
 pub mod chunked_source;
 pub mod crossfade;
 pub mod decoder;
+pub mod dsd;
 pub mod dsp;
 pub mod engine;
 pub mod mpris;
@@ -35,6 +36,12 @@ pub use crossfade::{
 pub use decoder::{
     AudioDecoder, DecodedPacket, DecodedStreamInfo, DecoderError, SeekableReadSource,
     build_test_wav_pcm16,
+};
+pub use dsd::{
+    DSD_FILTER_CUTOFF_HZ, DSD_PCM_RATE_HZ, DSF_BLOCK_BYTES, DST_FRAME_BYTES_PER_CH,
+    DST_FRAME_SAMPLES, DopPacker, DsdBlockDecimator, DsdContainer, DsdFormat, DsdStreamDecoder,
+    DstDecoder, SUPPORTED_DSD_RATES, build_dsd_fir_coefficients, build_test_dsf_dsd64,
+    dst_frame_crc32,
 };
 pub use dsp::{
     DspChain, EqTuningSnapshot, LoudnessProcessor, SpatialAudioProcessor,

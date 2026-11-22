@@ -739,6 +739,8 @@ async fn cmd_play(args: PlayArgs, json_mode: bool) -> Result<String, String> {
             "ogg" | "opus" => "audio/ogg",
             "m4a" | "aac" => "audio/mp4",
             "webm" => "audio/webm",
+            "dsf" => "audio/x-dsf",
+            "dff" => "audio/x-dff",
             _ => "application/octet-stream",
         };
         let stream = ResolvedStream {
@@ -1548,5 +1550,30 @@ mod tests {
         assert_eq!(val["nerdStats"]["sourceName"], "WebDAV");
         assert_eq!(val["nerdStats"]["sampleRateHz"], 44_100);
         assert!(val["renderedFrames"].as_u64().unwrap_or(0) > 8_000);
+    }
+
+    #[tokio::test]
+    async fn offline_play_dsf_dsd64_reports_hi_res_nerd_stats_and_renders() {
+        let path =
+            std::env::temp_dir().join(format!("bitchord_cli_dsd_{}.dsf", std::process::id()));
+        std::fs::write(&path, bitchord_audio::build_test_dsf_dsd64(1_000.0, 50))
+            .expect("write dsf");
+
+        let cli = Cli::try_parse_from([
+            "bitchord-cli",
+            "--json",
+            "play",
+            path.to_str().expect("utf8 path"),
+            "--no-output",
+        ])
+        .expect("parse dsf play");
+        let out = run(cli).await.expect("run dsf play");
+        let _ = std::fs::remove_file(&path);
+        let val: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        assert_eq!(val["finalState"], "ended");
+        assert_eq!(val["nerdStats"]["mimeType"], "audio/dsd64");
+        assert_eq!(val["nerdStats"]["sampleRateHz"], 2_822_400);
+        assert_eq!(val["nerdStats"]["bitDepth"], 1);
+        assert!(val["renderedFrames"].as_u64().unwrap_or(0) > 1_000);
     }
 }

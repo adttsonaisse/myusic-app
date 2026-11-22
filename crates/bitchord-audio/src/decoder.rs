@@ -31,6 +31,8 @@ use symphonia::core::units::{Time, TimeBase, Timestamp};
 use symphonia_adapter_libopus::OpusDecoder;
 use thiserror::Error;
 
+use crate::dsd::DsdStreamDecoder;
+
 /// Global codec registry extending Symphonia's built-in codecs with `libopus`.
 static CODEC_REGISTRY: LazyLock<CodecRegistry> = LazyLock::new(|| {
     let mut registry = CodecRegistry::new();
@@ -55,9 +57,11 @@ pub struct DecodedStreamInfo {
     pub track_id: u32,
     pub codec_mime: String,
     pub sample_rate_hz: u32,
+    /// Native 1-bit DSD clock rate (e.g. `2_822_400` for DSD64) when decoding `.dsf`/`.dff`.
+    pub dsd_bit_rate_hz: Option<u32>,
     pub channels: usize,
     /// Authoritative source bit depth (e.g. `Some(16)` or `Some(24)` for FLAC/WAV/ALAC;
-    /// `None` for lossy codecs such as Opus/AAC/MP3).
+    /// `Some(1)` for DSD; `None` for lossy codecs such as Opus/AAC/MP3).
     pub bit_depth: Option<u32>,
     pub duration_ms: Option<u64>,
     pub estimated_bitrate_kbps: Option<u32>,
@@ -67,13 +71,13 @@ pub struct DecodedStreamInfo {
 impl DecodedStreamInfo {
     /// Builds a measured [`NerdStatsSnapshot`] respecting BitChord's provenance contract.
     pub fn to_nerd_stats(&self, source_label: Option<&str>) -> NerdStatsSnapshot {
+        let reported_rate = self.dsd_bit_rate_hz.unwrap_or(self.sample_rate_hz);
         let pcm_rate_kbps = self.bit_depth.map(|depth| {
-            ((u64::from(self.sample_rate_hz) * u64::from(depth) * self.channels as u64) / 1_000)
-                as u32
+            ((u64::from(reported_rate) * u64::from(depth) * self.channels as u64) / 1_000) as u32
         });
         NerdStatsSnapshot {
             mime_type: Some(self.codec_mime.clone()),
-            sample_rate_hz: Some(self.sample_rate_hz),
+            sample_rate_hz: Some(reported_rate),
             bit_depth: self.bit_depth,
             channels: Some(self.channels as u32),
             bitrate_kbps: self.estimated_bitrate_kbps,
@@ -96,15 +100,22 @@ pub struct DecodedPacket {
     pub frames: usize,
 }
 
+enum DecoderBackend {
+    Symphonia {
+        format: Box<dyn FormatReader>,
+        decoder: Box<dyn SymphoniaAudioDecoder>,
+        time_base: Option<TimeBase>,
+        scratch: Vec<f32>,
+        decoded_frames: u64,
+    },
+    Dsd(Box<DsdStreamDecoder>),
+}
+
 /// Stateful audio demuxer + decoder outputting stereo interleaved `f32` frames.
 pub struct AudioDecoder {
-    format: Box<dyn FormatReader>,
-    decoder: Box<dyn SymphoniaAudioDecoder>,
+    backend: DecoderBackend,
     info: DecodedStreamInfo,
     byte_len: Option<u64>,
-    time_base: Option<TimeBase>,
-    scratch: Vec<f32>,
-    decoded_frames: u64,
 }
 
 /// Adapts any seekable `Read + Seek + Send + Sync` byte source (such as
@@ -171,10 +182,31 @@ impl AudioDecoder {
         Self::open_source(Box::new(SeekableReadSource::new(reader, byte_len)), hint)
     }
 
-    /// Opens any `MediaSource` (file, memory cursor, or `ChunkedRangeSource`).
-    pub fn open_source(source: Box<dyn MediaSource>, hint: Hint) -> Result<Self, DecoderError> {
+    /// Opens any `MediaSource` (file, memory cursor, `ChunkedRangeSource`, or SMB stream),
+    /// transparently sniffing DSF/DSDIFF (`.dsf`/`.dff`) ahead of Symphonia.
+    pub fn open_source(mut source: Box<dyn MediaSource>, hint: Hint) -> Result<Self, DecoderError> {
         let byte_len = source.byte_len();
         let is_seekable = source.is_seekable();
+
+        // Sniff DSF ("DSD ") or DSDIFF ("FRM8") magic before handing to Symphonia.
+        if is_seekable {
+            let mut magic = [0u8; 4];
+            if source.read_exact(&mut magic).is_ok() {
+                let _ = source.seek(SeekFrom::Start(0));
+                if DsdStreamDecoder::is_dsd_magic(&magic) {
+                    let dsd = DsdStreamDecoder::open(source)?;
+                    let info = dsd.info().clone();
+                    return Ok(Self {
+                        backend: DecoderBackend::Dsd(Box::new(dsd)),
+                        info,
+                        byte_len,
+                    });
+                }
+            } else {
+                let _ = source.seek(SeekFrom::Start(0));
+            }
+        }
+
         let mss = MediaSourceStream::new(source, Default::default());
 
         let format = symphonia::default::get_probe().probe(
@@ -233,6 +265,7 @@ impl AudioDecoder {
             track_id,
             codec_mime: codec_id_to_mime(audio_params.codec).to_owned(),
             sample_rate_hz,
+            dsd_bit_rate_hz: None,
             channels,
             bit_depth,
             duration_ms,
@@ -241,13 +274,15 @@ impl AudioDecoder {
         };
 
         Ok(Self {
-            format,
-            decoder,
+            backend: DecoderBackend::Symphonia {
+                format,
+                decoder,
+                time_base,
+                scratch: Vec::with_capacity(8_192),
+                decoded_frames: 0,
+            },
             info,
             byte_len,
-            time_base,
-            scratch: Vec::with_capacity(8_192),
-            decoded_frames: 0,
         })
     }
 
@@ -302,70 +337,88 @@ impl AudioDecoder {
 
     /// Seeks to `position_ms` (accurate mode when supported) and resets the codec state.
     pub fn seek_ms(&mut self, position_ms: u64) -> Result<u64, DecoderError> {
-        let target = SeekTo::Time {
-            time: Time::from_millis_u64(position_ms),
-            track_id: Some(self.info.track_id),
-        };
-        let seeked = self.format.seek(SeekMode::Accurate, target)?;
-        self.decoder.reset();
-        let actual_ms = self
-            .time_base
-            .and_then(|tb| tb.calc_time(seeked.actual_ts))
-            .map(time_to_ms)
-            .unwrap_or(position_ms);
-        self.decoded_frames = (actual_ms * u64::from(self.info.sample_rate_hz)) / 1_000;
-        Ok(actual_ms)
+        match &mut self.backend {
+            DecoderBackend::Symphonia {
+                format,
+                decoder,
+                time_base,
+                decoded_frames,
+                ..
+            } => {
+                let target = SeekTo::Time {
+                    time: Time::from_millis_u64(position_ms),
+                    track_id: Some(self.info.track_id),
+                };
+                let seeked = format.seek(SeekMode::Accurate, target)?;
+                decoder.reset();
+                let actual_ms = time_base
+                    .and_then(|tb| tb.calc_time(seeked.actual_ts))
+                    .map(time_to_ms)
+                    .unwrap_or(position_ms);
+                *decoded_frames = (actual_ms * u64::from(self.info.sample_rate_hz)) / 1_000;
+                Ok(actual_ms)
+            }
+            DecoderBackend::Dsd(dsd) => dsd.seek_ms(position_ms),
+        }
     }
 
     /// Decodes the next stereo `f32` audio packet, or returns `Ok(None)` at clean EOF.
     pub fn next_packet(&mut self) -> Result<Option<DecodedPacket>, DecoderError> {
-        loop {
-            let Some(packet) = self.format.next_packet()? else {
-                return Ok(None);
-            };
-            if packet.track_id != self.info.track_id {
-                continue;
-            }
-            let pkt_ts = packet.pts;
-
-            match self.decoder.decode(&packet) {
-                Ok(decoded) => {
-                    let frames = decoded.frames();
-                    if frames == 0 {
-                        continue;
-                    }
-                    let src_channels = decoded.spec().channels().count().max(1);
-                    self.scratch.clear();
-                    decoded.copy_to_vec_interleaved::<f32>(&mut self.scratch);
-
-                    let stereo = mix_to_stereo(&self.scratch, frames, src_channels);
-                    let timestamp_ms = self
-                        .time_base
-                        .and_then(|tb| tb.calc_time(pkt_ts))
-                        .map(time_to_ms)
-                        .unwrap_or_else(|| {
-                            (self.decoded_frames * 1_000)
-                                / u64::from(self.info.sample_rate_hz.max(1))
-                        });
-                    self.decoded_frames = self.decoded_frames.saturating_add(frames as u64);
-
-                    return Ok(Some(DecodedPacket {
-                        samples: stereo,
-                        timestamp_ms,
-                        frames,
-                    }));
-                }
-                Err(SymphoniaError::DecodeError(_)) => {
-                    // Recoverable corrupted packet; skip and continue decoding.
+        match &mut self.backend {
+            DecoderBackend::Symphonia {
+                format,
+                decoder,
+                time_base,
+                scratch,
+                decoded_frames,
+            } => loop {
+                let Some(packet) = format.next_packet()? else {
+                    return Ok(None);
+                };
+                if packet.track_id != self.info.track_id {
                     continue;
                 }
-                Err(SymphoniaError::IoError(ref io_err))
-                    if io_err.kind() == std::io::ErrorKind::UnexpectedEof =>
-                {
-                    return Ok(None);
+                let pkt_ts = packet.pts;
+
+                match decoder.decode(&packet) {
+                    Ok(decoded) => {
+                        let frames = decoded.frames();
+                        if frames == 0 {
+                            continue;
+                        }
+                        let src_channels = decoded.spec().channels().count().max(1);
+                        scratch.clear();
+                        decoded.copy_to_vec_interleaved::<f32>(scratch);
+
+                        let stereo = mix_to_stereo(scratch, frames, src_channels);
+                        let timestamp_ms = time_base
+                            .and_then(|tb| tb.calc_time(pkt_ts))
+                            .map(time_to_ms)
+                            .unwrap_or_else(|| {
+                                (*decoded_frames * 1_000)
+                                    / u64::from(self.info.sample_rate_hz.max(1))
+                            });
+                        *decoded_frames = decoded_frames.saturating_add(frames as u64);
+
+                        return Ok(Some(DecodedPacket {
+                            samples: stereo,
+                            timestamp_ms,
+                            frames,
+                        }));
+                    }
+                    Err(SymphoniaError::DecodeError(_)) => {
+                        // Recoverable corrupted packet; skip and continue decoding.
+                        continue;
+                    }
+                    Err(SymphoniaError::IoError(ref io_err))
+                        if io_err.kind() == std::io::ErrorKind::UnexpectedEof =>
+                    {
+                        return Ok(None);
+                    }
+                    Err(err) => return Err(DecoderError::Symphonia(err)),
                 }
-                Err(err) => return Err(DecoderError::Symphonia(err)),
-            }
+            },
+            DecoderBackend::Dsd(dsd) => dsd.next_packet(),
         }
     }
 }

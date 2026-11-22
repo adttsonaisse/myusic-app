@@ -1311,6 +1311,10 @@ fn mime_to_extension(mime: &str) -> Option<&'static str> {
         Some("mp3")
     } else if lower.contains("wav") {
         Some("wav")
+    } else if lower.contains("dsf") {
+        Some("dsf")
+    } else if lower.contains("dff") || lower.contains("dsdiff") {
+        Some("dff")
     } else {
         None
     }

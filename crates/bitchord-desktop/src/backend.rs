@@ -2195,6 +2195,8 @@ async fn prepare_track_decoder(
             "ogg" | "opus" => "audio/ogg",
             "m4a" | "aac" => "audio/mp4",
             "webm" => "audio/webm",
+            "dsf" => "audio/x-dsf",
+            "dff" => "audio/x-dff",
             _ => "application/octet-stream",
         };
         let stream = ResolvedStream {
@@ -2503,7 +2505,7 @@ fn scan_local_folder_into_db(folder: &Path, paths: &AppPaths) -> Result<usize, S
                 .unwrap_or_default();
             if !matches!(
                 ext.as_str(),
-                "flac" | "wav" | "mp3" | "opus" | "ogg" | "m4a" | "aac" | "aiff"
+                "flac" | "wav" | "mp3" | "opus" | "ogg" | "m4a" | "aac" | "aiff" | "dsf" | "dff"
             ) {
                 continue;
             }
