@@ -7,7 +7,10 @@ members = [
     "crates/bitchord-matcher",
     "crates/bitchord-queue",
     "crates/bitchord-lyrics",
+    "crates/bitchord-innertube",
     "crates/bitchord-integrations",
+    "crates/bitchord-storage",
+    "crates/bitchord-cli",
 ]
 # Keep heavy GUI crates (added in Wave 4) out of default-members so core `cargo test`
 # stays fast and low-RAM on Intel Core i3-1220P / 7.5 GiB RAM (ADR-007).
@@ -18,28 +21,50 @@ default-members = [
     "crates/bitchord-matcher",
     "crates/bitchord-queue",
     "crates/bitchord-lyrics",
+    "crates/bitchord-innertube",
     "crates/bitchord-integrations",
+    "crates/bitchord-storage",
+    "crates/bitchord-cli",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
-rust-version = "1.86"
+rust-version = "1.95"
 
 [workspace.dependencies]
 base64 = "0.23"
+bitchord-innertube = { path = "crates/bitchord-innertube" }
+bitchord-integrations = { path = "crates/bitchord-integrations" }
+bitchord-jam = { path = "crates/bitchord-jam" }
+bitchord-lyrics = { path = "crates/bitchord-lyrics" }
+bitchord-matcher = { path = "crates/bitchord-matcher" }
 bitchord-model = { path = "crates/bitchord-model" }
+bitchord-queue = { path = "crates/bitchord-queue" }
+bitchord-storage = { path = "crates/bitchord-storage" }
+clap = { version = "4", features = ["derive"] }
+directories = "6"
 flate2 = "1"
+futures-util = "0.3"
 hmac = "0.12"
+lofty = "0.25"
+md-5 = "0.10"
+oo7 = "0.7"
+percent-encoding = "2"
 quick-xml = "0.42"
 regex = "1"
 reqwest = { version = "0.13", features = ["json", "form", "query", "gzip"] }
+rquickjs = "0.14"
+rusqlite = "0.43"
 scraper = { version = "0.29", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha1 = "0.10"
 sha2 = "0.10"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net", "io-util", "process"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 unicode-normalization = "0.1"
 unicode-script = "0.5"
 url = "2"

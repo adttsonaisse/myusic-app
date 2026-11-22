@@ -4,14 +4,25 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "External service integrations for BitChord Linux desktop (Presence, Spotify, Scrobbling, Discord RPC, Listen Together client)"
+description = "External service integrations for BitChord Linux desktop (Presence, Spotify, Scrobbling, Discord RPC, Listen Together WS client, NerdStats)"
 
 [lints]
 workspace = true
 
 [dependencies]
+bitchord-innertube.workspace = true
+bitchord-jam.workspace = true
+bitchord-matcher.workspace = true
+bitchord-model.workspace = true
+futures-util.workspace = true
+md-5.workspace = true
+regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
+url.workspace = true
 uuid.workspace = true

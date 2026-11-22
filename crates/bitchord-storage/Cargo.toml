@@ -1,0 +1,24 @@
+[package]
+name = "bitchord-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "XDG settings, Linux Secret Service keyring, SQLite library/history DB, offline download store, and FLAC/MP4/WebM metadata & embedded lyrics taggers"
+
+[lints]
+workspace = true
+
+[dependencies]
+bitchord-lyrics.workspace = true
+bitchord-model.workspace = true
+directories.workspace = true
+lofty.workspace = true
+oo7.workspace = true
+regex.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true

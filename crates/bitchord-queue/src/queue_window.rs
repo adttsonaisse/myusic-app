@@ -190,13 +190,13 @@ impl QueueWindow {
         restored.active_cycle_id = snapshot.cycle_id;
         restored.last_cycle_final = snapshot.last_cycle_final_canonical_index;
 
-        if let (Some(cur_pos), Some(cur_idx)) = (restored.logical_cursor, restored.current_index) {
-            if cur_pos >= restored.logical_order.len() || restored.logical_order[cur_pos] != cur_idx
-            {
-                return Err(QueueWindowError::InvalidSnapshot(
-                    "cursor does not point at current_canonical_index",
-                ));
-            }
+        if let (Some(cur_pos), Some(cur_idx)) = (restored.logical_cursor, restored.current_index)
+            && (cur_pos >= restored.logical_order.len()
+                || restored.logical_order[cur_pos] != cur_idx)
+        {
+            return Err(QueueWindowError::InvalidSnapshot(
+                "cursor does not point at current_canonical_index",
+            ));
         }
         if let Some(last) = restored.last_cycle_final
             && last >= snapshot.canonical_size

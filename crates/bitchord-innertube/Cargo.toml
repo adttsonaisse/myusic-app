@@ -1,0 +1,32 @@
+[package]
+name = "bitchord-innertube"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Native YouTube Music InnerTube API client, parser, QuickJS-NG cipher sandbox, and StreamResolver with feature-gated yt-dlp dev bridge"
+
+[features]
+default = ["ytdlp-bridge"]
+# ADR-004: feature-gated yt-dlp subprocess bridge alongside native extraction during v1 development.
+ytdlp-bridge = []
+
+[dependencies]
+base64.workspace = true
+bitchord-lyrics.workspace = true
+bitchord-model.workspace = true
+percent-encoding.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+rquickjs.workspace = true
+scraper.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
