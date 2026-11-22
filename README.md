@@ -122,8 +122,25 @@ cargo build --release -j 2 -p bitchord-desktop
 ./target/release/bitchord-desktop
 ```
 
-### Build & Install Arch Linux Package (`makepkg`)
-A ready-to-use Arch Linux `PKGBUILD`, desktop entry (`com.music.myusic.desktop`), and scalable SVG icon live under `packaging/arch/`:
+### Install on Arch Linux (`pacman` — Prebuilt via GitHub Actions)
+No local compilation required! Add the custom `myusic` pacman repository to `/etc/pacman.conf`:
+
+```ini
+[myusic]
+SigLevel = Optional TrustAll
+Server = https://github.com/adttsonaisse/myusic-app/releases/download/arch-repo
+```
+
+Then sync and install:
+
+```bash
+sudo pacman -Sy myusic-app
+```
+
+Future `sudo pacman -Syu` runs will automatically upgrade `myusic-app` whenever a new build is published from `main`.
+
+### Build Arch Package Locally (`makepkg`)
+If you prefer compiling from source locally, the `PKGBUILD`, desktop entry (`com.music.myusic.desktop`), and scalable SVG icon live under `packaging/arch/`:
 
 ```bash
 cd packaging/arch
@@ -132,7 +149,7 @@ makepkg -si
 MYUSIC_ENABLE_ONNX=1 makepkg -si
 ```
 
-This installs `/usr/bin/myusic`, `/usr/bin/myusic-cli` (plus `bitchord-desktop` / `bitchord-cli` symlinks), the desktop launcher, and the scalable hicolor icon.
+Both methods install `/usr/bin/myusic`, `/usr/bin/myusic-cli` (plus `bitchord-desktop` / `bitchord-cli` symlinks), the desktop launcher, and the scalable hicolor icon.
 
 ### Enabling Optional ONNX Automix Acceleration
 By default, Smart Automix and LoopMix run 100% offline using the built-in pure-Rust DSP analyzer. To optionally refine beat grids and vocal masks with ONNX Runtime:

@@ -1,0 +1,119 @@
+name: Build & Publish Arch Linux Repo
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - "crates/**"
+      - "packaging/arch/**"
+      - ".github/workflows/arch-repo.yml"
+  workflow_dispatch:
+    inputs:
+      enable_onnx:
+        description: "Enable optional automix-onnx Cargo feature"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: arch-repo
+  cancel-in-progress: false
+
+jobs:
+  build-arch-package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cargo-cache/registry/index
+            .cargo-cache/registry/cache
+            .cargo-cache/git/db
+          key: arch-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            arch-cargo-
+
+      - name: Build myusic-app Arch package and pacman DB in Arch container
+        env:
+          MYUSIC_ENABLE_ONNX: ${{ inputs.enable_onnx && '1' || '0' }}
+        run: |
+          mkdir -p "$PWD/dist" "$PWD/.cargo-cache"
+          docker run --rm \
+            -e MYUSIC_ENABLE_ONNX="$MYUSIC_ENABLE_ONNX" \
+            -v "$PWD:/work" \
+            -v "$PWD/.cargo-cache:/cargo-cache" \
+            archlinux:base-devel \
+            bash -euo pipefail -c '
+              pacman -Syu --noconfirm --needed \
+                git rust clang lld cmake pkgconf \
+                pipewire alsa-lib opus sqlite fontconfig freetype2 \
+                libxcb libxkbcommon libxkbcommon-x11 vulkan-icd-loader \
+                wayland hicolor-icon-theme
+
+              useradd -m builder
+              mkdir -p /build /cargo-cache /work/dist
+              cp /work/packaging/arch/PKGBUILD /build/PKGBUILD
+              chown -R builder:builder /build /cargo-cache
+
+              su - builder -c "
+                set -euo pipefail
+                cd /build
+                export CARGO_HOME=/cargo-cache
+                export CARGO_BUILD_JOBS=4
+                export MYUSIC_ENABLE_ONNX=${MYUSIC_ENABLE_ONNX}
+                makepkg -fc --noconfirm
+              "
+
+              cp /build/myusic-app-*.pkg.tar.zst /work/dist/
+              cd /work/dist
+              repo-add myusic.db.tar.gz myusic-app-*.pkg.tar.zst
+
+              # Replace repo-add symlinks with regular files for GitHub Releases hosting
+              rm -f myusic.db myusic.files
+              cp myusic.db.tar.gz myusic.db
+              cp myusic.files.tar.gz myusic.files
+
+              sha256sum myusic-app-*.pkg.tar.zst myusic.db myusic.db.tar.gz myusic.files myusic.files.tar.gz > SHA256SUMS.txt
+              chmod -R a+rwX /cargo-cache /work/dist
+              ls -lh /work/dist
+            '
+
+      - name: Publish pacman repository to arch-repo GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="arch-repo"
+          PKG_FILE="$(basename dist/myusic-app-*.pkg.tar.zst)"
+
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --target main \
+              --title "Arch Linux Pacman Repository (x86_64)" \
+              --notes $'Rolling Arch Linux pacman repository for **Myusic** (`myusic-app`).\n\nAdd to `/etc/pacman.conf`:\n```ini\n[myusic]\nSigLevel = Optional TrustAll\nServer = https://github.com/adttsonaisse/myusic-app/releases/download/arch-repo\n```\n\nThen install:\n```bash\nsudo pacman -Sy myusic-app\n```'
+          fi
+
+          # Remove older .pkg.tar.zst archives so the release stays synchronized with myusic.db
+          OLD_ASSETS="$(gh release view "$TAG" --json assets --jq '.assets[].name | select(startswith("myusic-app-") and endswith(".pkg.tar.zst"))' || true)"
+          for asset in $OLD_ASSETS; do
+            if [[ "$asset" != "$PKG_FILE" ]]; then
+              gh release delete-asset "$TAG" "$asset" --yes || true
+            fi
+          done
+
+          gh release upload "$TAG" \
+            "dist/${PKG_FILE}" \
+            dist/myusic.db \
+            dist/myusic.db.tar.gz \
+            dist/myusic.files \
+            dist/myusic.files.tar.gz \
+            dist/SHA256SUMS.txt \
+            --clobber
