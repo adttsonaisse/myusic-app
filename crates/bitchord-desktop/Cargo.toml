@@ -1,0 +1,38 @@
+[package]
+name = "bitchord-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Native Linux Desktop music player UI built with GPUI-CE (wgpu, Wayland/X11, PipeWire, MPRIS2, System Tray)"
+
+[lints]
+workspace = true
+
+[features]
+default = ["wayland", "x11", "ytdlp-bridge"]
+wayland = ["gpui-ce/wayland", "gpui_ce_platform/wayland"]
+x11 = ["gpui-ce/x11", "gpui_ce_platform/x11"]
+ytdlp-bridge = ["bitchord-innertube/ytdlp-bridge"]
+
+[dependencies]
+async-channel.workspace = true
+bitchord-audio.workspace = true
+bitchord-dsp-core.workspace = true
+bitchord-innertube.workspace = true
+bitchord-integrations.workspace = true
+bitchord-jam.workspace = true
+bitchord-lyrics.workspace = true
+bitchord-model.workspace = true
+bitchord-queue.workspace = true
+bitchord-storage.workspace = true
+directories.workspace = true
+gpui-ce.workspace = true
+gpui-tray.workspace = true
+gpui_ce_platform.workspace = true
+gpui_ce_tokio.workspace = true
+image.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

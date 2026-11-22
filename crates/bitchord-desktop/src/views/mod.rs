@@ -1,0 +1,11 @@
+pub mod detail;
+pub mod home;
+pub mod library;
+pub mod now_playing;
+pub mod party;
+pub mod player_bar;
+pub mod queue_drawer;
+pub mod search;
+pub mod settings;
+pub mod sidebar;
+pub mod titlebar;

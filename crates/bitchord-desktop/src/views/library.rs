@@ -1,0 +1,422 @@
+//! Local Music Library + Offline Downloads screens (`W4-2`) backed by SQLite
+//! `LibraryDb`, `lofty` local tag scanning, and `DownloadStore`.
+
+use bitchord_model::{PlaybackSourceType, Song};
+use gpui::prelude::*;
+use gpui::{Context, FontWeight, Window, div, px, uniform_list};
+
+use crate::app::BitChordApp;
+use crate::backend::BackendCommand;
+
+impl BitChordApp {
+    pub fn render_library(&self, _window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme();
+        let stats = self.library.stats;
+        let song_count = self.library.songs.len();
+
+        div()
+            .size_full()
+            .px(px(28.0))
+            .py(px(20.0))
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            // Header + real SQLite counts (R-17: real numbers only)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.0))
+                            .child(
+                                div()
+                                    .text_size(px(24.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(theme.text_primary)
+                                    .child("Library"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .text_color(theme.text_muted)
+                                    .child(format!(
+                                        "{} songs · {} playlists · {} plays recorded",
+                                        stats.songs, stats.playlists, stats.listening_history
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("lib-refresh")
+                            .h(px(32.0))
+                            .px(px(12.0))
+                            .rounded(px(6.0))
+                            .bg(theme.surface_elevated)
+                            .border_1()
+                            .border_color(theme.border)
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .text_size(px(12.5))
+                            .text_color(theme.text_primary)
+                            .hover(move |s| s.bg(theme.surface_hover))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.send(BackendCommand::RefreshLibrary, cx);
+                            }))
+                            .child("Refresh"),
+                    ),
+            )
+            // Local folder scanner bar
+            .child(
+                div()
+                    .p(px(12.0))
+                    .rounded(px(10.0))
+                    .bg(theme.surface)
+                    .border_1()
+                    .border_color(theme.border)
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.text_secondary)
+                            .child("Scan folder:"),
+                    )
+                    .child(div().flex_1().child(self.folder_input.clone()))
+                    .child(
+                        div()
+                            .id("lib-scan-btn")
+                            .h(px(36.0))
+                            .px(px(14.0))
+                            .rounded(px(8.0))
+                            .bg(theme.accent)
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.on_accent)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let path = this.folder_input.read(cx).text().to_owned();
+                                this.scan_folder(path, cx);
+                            }))
+                            .child("Scan Local Audio"),
+                    ),
+            )
+            // Imported/Local Playlists row (only if playlists exist)
+            .when(!self.library.playlists.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(8.0))
+                        .children(self.library.playlists.iter().map(|pl| {
+                            div()
+                                .px(px(12.0))
+                                .py(px(6.0))
+                                .rounded(px(8.0))
+                                .bg(theme.surface)
+                                .border_1()
+                                .border_color(theme.border)
+                                .text_size(px(12.5))
+                                .text_color(theme.text_primary)
+                                .child(format!("{} ({})", pl.title, pl.source))
+                        })),
+                )
+            })
+            // Virtualized track list or honest empty state
+            .child(if song_count == 0 {
+                div()
+                    .p(px(24.0))
+                    .rounded(px(10.0))
+                    .bg(theme.surface)
+                    .border_1()
+                    .border_color(theme.border)
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .text_size(px(15.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.text_primary)
+                            .child("Your local library is empty"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(theme.text_muted)
+                            .child("Enter a Linux directory path above (FLAC, WAV, Opus, M4A, MP3, OGG) and click Scan Local Audio, or play any YouTube Music track to cache it here."),
+                    )
+                    .into_any_element()
+            } else {
+                uniform_list(
+                    "library-songs",
+                    song_count,
+                    cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
+                        let t = this.theme();
+                        let all_songs = this.library.songs.clone();
+                        let active_vid = this
+                            .playback
+                            .current_song
+                            .as_ref()
+                            .map(|s| s.video_id.as_str());
+
+                        range
+                            .filter_map(|idx| all_songs.get(idx).map(|s| (idx, s.clone())))
+                            .map(|(idx, song)| {
+                                let is_cur = active_vid == Some(song.video_id.as_str());
+                                let is_local = song.local_path.is_some();
+                                let songs_c = all_songs.clone();
+                                let next_s = song.clone();
+
+                                div()
+                                    .id(("lib-row", idx))
+                                    .w_full()
+                                    .h(px(52.0))
+                                    .px(px(12.0))
+                                    .rounded(px(8.0))
+                                    .bg(if is_cur {
+                                        t.surface_elevated
+                                    } else {
+                                        gpui::transparent_black()
+                                    })
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(12.0))
+                                    .cursor_pointer()
+                                    .hover(move |st| st.bg(t.surface_hover))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.play_songs(
+                                            songs_c.clone(),
+                                            idx,
+                                            "Library",
+                                            PlaybackSourceType::History,
+                                            None,
+                                            cx,
+                                        );
+                                    }))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .flex()
+                                            .flex_col()
+                                            .child(
+                                                div()
+                                                    .text_size(px(13.5))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(if is_cur {
+                                                        t.accent
+                                                    } else {
+                                                        t.text_primary
+                                                    })
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .child(song.title.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(12.0))
+                                                    .text_color(t.text_muted)
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .child(if let Some(ref al) = song.album_name {
+                                                        format!("{} · {al}", song.artist)
+                                                    } else {
+                                                        song.artist.clone()
+                                                    }),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(10.0))
+                                            .child(
+                                                div()
+                                                    .px(px(6.0))
+                                                    .py(px(2.0))
+                                                    .rounded(px(4.0))
+                                                    .bg(t.surface_elevated)
+                                                    .text_size(px(10.5))
+                                                    .text_color(t.text_muted)
+                                                    .child(if is_local { "LOCAL" } else { "YTM" }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id(("lib-next", idx))
+                                                    .px(px(8.0))
+                                                    .py(px(4.0))
+                                                    .rounded(px(5.0))
+                                                    .bg(t.surface_elevated)
+                                                    .border_1()
+                                                    .border_color(t.border)
+                                                    .text_size(px(11.0))
+                                                    .text_color(t.text_secondary)
+                                                    .hover(move |st| st.bg(t.surface_active))
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            this.send(
+                                                                BackendCommand::PlayNext(Box::new(
+                                                                    next_s.clone(),
+                                                                )),
+                                                                cx,
+                                                            );
+                                                            cx.stop_propagation();
+                                                        },
+                                                    ))
+                                                    .child("+ Next"),
+                                            ),
+                                    )
+                            })
+                            .collect()
+                    }),
+                )
+                .flex_1()
+                .w_full()
+                .into_any_element()
+            })
+    }
+
+    pub fn render_downloads(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme();
+        let downloads = self.library.downloads.clone();
+        let count = downloads.len();
+
+        div()
+            .size_full()
+            .px(px(28.0))
+            .py(px(20.0))
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_size(px(24.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme.text_primary)
+                            .child("Offline Downloads"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(theme.text_muted)
+                            .child(format!("{count} offline track(s) indexed in SQLite")),
+                    ),
+            )
+            .child(if count == 0 {
+                div()
+                    .p(px(24.0))
+                    .rounded(px(10.0))
+                    .bg(theme.surface)
+                    .border_1()
+                    .border_color(theme.border)
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .text_size(px(15.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.text_primary)
+                            .child("No offline downloads yet"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(theme.text_muted)
+                            .child("Downloaded tracks saved via DownloadStore appear here with format badges and embedded lyrics."),
+                    )
+                    .into_any_element()
+            } else {
+                div()
+                    .id("downloads-scroll")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .children(downloads.into_iter().enumerate().map(|(idx, rec)| {
+                        let mut song = Song::new(
+                            rec.video_id.clone(),
+                            rec.title.clone(),
+                            rec.artist.clone(),
+                            rec.thumbnail_url.clone(),
+                        );
+                        song.album_name = rec.album_name.clone();
+                        song.local_path = Some(rec.uri.clone());
+                        let fmt_label = rec
+                            .download_format
+                            .clone()
+                            .unwrap_or_else(|| "Offline".to_owned());
+
+                        div()
+                            .id(("dl-row", idx))
+                            .w_full()
+                            .h(px(54.0))
+                            .px(px(12.0))
+                            .rounded(px(8.0))
+                            .bg(theme.surface)
+                            .border_1()
+                            .border_color(theme.border)
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .cursor_pointer()
+                            .hover(move |st| st.bg(theme.surface_hover))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.play_songs(
+                                    vec![song.clone()],
+                                    0,
+                                    "Downloads",
+                                    PlaybackSourceType::History,
+                                    None,
+                                    cx,
+                                );
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .text_size(px(13.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(theme.text_primary)
+                                            .child(rec.title),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.0))
+                                            .text_color(theme.text_muted)
+                                            .child(rec.artist),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .px(px(8.0))
+                                    .py(px(3.0))
+                                    .rounded(px(5.0))
+                                    .bg(theme.surface_elevated)
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text_secondary)
+                                    .child(fmt_label),
+                            )
+                    }))
+                    .into_any_element()
+            })
+    }
+}

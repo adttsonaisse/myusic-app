@@ -12,6 +12,7 @@ members = [
     "crates/bitchord-storage",
     "crates/bitchord-audio",
     "crates/bitchord-cli",
+    "crates/bitchord-desktop",
 ]
 # Keep heavy GUI crates (added in Wave 4) out of default-members so core `cargo test`
 # stays fast and low-RAM on Intel Core i3-1220P / 7.5 GiB RAM (ADR-007).
@@ -36,6 +37,7 @@ license = "GPL-3.0-only"
 rust-version = "1.95"
 
 [workspace.dependencies]
+async-channel = "2"
 audioadapter-buffers = "5.2"
 base64 = "0.23"
 bitchord-audio = { path = "crates/bitchord-audio" }
@@ -52,7 +54,12 @@ clap = { version = "4", features = ["derive"] }
 directories = "6"
 flate2 = "1"
 futures-util = "0.3"
+gpui-ce = { version = "0.3", default-features = false, features = ["font-kit", "image-default-formats"] }
+gpui-tray = { version = "0.3", default-features = false, features = ["gpui-ce"] }
+gpui_ce_platform = { version = "0.3", default-features = false }
+gpui_ce_tokio = "0.3"
 hmac = "0.12"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 libspa = { version = "0.10", features = ["v1_6_0"] }
 lofty = "0.25"
 md-5 = "0.10"
@@ -115,6 +122,16 @@ opt-level = 2
 [profile.dev.package.rubato]
 opt-level = 2
 [profile.dev.package.bitchord-dsp-core]
+opt-level = 2
+
+# Frame-critical UI layout/text/image decoding (gpui-ce/wgpu stays opt-level = 0 for RAM).
+[profile.dev.package.image]
+opt-level = 2
+[profile.dev.package.resvg]
+opt-level = 2
+[profile.dev.package.taffy]
+opt-level = 2
+[profile.dev.package.parley]
 opt-level = 2
 
 [profile.release]
