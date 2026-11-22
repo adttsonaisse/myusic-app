@@ -1,0 +1,87 @@
+# Maintainer: adttsonaisse <https://github.com/adttsonaisse>
+pkgname=myusic
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Native Linux desktop music player in Rust + GPUI with bit-perfect ALSA/PipeWire, DSD/DST, Smart Automix, LoopMix, and WebDAV/SMB"
+arch=('x86_64')
+url="https://github.com/adttsonaisse/myusic-app"
+license=('GPL-3.0-only')
+depends=(
+  'alsa-lib'
+  'fontconfig'
+  'freetype2'
+  'gcc-libs'
+  'glibc'
+  'hicolor-icon-theme'
+  'libpipewire'
+  'libxcb'
+  'libxkbcommon'
+  'libxkbcommon-x11'
+  'opus'
+  'sqlite'
+  'vulkan-icd-loader'
+  'wayland'
+)
+makedepends=(
+  'cargo'
+  'clang'
+  'git'
+  'lld'
+  'pkgconf'
+  'pipewire'
+)
+optdepends=(
+  'yt-dlp: fallback stream extraction bridge for YouTube Music'
+  'onnxruntime: optional neural Automix beat/vocal acceleration (requires automix-onnx feature)'
+  'gnome-keyring: Secret Service keyring backend for saved cookies and NAS credentials'
+  'kwallet: alternative Secret Service keyring backend'
+)
+options=('!lto' '!debug')
+source=("$pkgname::git+https://github.com/adttsonaisse/myusic-app.git#branch=main")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$srcdir/$pkgname"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$srcdir/$pkgname"
+  export CARGO_TARGET_DIR="$srcdir/target"
+  export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang
+  export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-fuse-ld=lld -C link-arg=-Wl,--threads=2"
+
+  local extra_features=()
+  if [[ "${MYUSIC_ENABLE_ONNX:-0}" == "1" ]]; then
+    extra_features+=(--features "bitchord-desktop/automix-onnx,bitchord-cli/automix-onnx")
+  fi
+
+  cargo build \
+    --release \
+    --frozen \
+    -j "${CARGO_BUILD_JOBS}" \
+    -p bitchord-desktop \
+    -p bitchord-cli \
+    "${extra_features[@]}"
+}
+
+package() {
+  cd "$srcdir/$pkgname"
+
+  # Binaries (user-facing `myusic` / `myusic-cli` + compatibility symlinks)
+  install -Dm755 "$srcdir/target/release/bitchord-desktop" "$pkgdir/usr/bin/myusic"
+  install -Dm755 "$srcdir/target/release/bitchord-cli" "$pkgdir/usr/bin/myusic-cli"
+  ln -s myusic "$pkgdir/usr/bin/bitchord-desktop"
+  ln -s myusic-cli "$pkgdir/usr/bin/bitchord-cli"
+
+  # Desktop entry & scalable icon
+  install -Dm644 "packaging/arch/com.music.myusic.desktop" \
+    "$pkgdir/usr/share/applications/com.music.myusic.desktop"
+  install -Dm644 "packaging/arch/com.music.myusic.svg" \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/com.music.myusic.svg"
+
+  # License & documentation
+  install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

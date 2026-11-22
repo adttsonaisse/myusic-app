@@ -25,8 +25,8 @@ use crate::time_stretch::{MAX_SPEED, MIN_SPEED};
 
 /// Primary MPRIS2 bus name suffix (`org.mpris.MediaPlayer2.bitchord`).
 pub const MPRIS_BUS_SUFFIX: &str = "bitchord";
-/// Desktop entry basename (`bitchord.desktop`).
-pub const DESKTOP_ENTRY: &str = "bitchord";
+/// Desktop entry basename (`com.music.myusic.desktop`).
+pub const DESKTOP_ENTRY: &str = "com.music.myusic";
 /// Human-readable application name shown in Linux media widgets.
 pub const IDENTITY: &str = "Myusic";
 

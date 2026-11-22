@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Myusic
+GenericName=Music Player
+Comment=Native Linux Music Player with Bit-Perfect Audio, DSD/DST, Smart Automix, and WebDAV/SMB
+Exec=/usr/bin/myusic %U
+Icon=com.music.myusic
+Terminal=false
+Categories=AudioVideo;Audio;Player;Music;
+Keywords=music;audio;player;flac;dsd;pipewire;alsa;youtube;lyrics;automix;
+StartupNotify=true
+StartupWMClass=com.music.myusic
+MimeType=audio/flac;audio/mpeg;audio/mp4;audio/ogg;audio/opus;audio/wav;audio/x-wav;audio/webm;audio/x-dsf;audio/x-dff;x-scheme-handler/bitchord;
