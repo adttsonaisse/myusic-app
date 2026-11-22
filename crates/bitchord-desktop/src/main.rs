@@ -76,17 +76,17 @@ fn main() {
             if let Ok(icon) = build_tray_icon()
                 && let Ok(tray) = Tray::builder()
                     .icon(icon)
-                    .title("BitChord")
-                    .tooltip("BitChord Music Player")
+                    .title("Myusic")
+                    .tooltip("Myusic")
                     .menu(|_cx| {
                         vec![
-                            MenuItem::action("Show BitChord", ShowWindow),
+                            MenuItem::action("Show Myusic", ShowWindow),
                             MenuItem::separator(),
                             MenuItem::action("Play / Pause", PlayPause),
                             MenuItem::action("Next Track", NextTrack),
                             MenuItem::action("Previous Track", PrevTrack),
                             MenuItem::separator(),
-                            MenuItem::action("Quit BitChord", QuitApp),
+                            MenuItem::action("Quit Myusic", QuitApp),
                         ]
                     })
                     .build(cx)
@@ -118,10 +118,10 @@ fn open_or_focus_main_window(cx: &mut App) {
             height: px(560.0),
         }),
         titlebar: Some(TitlebarOptions {
-            title: Some("BitChord".into()),
+            title: Some("Myusic".into()),
             ..TitlebarOptions::default()
         }),
-        app_id: Some("com.music.bitchord".to_owned()),
+        app_id: Some("com.music.myusic".to_owned()),
         ..WindowOptions::default()
     };
 

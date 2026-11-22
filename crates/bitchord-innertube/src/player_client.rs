@@ -267,6 +267,20 @@ impl PlayerClient {
             .query_pairs()
             .find_map(|(k, v)| (k == "clen").then(|| v.parse::<u64>().ok())?)
     }
+
+    /// Reads the `dur` (seconds, e.g. `256.881`) query parameter from a `googlevideo.com`
+    /// URL and returns the exact duration in milliseconds when positive and finite.
+    pub fn duration_ms_from_url(url: &str) -> Option<u64> {
+        let parsed = Url::parse(url).ok()?;
+        let secs = parsed
+            .query_pairs()
+            .find_map(|(k, v)| (k == "dur").then(|| v.parse::<f64>().ok())?)?;
+        if secs.is_finite() && secs > 0.0 {
+            Some((secs * 1_000.0).round() as u64)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -306,6 +320,16 @@ mod tests {
         );
         assert_eq!(
             PlayerClient::range_bytes_for("https://example.com/audio.opus"),
+            None
+        );
+        assert_eq!(
+            PlayerClient::duration_ms_from_url(
+                "https://rr1.googlevideo.com/videoplayback?clen=4739610&dur=256.881&c=VISIONOS"
+            ),
+            Some(256_881)
+        );
+        assert_eq!(
+            PlayerClient::duration_ms_from_url("https://example.com/audio.opus"),
             None
         );
     }

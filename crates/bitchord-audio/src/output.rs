@@ -598,7 +598,7 @@ fn run_pipewire_loop(
             *pw::keys::MEDIA_TYPE => "Audio",
             *pw::keys::MEDIA_ROLE => "Music",
             *pw::keys::MEDIA_CATEGORY => "Playback",
-            *pw::keys::APP_NAME => "BitChord",
+            *pw::keys::APP_NAME => "Myusic",
             *pw::keys::AUDIO_CHANNELS => "2",
         },
     ) {

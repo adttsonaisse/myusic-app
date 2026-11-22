@@ -689,9 +689,13 @@ impl BitChordApp {
                                             None
                                         };
 
+                                        let next_time_ms =
+                                            payload.lines.get(idx + 1).map(|l| l.time_ms);
+
                                         render_lyric_line_row(
                                             idx,
                                             line,
+                                            next_time_ms,
                                             pos_ms,
                                             is_active,
                                             was_prev_active,
@@ -712,10 +716,52 @@ impl BitChordApp {
     }
 }
 
+/// Returns `true` when a lyric entry represents an instrumental intro or interlude
+/// (blank gap markers emitted by `with_instrumental_gaps`, musical note symbols,
+/// ellipsis, or explicit `[Instrumental]` tags).
+pub(crate) fn is_instrumental_line(line: &LyricLine) -> bool {
+    if line.is_gap() {
+        return true;
+    }
+    let trimmed = line.text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "..."
+            | "…"
+            | ". . ."
+            | "• • •"
+            | "•••"
+            | "instrumental"
+            | "[instrumental]"
+            | "(instrumental)"
+            | "music"
+            | "[music]"
+            | "(music)"
+            | "interlude"
+            | "[interlude]"
+            | "(interlude)"
+    ) {
+        return true;
+    }
+    // Musical note symbols / dots / whitespace only (e.g. "♪", "♫ ♪", "🎵")
+    trimmed.chars().all(|c| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '♪' | '♫' | '♩' | '♬' | '🎵' | '🎶' | '•' | '·' | '.' | '…' | '-' | '~'
+            )
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_lyric_line_row(
     idx: usize,
     line: &LyricLine,
+    next_time_ms: Option<i64>,
     pos_ms: i64,
     is_active: bool,
     was_prev_active: bool,
@@ -750,8 +796,52 @@ fn render_lyric_line_row(
     } else {
         0.0
     };
+    let lyric_size = if is_active {
+        21.0 + 4.0 * transition_t
+    } else if was_prev_active {
+        21.0 + 4.0 * (1.0 - transition_t)
+    } else {
+        20.5
+    };
 
-    let content = if !line.words.is_empty() && is_active {
+    let content = if is_instrumental_line(line) {
+        // Instrumental interlude indicator: three dots (. . .) scaling with lyric size
+        // with smooth progressive pure-white illumination across the break duration.
+        let dot_base = lyric_size * 0.42;
+        let dot_gap = lyric_size * 0.38;
+        let gap_frac = if is_active {
+            let end_ms = next_time_ms
+                .filter(|&nt| nt > line.time_ms)
+                .unwrap_or(line.time_ms + 4_000);
+            ((pos_ms - line.time_ms) as f32 / (end_ms - line.time_ms).max(1) as f32).clamp(0.0, 1.0)
+        } else if is_past {
+            1.0
+        } else {
+            0.0
+        };
+
+        div()
+            .h(px(lyric_size * 1.28))
+            .flex()
+            .items_center()
+            .gap(px(dot_gap))
+            .children((0usize..3).map(|dot_i| {
+                let (alpha, diameter) = if is_active {
+                    let dot_t = ease_out_cubic((gap_frac * 3.0 - dot_i as f32).clamp(0.0, 1.0));
+                    let a = 0.34 + 0.66 * dot_t;
+                    let d = dot_base * (0.90 + 0.16 * dot_t);
+                    (a, d)
+                } else {
+                    (line_alpha, dot_base * 0.90)
+                };
+                div()
+                    .w(px(diameter))
+                    .h(px(diameter))
+                    .rounded_full()
+                    .bg(white_alpha(alpha))
+            }))
+            .into_any_element()
+    } else if !line.words.is_empty() && is_active {
         // Continuous liquid pure-white luminance sweep across each word as it is sung.
         div()
             .flex()
@@ -771,15 +861,8 @@ fn render_lyric_line_row(
             }))
             .into_any_element()
     } else {
-        let size = if is_active {
-            21.0 + 4.0 * transition_t
-        } else if was_prev_active {
-            21.0 + 4.0 * (1.0 - transition_t)
-        } else {
-            20.5
-        };
         div()
-            .text_size(px(size))
+            .text_size(px(lyric_size))
             .font_weight(if is_active {
                 FontWeight::BOLD
             } else {
@@ -789,6 +872,8 @@ fn render_lyric_line_row(
             .child(line.text.clone())
             .into_any_element()
     };
+
+    let show_translation = !is_instrumental_line(line);
 
     div()
         .id(("lyric-line", idx))
@@ -809,12 +894,35 @@ fn render_lyric_line_row(
         .flex_col()
         .gap(px(5.0))
         .child(content)
-        .when_some(translated_text, |el, tr| {
-            el.child(
-                div()
-                    .text_size(px(14.0))
-                    .text_color(white_alpha(if is_active { 0.78 } else { 0.42 }))
-                    .child(tr),
-            )
+        .when(show_translation, |el| {
+            el.when_some(translated_text, |inner, tr| {
+                inner.child(
+                    div()
+                        .text_size(px(14.0))
+                        .text_color(white_alpha(if is_active { 0.78 } else { 0.42 }))
+                        .child(tr),
+                )
+            })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_instrumental_gap_and_placeholder_lines_only() {
+        assert!(is_instrumental_line(&LyricLine::new(0, "")));
+        assert!(is_instrumental_line(&LyricLine::new(10_000, "   ")));
+        assert!(is_instrumental_line(&LyricLine::new(12_000, "♪")));
+        assert!(is_instrumental_line(&LyricLine::new(
+            15_000,
+            "[Instrumental]"
+        )));
+        assert!(is_instrumental_line(&LyricLine::new(18_000, "...")));
+        assert!(!is_instrumental_line(&LyricLine::new(
+            20_000,
+            "I'm giving you a night call"
+        )));
+    }
 }

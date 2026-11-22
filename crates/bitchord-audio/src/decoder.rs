@@ -100,6 +100,7 @@ pub struct AudioDecoder {
     format: Box<dyn FormatReader>,
     decoder: Box<dyn SymphoniaAudioDecoder>,
     info: DecodedStreamInfo,
+    byte_len: Option<u64>,
     time_base: Option<TimeBase>,
     scratch: Vec<f32>,
     decoded_frames: u64,
@@ -189,6 +190,7 @@ impl AudioDecoder {
             format,
             decoder,
             info,
+            byte_len,
             time_base,
             scratch: Vec::with_capacity(8_192),
             decoded_frames: 0,
@@ -197,6 +199,25 @@ impl AudioDecoder {
 
     pub fn info(&self) -> &DecodedStreamInfo {
         &self.info
+    }
+
+    /// Populates `duration_ms` (and derived `estimated_bitrate_kbps`) from an
+    /// authoritative stream metadata source (e.g. YouTube `approxDurationMs` or
+    /// `googlevideo.com` `dur=` parameter) when the container demuxer does not
+    /// carry a per-track duration (common on WebM/Matroska Opus streams).
+    pub fn apply_fallback_duration_ms(&mut self, duration_ms: Option<u64>) {
+        let Some(dur) = duration_ms.filter(|&d| d > 0) else {
+            return;
+        };
+        if self.info.duration_ms.is_none_or(|d| d == 0) {
+            self.info.duration_ms = Some(dur);
+        }
+        if self.info.estimated_bitrate_kbps.is_none()
+            && let Some(bytes) = self.byte_len
+            && bytes > 0
+        {
+            self.info.estimated_bitrate_kbps = Some(((bytes * 8) / dur) as u32);
+        }
     }
 
     /// Pre-decodes at least `min_ms` of opening audio packets starting from exact

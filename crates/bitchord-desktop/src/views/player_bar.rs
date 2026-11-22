@@ -319,14 +319,15 @@ impl BitChordApp {
                             ),
                     ),
             )
-            // Right: Lyrics jump + Mute icon + continuous pill volume bar
+            // Right: Lyrics + Queue (side-by-side with distinct icons) + Mute + continuous pill volume bar
             .child(
                 div()
-                    .w(px(236.0))
+                    .w(px(286.0))
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
                     .justify_end()
-                    .gap(px(10.0))
+                    .gap(px(8.0))
                     .child(
                         div()
                             .id("bar-lyrics-btn")
@@ -367,7 +368,7 @@ impl BitChordApp {
                             }))
                             .child(icons::icon(
                                 icons::LYRICS,
-                                14.5,
+                                15.0,
                                 if self.route == Route::NowPlaying {
                                     theme.accent
                                 } else {
@@ -375,6 +376,61 @@ impl BitChordApp {
                                 },
                             ))
                             .child("Lyrics"),
+                    )
+                    .child(
+                        div()
+                            .id("bar-queue-btn")
+                            .h(px(32.0))
+                            .px(px(10.0))
+                            .rounded(px(8.0))
+                            .bg(if self.queue_open {
+                                theme.accent_soft
+                            } else {
+                                theme.surface_elevated
+                            })
+                            .border_1()
+                            .border_color(if self.queue_open {
+                                theme.accent
+                            } else {
+                                theme.border
+                            })
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .cursor_pointer()
+                            .text_size(px(12.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(if self.queue_open {
+                                theme.accent
+                            } else {
+                                theme.text_primary
+                            })
+                            .hover(move |s| s.bg(theme.surface_hover))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.queue_open = !this.queue_open;
+                                cx.notify();
+                            }))
+                            .child(icons::icon(
+                                icons::QUEUE_LIST,
+                                15.0,
+                                if self.queue_open {
+                                    theme.accent
+                                } else {
+                                    theme.text_secondary
+                                },
+                            ))
+                            .when(!self.queue.items.is_empty(), |el| {
+                                el.child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(if self.queue_open {
+                                            theme.accent
+                                        } else {
+                                            theme.text_muted
+                                        })
+                                        .child(format!("{}", self.queue.items.len())),
+                                )
+                            }),
                     )
                     .child(
                         div()
@@ -400,7 +456,7 @@ impl BitChordApp {
                                 },
                             )),
                     )
-                    .child(div().w(px(86.0)).child(pill_slider(
+                    .child(div().w(px(80.0)).child(pill_slider(
                         "bar-vol-pill",
                         vol_frac,
                         5.0,

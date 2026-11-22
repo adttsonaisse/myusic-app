@@ -73,6 +73,8 @@ pub struct ResolvedStream {
     pub mime_type: String,
     pub ext: String,
     pub content_length: Option<u64>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
     pub loudness_db: Option<f64>,
     pub is_live_hls: bool,
     pub client_name: String,
@@ -413,6 +415,7 @@ impl NativeStreamBackend {
                 mime_type: "application/vnd.apple.mpegurl".to_owned(),
                 ext: "m3u8".to_owned(),
                 content_length: None,
+                duration_ms: None,
                 loudness_db,
                 is_live_hls: true,
                 client_name: client.client_name.clone(),
@@ -421,6 +424,13 @@ impl NativeStreamBackend {
                 range_chunk_bytes: None,
             });
         }
+
+        let details_duration_ms = payload
+            .get("videoDetails")
+            .and_then(|v| v.get("lengthSeconds"))
+            .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse::<u64>().ok()))
+            .filter(|&s| s > 0)
+            .map(|s| s.saturating_mul(1_000));
 
         let formats = streaming
             .get("adaptiveFormats")
@@ -455,6 +465,11 @@ impl NativeStreamBackend {
         let content_length = chosen
             .content_length
             .or_else(|| PlayerClient::content_length_from_url(&final_url));
+        let duration_ms = chosen
+            .approx_duration_ms
+            .filter(|&d| d > 0)
+            .or_else(|| PlayerClient::duration_ms_from_url(&final_url))
+            .or(details_duration_ms);
 
         Ok(ResolvedStream {
             video_id: req.video_id.clone(),
@@ -463,6 +478,7 @@ impl NativeStreamBackend {
             mime_type: chosen.mime_type,
             ext: chosen.ext,
             content_length,
+            duration_ms,
             loudness_db,
             is_live_hls: false,
             client_name: client.client_name.clone(),
@@ -512,6 +528,7 @@ struct SelectedFormat {
     mime_type: String,
     ext: String,
     content_length: Option<u64>,
+    approx_duration_ms: Option<u64>,
 }
 
 fn select_best_audio_format(
@@ -557,6 +574,9 @@ fn select_best_audio_format(
         let content_length = obj
             .get("contentLength")
             .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()));
+        let approx_duration_ms = obj
+            .get("approxDurationMs")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()));
         let within_cap = max_kbps == 0 || kbps <= max_kbps;
         candidates.push((
             SelectedFormat {
@@ -565,6 +585,7 @@ fn select_best_audio_format(
                 mime_type: mime.to_owned(),
                 ext: ext.to_owned(),
                 content_length,
+                approx_duration_ms,
             },
             within_cap,
             is_webm_opus,
@@ -680,6 +701,7 @@ pub mod ytdlp {
         pub tbr: Option<f64>,
         pub filesize: Option<u64>,
         pub filesize_approx: Option<u64>,
+        pub duration: Option<f64>,
         pub protocol: Option<String>,
         pub is_live: Option<bool>,
     }
@@ -767,6 +789,11 @@ pub mod ytdlp {
                 .filesize
                 .or(info.filesize_approx)
                 .or_else(|| PlayerClient::content_length_from_url(&url));
+            let duration_ms = info
+                .duration
+                .filter(|d| d.is_finite() && *d > 0.0)
+                .map(|d| (d * 1_000.0).round() as u64)
+                .or_else(|| PlayerClient::duration_ms_from_url(&url));
             let inferred_client = PlayerClient::for_stream_url(&url);
             let media_headers = info
                 .http_headers
@@ -789,6 +816,7 @@ pub mod ytdlp {
                 mime_type,
                 ext,
                 content_length,
+                duration_ms,
                 // yt-dlp does not extract playerConfig.audioConfig.loudnessDb
                 loudness_db: None,
                 is_live_hls: info.is_live == Some(true)
@@ -1350,6 +1378,7 @@ mod tests {
                     mime_type: r#"audio/webm; codecs="opus""#.to_owned(),
                     ext: "webm".to_owned(),
                     content_length: Some(2_000_000),
+                    duration_ms: Some(180_000),
                     loudness_db: Some(-4.5),
                     is_live_hls: false,
                     client_name: if use_good { "VISIONOS" } else { "BAD" }.to_owned(),
@@ -1430,6 +1459,7 @@ mod tests {
                         mime_type: r#"audio/webm; codecs="opus""#.to_owned(),
                         ext: "webm".to_owned(),
                         content_length: None,
+                        duration_ms: None,
                         loudness_db: None,
                         is_live_hls: false,
                         client_name: "VISIONOS".to_owned(),

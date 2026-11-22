@@ -28,7 +28,7 @@ pub const MPRIS_BUS_SUFFIX: &str = "bitchord";
 /// Desktop entry basename (`bitchord.desktop`).
 pub const DESKTOP_ENTRY: &str = "bitchord";
 /// Human-readable application name shown in Linux media widgets.
-pub const IDENTITY: &str = "BitChord";
+pub const IDENTITY: &str = "Myusic";
 
 /// Inbound control command sent by Linux desktop media keys, KDE/GNOME/Cutefish
 /// media widgets, or `playerctl`.

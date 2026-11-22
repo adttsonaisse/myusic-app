@@ -52,7 +52,9 @@ impl BitChordApp {
                         div()
                             .text_size(px(13.0))
                             .text_color(theme.text_muted)
-                            .child("Synchronized group playback compatible with BitChord Go party servers."),
+                            .child(
+                                "Synchronized group playback over Listen Together party servers.",
+                            ),
                     ),
             )
             // Server URL & Nickname configuration
@@ -258,8 +260,7 @@ impl BitChordApp {
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme.on_accent)
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        let code =
-                                            this.party_code_input.read(cx).text().to_owned();
+                                        let code = this.party_code_input.read(cx).text().to_owned();
                                         this.join_party(code, cx);
                                     }))
                                     .child(icons::icon(icons::USERS, 14.5, theme.on_accent))

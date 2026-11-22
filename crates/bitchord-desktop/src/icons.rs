@@ -66,7 +66,8 @@ pub const VOLUME_MUTE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" view
 
 pub const QUEUE_LIST: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h14"/><path d="M3 12h10"/><path d="M3 18h7"/><path d="M17 12v7"/><circle cx="15" cy="19" r="2"/><path d="M17 12l4-1"/></svg>"##;
 
-pub const LYRICS: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16"/><path d="M4 11h12"/><path d="M4 16h8"/><path d="M18 14v5"/><circle cx="16.5" cy="19" r="1.5"/></svg>"##;
+/// Distinct speech-bubble quotation icon for Lyrics (clearly differentiated from QUEUE_LIST).
+pub const LYRICS: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a8.5 8.5 0 0 1-8.5 8.5c-1.4 0-2.75-.34-3.95-.95L3 21l1.45-4.8A8.5 8.5 0 1 1 21 12z"/><path d="M9.5 11.5h1.5v2H9a1 1 0 0 1-1-1v-1a2.5 2.5 0 0 1 2.5-2.5"/><path d="M14.5 11.5H16v2h-2a1 1 0 0 1-1-1v-1a2.5 2.5 0 0 1 2.5-2.5"/></svg>"##;
 
 pub const MUSIC_NOTE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>"##;
 

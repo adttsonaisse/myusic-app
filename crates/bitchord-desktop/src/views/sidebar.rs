@@ -76,7 +76,7 @@ impl BitChordApp {
                                             .text_size(px(16.0))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(theme.text_primary)
-                                            .child("BitChord"),
+                                            .child("Myusic"),
                                     )
                                     .into_any_element()
                             })

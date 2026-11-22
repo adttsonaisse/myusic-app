@@ -146,50 +146,6 @@ impl BitChordApp {
                                     .child("Ctrl+F"),
                             ),
                     )
-                    .child(
-                        div()
-                            .id("tb-queue-toggle")
-                            .h(px(30.0))
-                            .px(px(11.0))
-                            .rounded(px(8.0))
-                            .bg(if self.queue_open {
-                                theme.accent_soft
-                            } else {
-                                theme.surface_elevated
-                            })
-                            .border_1()
-                            .border_color(if self.queue_open {
-                                theme.accent
-                            } else {
-                                theme.border
-                            })
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .cursor_pointer()
-                            .text_size(px(12.0))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(if self.queue_open {
-                                theme.accent
-                            } else {
-                                theme.text_primary
-                            })
-                            .hover(move |s| s.bg(theme.surface_hover))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.queue_open = !this.queue_open;
-                                cx.notify();
-                            }))
-                            .child(icons::icon(
-                                icons::QUEUE_LIST,
-                                14.0,
-                                if self.queue_open {
-                                    theme.accent
-                                } else {
-                                    theme.text_secondary
-                                },
-                            ))
-                            .child(format!("Queue ({})", self.queue.items.len())),
-                    )
                     .when(is_csd, |el| {
                         el.child(
                             div()

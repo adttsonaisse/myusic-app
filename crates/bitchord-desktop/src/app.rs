@@ -154,7 +154,7 @@ impl BitChordApp {
         let party_nick_input = cx.new(|cx| {
             TextInput::new("Display nickname", cx).with_initial(
                 if backend.initial_settings.listen_together_nickname.is_empty() {
-                    "BitChord Linux".to_owned()
+                    "Myusic Linux".to_owned()
                 } else {
                     backend.initial_settings.listen_together_nickname.clone()
                 },

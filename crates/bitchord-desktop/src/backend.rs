@@ -494,7 +494,7 @@ fn run_backend_thread(
             match msg {
                 InternalTrackMsg::Ready {
                     generation,
-                    song,
+                    mut song,
                     decoder,
                     prebuffered,
                     loudness_db,
@@ -502,6 +502,12 @@ fn run_backend_thread(
                 } => {
                     if load_gen.load(Ordering::Acquire) != generation {
                         continue; // Superseded by a newer user click!
+                    }
+                    if song.duration_text.as_deref().is_none_or(str::is_empty)
+                        && let Some(dur_ms) = decoder.info().duration_ms.filter(|&d| d > 0)
+                    {
+                        let secs = dur_ms / 1_000;
+                        song.duration_text = Some(format!("{}:{:02}", secs / 60, secs % 60));
                     }
                     match engine.load_prepared_decoder(
                         *decoder,
@@ -1366,7 +1372,7 @@ fn run_backend_thread(
                         user_id: settings.device_id.clone(),
                         device_id: settings.device_id.clone(),
                         display_name: if nickname.trim().is_empty() {
-                            "BitChord Linux".to_owned()
+                            "Myusic Linux".to_owned()
                         } else {
                             nickname.trim().to_owned()
                         },
@@ -1417,7 +1423,7 @@ fn run_backend_thread(
                         user_id: settings.device_id.clone(),
                         device_id: settings.device_id.clone(),
                         display_name: if nickname.trim().is_empty() {
-                            "BitChord Linux".to_owned()
+                            "Myusic Linux".to_owned()
                         } else {
                             nickname.trim().to_owned()
                         },

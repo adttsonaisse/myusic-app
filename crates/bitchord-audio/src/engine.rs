@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use bitchord_innertube::ResolvedStream;
+use bitchord_innertube::{PlayerClient, ResolvedStream};
 use bitchord_integrations::NerdStatsSnapshot;
 use bitchord_model::{Song, duration_millis};
 use reqwest::Client;
@@ -811,11 +811,8 @@ impl AudioEngine {
         let raw = base_ms
             .saturating_add(media_delta_ms)
             .saturating_add(skipped_ms);
-        if let Some(dur) = slot.stream_info.as_ref().and_then(|i| i.duration_ms) {
-            raw.min(dur)
-        } else {
-            raw
-        }
+        let dur = self.duration_ms();
+        if dur > 0 { raw.min(dur) } else { raw }
     }
 
     pub fn duration_ms(&self) -> u64 {
@@ -824,11 +821,13 @@ impl AudioEngine {
             .stream_info
             .as_ref()
             .and_then(|i| i.duration_ms)
+            .filter(|&d| d > 0)
             .or_else(|| {
                 self.deck(active)
                     .song
                     .as_ref()
                     .map(|s| duration_millis(s.duration_text.as_deref()))
+                    .filter(|&d| d > 0)
             })
             .unwrap_or(0)
     }
@@ -1066,7 +1065,13 @@ pub fn open_http_decoder(
         hint.with_extension(ext);
     }
     let source = ChunkedRangeSource::from_resolved(http, rt, stream, on_refused)?;
-    Ok(AudioDecoder::open_source(Box::new(source), hint)?)
+    let mut decoder = AudioDecoder::open_source(Box::new(source), hint)?;
+    let fallback_dur = stream
+        .duration_ms
+        .filter(|&d| d > 0)
+        .or_else(|| PlayerClient::duration_ms_from_url(&stream.url));
+    decoder.apply_fallback_duration_ms(fallback_dur);
+    Ok(decoder)
 }
 
 fn open_decoder_for_spec(
