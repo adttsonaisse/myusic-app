@@ -24,6 +24,7 @@ bitchord-integrations.workspace = true
 bitchord-jam.workspace = true
 bitchord-lyrics.workspace = true
 bitchord-model.workspace = true
+bitchord-netstorage.workspace = true
 bitchord-queue.workspace = true
 bitchord-storage.workspace = true
 directories.workspace = true

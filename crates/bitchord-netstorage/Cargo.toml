@@ -1,0 +1,23 @@
+[package]
+name = "bitchord-netstorage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Pure-Rust WebDAV and SMB2/3 network music library clients and seekable stream readers for Myusic"
+
+[lints]
+workspace = true
+
+[dependencies]
+base64.workspace = true
+bitchord-model.workspace = true
+futures-util.workspace = true
+percent-encoding.workspace = true
+quick-xml.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+smb.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+url.workspace = true

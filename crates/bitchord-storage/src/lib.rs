@@ -29,8 +29,8 @@ pub use secrets::{
 };
 pub use settings::{
     AppFont, AppSettingsData, DEFAULT_UPGRADE_LENGTH_SLACK_SECONDS, DownloadQuality, EqualizerMode,
-    LocalMusicSort, OutputPcmMode, SettingsError, SettingsStore, SongSort, StreamRequest,
-    ThemeMode, request_for_download,
+    LocalMusicSort, OutputPcmMode, SettingsError, SettingsStore, SmbSettings, SongSort,
+    StreamRequest, ThemeMode, WebDavSettings, request_for_download,
 };
 pub use tagger::{
     EmbeddedLyrics, FlacHeaderRewrite, FlacTagger, LocalAudioTags, Mp4Tagger, WebmTagger,

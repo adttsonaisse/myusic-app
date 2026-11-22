@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -21,7 +21,8 @@ use bitchord_audio::{
 use bitchord_dsp_core::{EqCurve, EqLayout, EqualizerPreset, manual_curve};
 use bitchord_innertube::{
     BrowseHeader, InnertubeClient, InnertubeParser, NativeStreamBackend, ResolveRequest,
-    StreamBackend, StreamResolver, UploadedTracks, YtMusicRepository, build_shared_http_client,
+    ResolvedStream, StreamBackend, StreamResolver, UploadedTracks, YtMusicRepository,
+    build_shared_http_client,
 };
 #[cfg(feature = "ytdlp-bridge")]
 use bitchord_innertube::{FallbackStreamBackend, YtDlpStreamBackend};
@@ -38,16 +39,20 @@ use bitchord_model::{
     BrowseType, EntityType, HomeFeed, PlaybackSourceType, QueueTier, SearchFilter,
     SearchHistoryEntity, SearchResult, Song, duration_millis,
 };
+use bitchord_netstorage::{
+    SmbClient, SmbConfig, WebDavClient, WebDavConfig, remote_song::extension_lower,
+};
 use bitchord_queue::{QueueSource, QueueTimeline};
 use bitchord_storage::{
     AppPaths, AppSettingsData, DbStats, KeyringSecretStore, LibraryDb, LocalPlaylist,
-    SavedSongMetadata, SecretKey, SecretStore, SettingsStore, read_local_audio_tags,
+    SavedSongMetadata, SecretKey, SecretStore, SettingsStore, SmbSettings, WebDavSettings,
+    read_local_audio_tags,
 };
 use gpui::Global;
 use reqwest::Client;
 use tokio::runtime::Handle;
 
-use crate::artwork::song_thumbnail_url;
+use crate::artwork::{RemoteArtworkAuth, song_thumbnail_url};
 
 /// Selection of stream resolver mode (`ADR-004`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -173,6 +178,32 @@ pub enum BackendCommand {
     },
     SaveYoutubeCookie(String),
     ClearYoutubeCookie,
+    SaveWebDav {
+        url: String,
+        username: String,
+        password: String,
+    },
+    TestWebDav {
+        url: String,
+        username: String,
+        password: String,
+    },
+    SyncWebDav,
+    SaveSmb {
+        host: String,
+        share: String,
+        base_path: String,
+        username: String,
+        password: String,
+    },
+    TestSmb {
+        host: String,
+        share: String,
+        base_path: String,
+        username: String,
+        password: String,
+    },
+    SyncSmb,
     SetStreamBackend(StreamBackendChoice),
     SetDiscordRpc(bool),
     ImportSpotifyPlaylist(String),
@@ -235,6 +266,7 @@ pub struct AppBackend {
     pub http: Client,
     pub paths: AppPaths,
     pub initial_settings: AppSettingsData,
+    pub remote_auth: Arc<RwLock<RemoteArtworkAuth>>,
 }
 
 impl Global for AppBackend {}
@@ -246,6 +278,20 @@ impl AppBackend {
         let settings_store = SettingsStore::new(paths.settings_file());
         let initial_settings = settings_store.load().unwrap_or_default();
         let http = build_shared_http_client();
+        let remote_auth = Arc::new(RwLock::new(RemoteArtworkAuth {
+            webdav: WebDavConfig::new(
+                initial_settings.webdav.url.clone(),
+                initial_settings.webdav.username.clone(),
+                String::new(),
+            ),
+            smb: SmbConfig::new(
+                initial_settings.smb.host.clone(),
+                initial_settings.smb.share.clone(),
+                initial_settings.smb.base_path.clone(),
+                initial_settings.smb.username.clone(),
+                String::new(),
+            ),
+        }));
 
         let (cmd_tx, cmd_rx) = async_channel::bounded::<BackendCommand>(128);
         let (evt_tx, evt_rx) = async_channel::bounded::<BackendEvent>(128);
@@ -254,6 +300,7 @@ impl AppBackend {
         let worker_paths = paths.clone();
         let worker_settings = initial_settings.clone();
         let worker_rt = rt.clone();
+        let worker_remote_auth = Arc::clone(&remote_auth);
 
         thread::Builder::new()
             .name("bitchord-backend".to_owned())
@@ -263,6 +310,7 @@ impl AppBackend {
                     worker_http,
                     worker_paths,
                     worker_settings,
+                    worker_remote_auth,
                     cmd_rx,
                     evt_tx,
                 );
@@ -275,6 +323,7 @@ impl AppBackend {
             http,
             paths,
             initial_settings,
+            remote_auth,
         }
     }
 
@@ -356,6 +405,7 @@ fn run_backend_thread(
     http: Client,
     paths: AppPaths,
     mut settings: AppSettingsData,
+    remote_auth: Arc<RwLock<RemoteArtworkAuth>>,
     cmd_rx: Receiver<BackendCommand>,
     evt_tx: Sender<BackendEvent>,
 ) {
@@ -395,12 +445,28 @@ fn run_backend_thread(
     let mut resolver =
         build_stream_resolver(&http_arc, &innertube, &uploads, StreamBackendChoice::Auto);
 
-    // Load saved YouTube Music cookie from Linux Secret Service (best-effort).
+    // Load saved credentials from Linux Secret Service (best-effort).
     let secret_store = rt.block_on(KeyringSecretStore::open()).ok();
-    if let Some(ref store) = secret_store
-        && let Ok(Some(cookie)) = rt.block_on(store.get(SecretKey::YoutubeCookie))
-    {
-        innertube.set_cookie(Some(cookie.expose().to_owned()));
+    if let Some(ref store) = secret_store {
+        if let Ok(Some(cookie)) = rt.block_on(store.get(SecretKey::YoutubeCookie)) {
+            innertube.set_cookie(Some(cookie.expose().to_owned()));
+        }
+        let webdav_pw = rt
+            .block_on(store.get(SecretKey::WebDavPassword))
+            .ok()
+            .flatten()
+            .map(|s| s.expose().to_owned())
+            .unwrap_or_default();
+        let smb_pw = rt
+            .block_on(store.get(SecretKey::SmbPassword))
+            .ok()
+            .flatten()
+            .map(|s| s.expose().to_owned())
+            .unwrap_or_default();
+        if let Ok(mut guard) = remote_auth.write() {
+            guard.webdav.password = webdav_pw;
+            guard.smb.password = smb_pw;
+        }
     }
 
     // Start MPRIS2 D-Bus server (`org.mpris.MediaPlayer2.bitchord`).
@@ -558,6 +624,7 @@ fn run_backend_thread(
                                     &rt,
                                     Arc::clone(&http_arc),
                                     Arc::clone(&resolver),
+                                    Arc::clone(&remote_auth),
                                     next_song,
                                     track_tx.clone(),
                                 );
@@ -815,6 +882,7 @@ fn run_backend_thread(
                             &rt,
                             &http_arc,
                             &resolver,
+                            &remote_auth,
                             &lyrics_repo,
                             &current_lyrics,
                             song,
@@ -843,6 +911,7 @@ fn run_backend_thread(
                                 &rt,
                                 &http_arc,
                                 &resolver,
+                                &remote_auth,
                                 &lyrics_repo,
                                 &current_lyrics,
                                 s,
@@ -887,6 +956,7 @@ fn run_backend_thread(
                             &rt,
                             &http_arc,
                             &resolver,
+                            &remote_auth,
                             &lyrics_repo,
                             &current_lyrics,
                             song,
@@ -915,6 +985,7 @@ fn run_backend_thread(
                                     &rt,
                                     &http_arc,
                                     &resolver,
+                                    &remote_auth,
                                     &lyrics_repo,
                                     &current_lyrics,
                                     song,
@@ -1018,6 +1089,7 @@ fn run_backend_thread(
                             &rt,
                             &http_arc,
                             &resolver,
+                            &remote_auth,
                             &lyrics_repo,
                             &current_lyrics,
                             song,
@@ -1053,6 +1125,7 @@ fn run_backend_thread(
                                 &rt,
                                 &http_arc,
                                 &resolver,
+                                &remote_auth,
                                 &lyrics_repo,
                                 &current_lyrics,
                                 song,
@@ -1266,6 +1339,235 @@ fn run_backend_thread(
                     let _ = evt_tx.try_send(BackendEvent::StatusNotice(
                         "YouTube Music session cleared".to_owned(),
                     ));
+                }
+                BackendCommand::SaveWebDav {
+                    url,
+                    username,
+                    password,
+                } => {
+                    let norm_url = WebDavConfig::normalize_url(&url);
+                    let user_trimmed = username.trim().to_owned();
+                    settings.webdav = WebDavSettings {
+                        url: norm_url.clone(),
+                        username: user_trimmed.clone(),
+                    };
+                    let _ = settings_store.save(&settings);
+                    let effective_pw = if password.is_empty() {
+                        remote_auth
+                            .read()
+                            .map(|g| g.webdav.password.clone())
+                            .unwrap_or_default()
+                    } else {
+                        if let Some(ref store) = secret_store {
+                            let _ = rt.block_on(store.set(SecretKey::WebDavPassword, &password));
+                        }
+                        password
+                    };
+                    if let Ok(mut guard) = remote_auth.write() {
+                        guard.webdav = WebDavConfig::new(norm_url, user_trimmed, effective_pw);
+                    }
+                    let _ = evt_tx.try_send(BackendEvent::StatusNotice(
+                        "WebDAV configuration saved (password stored in Secret Service)".to_owned(),
+                    ));
+                }
+                BackendCommand::TestWebDav {
+                    url,
+                    username,
+                    password,
+                } => {
+                    let effective_pw = if password.is_empty() {
+                        remote_auth
+                            .read()
+                            .map(|g| g.webdav.password.clone())
+                            .unwrap_or_default()
+                    } else {
+                        password
+                    };
+                    let cfg = WebDavConfig::new(url, username.trim(), effective_pw);
+                    let http_c = http.clone();
+                    let tx = evt_tx.clone();
+                    rt.spawn(async move {
+                        let client = WebDavClient::with_http(http_c);
+                        match client.test_connection(&cfg).await {
+                            Ok(()) => {
+                                let _ = tx
+                                    .send(BackendEvent::StatusNotice(format!(
+                                        "WebDAV connected: {}",
+                                        WebDavConfig::normalize_url(&cfg.url)
+                                    )))
+                                    .await;
+                            }
+                            Err(err) => {
+                                let _ = tx
+                                    .send(BackendEvent::ErrorNotice(format!(
+                                        "WebDAV test failed: {err}"
+                                    )))
+                                    .await;
+                            }
+                        }
+                    });
+                }
+                BackendCommand::SyncWebDav => {
+                    let cfg = remote_auth
+                        .read()
+                        .map(|g| g.webdav.clone())
+                        .unwrap_or_default();
+                    let http_c = http.clone();
+                    let paths_c = paths.clone();
+                    let tx = evt_tx.clone();
+                    rt.spawn(async move {
+                        let _ = tx
+                            .send(BackendEvent::StatusNotice(
+                                "Syncing WebDAV music library...".to_owned(),
+                            ))
+                            .await;
+                        let client = WebDavClient::with_http(http_c);
+                        match client
+                            .list_songs(&cfg, bitchord_netstorage::webdav::DEFAULT_MAX_FILES)
+                            .await
+                        {
+                            Ok(songs) => {
+                                let count = match LibraryDb::open(&paths_c.db_file()) {
+                                    Ok(db) => {
+                                        db.replace_prefixed_songs("webdav:", &songs).unwrap_or(0)
+                                    }
+                                    Err(_) => 0,
+                                };
+                                emit_library_snapshot(&paths_c, &tx);
+                                let _ = tx
+                                    .send(BackendEvent::StatusNotice(format!(
+                                        "Synced {count} WebDAV track(s) into Library"
+                                    )))
+                                    .await;
+                            }
+                            Err(err) => {
+                                let _ = tx
+                                    .send(BackendEvent::ErrorNotice(format!(
+                                        "WebDAV sync failed: {err}"
+                                    )))
+                                    .await;
+                            }
+                        }
+                    });
+                }
+                BackendCommand::SaveSmb {
+                    host,
+                    share,
+                    base_path,
+                    username,
+                    password,
+                } => {
+                    let host_t = host.trim().to_owned();
+                    let share_t = share.trim().trim_matches(['/', '\\']).to_owned();
+                    let base_t = base_path
+                        .trim()
+                        .replace('\\', "/")
+                        .trim_matches('/')
+                        .to_owned();
+                    let user_t = username.trim().to_owned();
+                    settings.smb = SmbSettings {
+                        host: host_t.clone(),
+                        share: share_t.clone(),
+                        base_path: base_t.clone(),
+                        username: user_t.clone(),
+                    };
+                    let _ = settings_store.save(&settings);
+                    let effective_pw = if password.is_empty() {
+                        remote_auth
+                            .read()
+                            .map(|g| g.smb.password.clone())
+                            .unwrap_or_default()
+                    } else {
+                        if let Some(ref store) = secret_store {
+                            let _ = rt.block_on(store.set(SecretKey::SmbPassword, &password));
+                        }
+                        password
+                    };
+                    if let Ok(mut guard) = remote_auth.write() {
+                        guard.smb = SmbConfig::new(host_t, share_t, base_t, user_t, effective_pw);
+                    }
+                    let _ = evt_tx.try_send(BackendEvent::StatusNotice(
+                        "SMB configuration saved (password stored in Secret Service)".to_owned(),
+                    ));
+                }
+                BackendCommand::TestSmb {
+                    host,
+                    share,
+                    base_path,
+                    username,
+                    password,
+                } => {
+                    let effective_pw = if password.is_empty() {
+                        remote_auth
+                            .read()
+                            .map(|g| g.smb.password.clone())
+                            .unwrap_or_default()
+                    } else {
+                        password
+                    };
+                    let cfg = SmbConfig::new(host, share, base_path, username.trim(), effective_pw);
+                    let tx = evt_tx.clone();
+                    rt.spawn(async move {
+                        match SmbClient::new().test_connection(&cfg).await {
+                            Ok(()) => {
+                                let _ = tx
+                                    .send(BackendEvent::StatusNotice(format!(
+                                        "SMB connected: //{}/{}",
+                                        SmbConfig::normalize_host(&cfg.host),
+                                        cfg.normalized_share()
+                                    )))
+                                    .await;
+                            }
+                            Err(err) => {
+                                let _ = tx
+                                    .send(BackendEvent::ErrorNotice(format!(
+                                        "SMB test failed: {err}"
+                                    )))
+                                    .await;
+                            }
+                        }
+                    });
+                }
+                BackendCommand::SyncSmb => {
+                    let cfg = remote_auth
+                        .read()
+                        .map(|g| g.smb.clone())
+                        .unwrap_or_default();
+                    let paths_c = paths.clone();
+                    let tx = evt_tx.clone();
+                    rt.spawn(async move {
+                        let _ = tx
+                            .send(BackendEvent::StatusNotice(
+                                "Syncing SMB2/3 music share...".to_owned(),
+                            ))
+                            .await;
+                        match SmbClient::new()
+                            .list_songs(&cfg, bitchord_netstorage::smb::SMB_DEFAULT_MAX_FILES)
+                            .await
+                        {
+                            Ok(songs) => {
+                                let count = match LibraryDb::open(&paths_c.db_file()) {
+                                    Ok(db) => {
+                                        db.replace_prefixed_songs("smb:", &songs).unwrap_or(0)
+                                    }
+                                    Err(_) => 0,
+                                };
+                                emit_library_snapshot(&paths_c, &tx);
+                                let _ = tx
+                                    .send(BackendEvent::StatusNotice(format!(
+                                        "Synced {count} SMB track(s) into Library"
+                                    )))
+                                    .await;
+                            }
+                            Err(err) => {
+                                let _ = tx
+                                    .send(BackendEvent::ErrorNotice(format!(
+                                        "SMB sync failed: {err}"
+                                    )))
+                                    .await;
+                            }
+                        }
+                    });
                 }
                 BackendCommand::SetStreamBackend(choice) => {
                     resolver = build_stream_resolver(&http_arc, &innertube, &uploads, choice);
@@ -1537,6 +1839,7 @@ fn run_backend_thread(
                     &rt,
                     Arc::clone(&http_arc),
                     Arc::clone(&resolver),
+                    Arc::clone(&remote_auth),
                     next_song,
                     track_tx.clone(),
                 );
@@ -1570,6 +1873,7 @@ fn run_backend_thread(
                 &rt,
                 &http_arc,
                 &resolver,
+                &remote_auth,
                 &lyrics_repo,
                 &current_lyrics,
                 song,
@@ -1628,6 +1932,7 @@ fn start_async_song_load(
     rt: &Handle,
     http: &Arc<Client>,
     resolver: &Arc<StreamResolver>,
+    remote_auth: &Arc<RwLock<RemoteArtworkAuth>>,
     lyrics_repo: &Arc<LyricsRepository>,
     current_lyrics: &Arc<Mutex<Option<LyricsPayload>>>,
     song: Song,
@@ -1663,12 +1968,21 @@ fn start_async_song_load(
     let gen_ref = Arc::clone(load_gen);
     let http_c = Arc::clone(http);
     let resolver_c = Arc::clone(resolver);
+    let remote_c = Arc::clone(remote_auth);
     let rt_c = rt.clone();
     let tx = track_tx.clone();
 
     rt.spawn(async move {
-        let prepared =
-            prepare_track_decoder(&http_c, &rt_c, &resolver_c, &song, &gen_ref, generation).await;
+        let prepared = prepare_track_decoder(
+            &http_c,
+            &rt_c,
+            &resolver_c,
+            &remote_c,
+            &song,
+            &gen_ref,
+            generation,
+        )
+        .await;
         if gen_ref.load(Ordering::Acquire) != generation {
             return;
         }
@@ -1698,12 +2012,14 @@ fn start_async_song_load(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_preload_next(
     generation: u64,
     load_gen: Arc<AtomicU64>,
     rt: &Handle,
     http: Arc<Client>,
     resolver: Arc<StreamResolver>,
+    remote_auth: Arc<RwLock<RemoteArtworkAuth>>,
     next_song: Song,
     track_tx: Sender<InternalTrackMsg>,
 ) {
@@ -1714,8 +2030,16 @@ fn spawn_preload_next(
         if load_gen.load(Ordering::Acquire) != generation {
             return;
         }
-        if let Ok((decoder, prebuffered, loudness_db, source_label)) =
-            prepare_track_decoder(&http, &rt_c, &resolver, &next_song, &load_gen, generation).await
+        if let Ok((decoder, prebuffered, loudness_db, source_label)) = prepare_track_decoder(
+            &http,
+            &rt_c,
+            &resolver,
+            &remote_auth,
+            &next_song,
+            &load_gen,
+            generation,
+        )
+        .await
             && load_gen.load(Ordering::Acquire) == generation
         {
             let _ = track_tx
@@ -1738,6 +2062,7 @@ async fn prepare_track_decoder(
     http: &Arc<Client>,
     rt: &Handle,
     resolver: &Arc<StreamResolver>,
+    remote_auth: &Arc<RwLock<RemoteArtworkAuth>>,
     song: &Song,
     load_gen: &Arc<AtomicU64>,
     generation: u64,
@@ -1776,6 +2101,98 @@ async fn prepare_track_decoder(
         .await
         .map_err(|e| format!("decode task join error: {e}"))??;
         return Ok((dec, prebuf, None, "Local".to_owned()));
+    }
+
+    // 2. WebDAV stream (authenticated HTTP Range via ChunkedRangeSource).
+    if WebDavConfig::is_webdav_id(&song.video_id) {
+        let file_url = WebDavConfig::file_url_of(&song.video_id)
+            .or(song.local_uri.as_deref())
+            .ok_or_else(|| "WebDAV track missing stream URL".to_owned())?
+            .to_owned();
+        let webdav_cfg = remote_auth
+            .read()
+            .map(|g| g.webdav.clone())
+            .unwrap_or_default();
+        let mut headers = std::collections::BTreeMap::new();
+        if let Some(auth_hdr) = webdav_cfg.auth_header_for_url(&file_url) {
+            headers.insert("Authorization".to_owned(), auth_hdr);
+        }
+        let ext = extension_lower(&file_url);
+        let mime = match ext.as_str() {
+            "flac" => "audio/flac",
+            "wav" => "audio/wav",
+            "mp3" => "audio/mpeg",
+            "ogg" | "opus" => "audio/ogg",
+            "m4a" | "aac" => "audio/mp4",
+            "webm" => "audio/webm",
+            _ => "application/octet-stream",
+        };
+        let stream = ResolvedStream {
+            video_id: song.video_id.clone(),
+            url: file_url,
+            kbps: 0,
+            mime_type: mime.to_owned(),
+            ext,
+            content_length: None,
+            duration_ms: None,
+            loudness_db: None,
+            is_live_hls: false,
+            client_name: "WebDAV".to_owned(),
+            profile_id: "webdav".to_owned(),
+            media_headers: headers,
+            range_chunk_bytes: None,
+        };
+        let http_clone = (**http).clone();
+        let rt_clone = rt.clone();
+        let gen_check = Arc::clone(load_gen);
+        let (dec, prebuf) = tokio::task::spawn_blocking(move || {
+            let mut dec = open_http_decoder(http_clone, rt_clone, &stream, None)
+                .map_err(|e| e.to_string())?;
+            let prebuf = dec
+                .prebuffer_ms(INITIAL_PREBUFFER_MS, || {
+                    gen_check.load(Ordering::Acquire) != generation
+                })
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>((dec, prebuf))
+        })
+        .await
+        .map_err(|e| format!("WebDAV decode join error: {e}"))??;
+        return Ok((dec, prebuf, None, "WebDAV".to_owned()));
+    }
+
+    // 3. SMB2/3 share stream (pure-Rust chunk-cached SmbRangeReader).
+    if SmbConfig::is_smb_id(&song.video_id)
+        || song.local_uri.as_deref().is_some_and(SmbConfig::is_smb_url)
+    {
+        let uri = song
+            .local_uri
+            .as_deref()
+            .unwrap_or(&song.video_id)
+            .to_owned();
+        let smb_cfg = remote_auth
+            .read()
+            .map(|g| g.smb.clone())
+            .unwrap_or_default();
+        let reader = SmbClient::new()
+            .open_range_reader(&smb_cfg, &uri, rt.clone())
+            .await
+            .map_err(|e| e.to_string())?;
+        let byte_len = reader.byte_len();
+        let ext = extension_lower(&uri);
+        let gen_check = Arc::clone(load_gen);
+        let (dec, prebuf) = tokio::task::spawn_blocking(move || {
+            let mut dec = AudioDecoder::open_seekable_reader(reader, Some(byte_len), Some(&ext))
+                .map_err(|e| e.to_string())?;
+            let prebuf = dec
+                .prebuffer_ms(INITIAL_PREBUFFER_MS, || {
+                    gen_check.load(Ordering::Acquire) != generation
+                })
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>((dec, prebuf))
+        })
+        .await
+        .map_err(|e| format!("SMB decode join error: {e}"))??;
+        return Ok((dec, prebuf, None, "SMB".to_owned()));
     }
 
     // 2. Remote YouTube Music stream with automatic 403/404/410 profile-refusal retry

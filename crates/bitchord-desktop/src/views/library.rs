@@ -6,7 +6,7 @@ use bitchord_model::{PlaybackSourceType, Song};
 use gpui::prelude::*;
 use gpui::{Context, FontWeight, Window, div, px, uniform_list};
 
-use crate::app::BitChordApp;
+use crate::app::{BitChordApp, LibrarySourceFilter};
 use crate::artwork::song_thumbnail_url;
 use crate::backend::BackendCommand;
 use crate::icons;
@@ -15,7 +15,15 @@ impl BitChordApp {
     pub fn render_library(&self, _window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme();
         let stats = self.library.stats;
-        let song_count = self.library.songs.len();
+        let active_filter = self.library_source_filter;
+        let filtered_songs: Vec<Song> = self
+            .library
+            .songs
+            .iter()
+            .filter(|s| active_filter.matches(s))
+            .cloned()
+            .collect();
+        let song_count = filtered_songs.len();
 
         div()
             .size_full()
@@ -124,6 +132,55 @@ impl BitChordApp {
                             .child("Scan Local Audio"),
                     ),
             )
+            // Source filter chips (All / Local / WebDAV / SMB / YouTube)
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(8.0))
+                    .children(LibrarySourceFilter::ALL.into_iter().map(|flt| {
+                        let is_sel = flt == active_filter;
+                        let count = self
+                            .library
+                            .songs
+                            .iter()
+                            .filter(|s| flt.matches(s))
+                            .count();
+                        div()
+                            .id(("lib-filter", flt as usize))
+                            .h(px(30.0))
+                            .px(px(12.0))
+                            .rounded(px(999.0))
+                            .bg(if is_sel {
+                                theme.accent_soft
+                            } else {
+                                theme.surface_elevated
+                            })
+                            .border_1()
+                            .border_color(if is_sel { theme.accent } else { theme.border })
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .text_size(px(12.0))
+                            .font_weight(if is_sel {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .text_color(if is_sel {
+                                theme.accent
+                            } else {
+                                theme.text_secondary
+                            })
+                            .hover(move |s| s.bg(theme.surface_hover))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.library_source_filter = flt;
+                                cx.notify();
+                            }))
+                            .child(format!("{} ({count})", flt.label()))
+                    })),
+            )
             // Imported/Local Playlists row (only if playlists exist)
             .when(!self.library.playlists.is_empty(), |el| {
                 el.child(
@@ -180,7 +237,14 @@ impl BitChordApp {
                     song_count,
                     cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
                         let t = this.theme();
-                        let all_songs = this.library.songs.clone();
+                        let flt = this.library_source_filter;
+                        let all_songs: Vec<Song> = this
+                            .library
+                            .songs
+                            .iter()
+                            .filter(|s| flt.matches(s))
+                            .cloned()
+                            .collect();
                         let active_vid = this
                             .playback
                             .current_song
@@ -191,7 +255,15 @@ impl BitChordApp {
                             .filter_map(|idx| all_songs.get(idx).map(|s| (idx, s.clone())))
                             .map(|(idx, song)| {
                                 let is_cur = active_vid == Some(song.video_id.as_str());
-                                let is_local = song.local_path.is_some();
+                                let source_badge = if song.video_id.starts_with("webdav:") {
+                                    "WEBDAV"
+                                } else if song.video_id.starts_with("smb:") {
+                                    "SMB"
+                                } else if song.local_path.is_some() {
+                                    "LOCAL"
+                                } else {
+                                    "YTM"
+                                };
                                 let songs_c = all_songs.clone();
                                 let next_s = song.clone();
                                 let art = song_thumbnail_url(&song);
@@ -288,7 +360,7 @@ impl BitChordApp {
                                                     .bg(t.surface_elevated)
                                                     .text_size(px(10.5))
                                                     .text_color(t.text_muted)
-                                                    .child(if is_local { "LOCAL" } else { "YTM" }),
+                                                    .child(source_badge),
                                             )
                                             .child(
                                                 div()

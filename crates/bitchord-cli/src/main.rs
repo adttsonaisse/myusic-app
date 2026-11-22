@@ -13,14 +13,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bitchord_audio::{
-    AudioEngine, EqTuningSnapshot, MprisCommand, MprisService, MprisState, PlaybackState,
-    PlaybackStatus, build_mpris_metadata,
+    AudioDecoder, AudioEngine, EqTuningSnapshot, MprisCommand, MprisService, MprisState,
+    PlaybackState, PlaybackStatus, build_mpris_metadata,
 };
 use bitchord_dsp_core::{EqualizerPreset, manual_curve};
 use bitchord_innertube::{
     ContainerPreference, InnertubeClient, InnertubeParser, NativeStreamBackend, ResolveRequest,
-    SongInfoRepository, StreamBackend, StreamResolver, UploadedTracks, YtMusicRepository,
-    build_shared_http_client,
+    ResolvedStream, SongInfoRepository, StreamBackend, StreamResolver, UploadedTracks,
+    YtMusicRepository, build_shared_http_client,
 };
 #[cfg(feature = "ytdlp-bridge")]
 use bitchord_innertube::{FallbackStreamBackend, YtDlpStreamBackend};
@@ -32,6 +32,7 @@ use bitchord_lyrics::{
     LyricsCallbacks, LyricsRepository, LyricsRequest, LyricsSource, to_enhanced_lrc, to_lrc,
 };
 use bitchord_model::{PlaybackSourceType, QueueTier, SearchFilter, SearchResult, Song};
+use bitchord_netstorage::{SmbClient, SmbConfig, WebDavClient, WebDavConfig};
 use bitchord_queue::{QueueSource, QueueTimeline};
 use bitchord_storage::{AppPaths, EmbeddedLyrics, LibraryDb, SettingsStore, read_local_audio_tags};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -95,6 +96,11 @@ enum Command {
     Storage {
         #[command(subcommand)]
         action: StorageAction,
+    },
+    /// Test and browse WebDAV or SMB2/3 network music shares.
+    Netstorage {
+        #[command(subcommand)]
+        action: NetStorageAction,
     },
     /// Deterministic queue state machine smoke command for replay verification.
     QueueDemo {
@@ -254,8 +260,14 @@ impl From<CliEqPreset> for EqualizerPreset {
 
 #[derive(Debug, Args)]
 struct PlayArgs {
-    /// Local audio file path (FLAC/WAV/Opus/M4A/MP3/OGG) or YouTube videoId.
+    /// Local audio file path, WebDAV URL (`http(s)://...` / `webdav:...`), SMB URL (`smb://host/share/path`), or YouTube videoId.
     target: String,
+    /// Optional username for WebDAV Basic Auth or SMB2/3 login.
+    #[arg(long, default_value = "")]
+    remote_user: String,
+    /// Optional password for WebDAV Basic Auth or SMB2/3 login.
+    #[arg(long, default_value = "")]
+    remote_pass: String,
     #[arg(long, value_enum, default_value_t = StreamBackendMode::Auto)]
     backend: StreamBackendMode,
     #[arg(long, default_value_t = u32::MAX)]
@@ -333,6 +345,58 @@ enum StorageAction {
     Tags { path: PathBuf },
 }
 
+#[derive(Debug, Subcommand)]
+enum NetStorageAction {
+    /// Test WebDAV PROPFIND connectivity and credentials.
+    WebdavTest {
+        #[arg(long)]
+        url: String,
+        #[arg(long, default_value = "")]
+        user: String,
+        #[arg(long, default_value = "")]
+        pass: String,
+    },
+    /// Recursively list audio tracks and paired folder covers on a WebDAV server.
+    WebdavList {
+        #[arg(long)]
+        url: String,
+        #[arg(long, default_value = "")]
+        user: String,
+        #[arg(long, default_value = "")]
+        pass: String,
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+    },
+    /// Test SMB2/3 share connectivity and credentials.
+    SmbTest {
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        share: String,
+        #[arg(long, default_value = "")]
+        base_path: String,
+        #[arg(long, default_value = "")]
+        user: String,
+        #[arg(long, default_value = "")]
+        pass: String,
+    },
+    /// Recursively list audio tracks and paired folder covers on an SMB2/3 share.
+    SmbList {
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        share: String,
+        #[arg(long, default_value = "")]
+        base_path: String,
+        #[arg(long, default_value = "")]
+        user: String,
+        #[arg(long, default_value = "")]
+        pass: String,
+        #[arg(long, default_value_t = 500)]
+        limit: usize,
+    },
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OutputMessage<T: Serialize> {
@@ -379,6 +443,7 @@ async fn run(cli: Cli) -> Result<String, String> {
         Command::Jam { action } => cmd_jam(action, json_mode).await,
         Command::Spotify { action } => cmd_spotify(action, json_mode).await,
         Command::Storage { action } => cmd_storage(action, &paths, json_mode),
+        Command::Netstorage { action } => cmd_netstorage(action, json_mode).await,
         Command::QueueDemo { tracks, play_next } => cmd_queue_demo(tracks, play_next, json_mode),
     }
 }
@@ -630,6 +695,79 @@ async fn cmd_play(args: PlayArgs, json_mode: bool) -> Result<String, String> {
         song.album_name = tags.and_then(|t| t.album);
         engine
             .load_file(target_path, song, None)
+            .map_err(|e| e.to_string())?;
+    } else if args.target.starts_with("http://")
+        || args.target.starts_with("https://")
+        || WebDavConfig::is_webdav_id(&args.target)
+    {
+        let file_url = WebDavConfig::file_url_of(&args.target)
+            .unwrap_or(&args.target)
+            .to_owned();
+        let mut headers = std::collections::BTreeMap::new();
+        if let Some(auth) = WebDavConfig::basic_auth_header(&args.remote_user, &args.remote_pass) {
+            headers.insert("Authorization".to_owned(), auth);
+        }
+        let ext = bitchord_netstorage::remote_song::extension_lower(&file_url);
+        let mime = match ext.as_str() {
+            "flac" => "audio/flac",
+            "wav" => "audio/wav",
+            "mp3" => "audio/mpeg",
+            "ogg" | "opus" => "audio/ogg",
+            "m4a" | "aac" => "audio/mp4",
+            "webm" => "audio/webm",
+            _ => "application/octet-stream",
+        };
+        let stream = ResolvedStream {
+            video_id: WebDavConfig::id_for(&file_url),
+            url: file_url.clone(),
+            kbps: 0,
+            mime_type: mime.to_owned(),
+            ext: ext.clone(),
+            content_length: None,
+            duration_ms: None,
+            loudness_db: None,
+            is_live_hls: false,
+            client_name: "WebDAV".to_owned(),
+            profile_id: "webdav".to_owned(),
+            media_headers: headers,
+            range_chunk_bytes: None,
+        };
+        let song = WebDavConfig::song_for(&file_url, None, None);
+        let http = build_shared_http_client();
+        let rt = tokio::runtime::Handle::current();
+        engine
+            .load_stream(http, rt, stream, song, None)
+            .map_err(|e| e.to_string())?;
+    } else if SmbConfig::is_smb_url(&args.target) || SmbConfig::is_smb_id(&args.target) {
+        let stripped = args
+            .target
+            .strip_prefix("smb://")
+            .or_else(|| args.target.strip_prefix("smb:"))
+            .unwrap_or(&args.target);
+        let mut parts = stripped.splitn(3, '/');
+        let host = parts.next().unwrap_or("");
+        let share = parts.next().unwrap_or("");
+        let rel_path = parts.next().unwrap_or("");
+        if host.is_empty() || share.is_empty() || rel_path.is_empty() {
+            return Err("SMB target must be smb://host/share/path/to/file".to_owned());
+        }
+        let cfg = SmbConfig::new(host, share, "", &args.remote_user, &args.remote_pass);
+        let rt = tokio::runtime::Handle::current();
+        let reader = SmbClient::new()
+            .open_range_reader(&cfg, rel_path, rt)
+            .await
+            .map_err(|e| e.to_string())?;
+        let byte_len = reader.byte_len();
+        let ext = bitchord_netstorage::remote_song::extension_lower(rel_path);
+        let decoder = tokio::task::spawn_blocking(move || {
+            AudioDecoder::open_seekable_reader(reader, Some(byte_len), Some(&ext))
+        })
+        .await
+        .map_err(|e| format!("SMB decoder join error: {e}"))?
+        .map_err(|e| e.to_string())?;
+        let song = SmbConfig::song_for(host, share, rel_path, None, None);
+        engine
+            .load_prepared_decoder(decoder, Vec::new(), song, None, Some("SMB"))
             .map_err(|e| e.to_string())?;
     } else {
         let http = Arc::new(build_shared_http_client());
@@ -899,6 +1037,117 @@ async fn cmd_spotify(action: SpotifyAction, json_mode: bool) -> Result<String, S
     }
 }
 
+async fn cmd_netstorage(action: NetStorageAction, json_mode: bool) -> Result<String, String> {
+    match action {
+        NetStorageAction::WebdavTest { url, user, pass } => {
+            let cfg = WebDavConfig::new(url, user, pass);
+            WebDavClient::new()
+                .test_connection(&cfg)
+                .await
+                .map_err(|e| e.to_string())?;
+            if json_mode {
+                return to_json(&serde_json::json!({
+                    "protocol": "webdav",
+                    "url": WebDavConfig::normalize_url(&cfg.url),
+                    "connected": true,
+                }));
+            }
+            Ok(format!(
+                "WebDAV connected: {}",
+                WebDavConfig::normalize_url(&cfg.url)
+            ))
+        }
+        NetStorageAction::WebdavList {
+            url,
+            user,
+            pass,
+            limit,
+        } => {
+            let cfg = WebDavConfig::new(url, user, pass);
+            let songs = WebDavClient::new()
+                .list_songs(&cfg, limit)
+                .await
+                .map_err(|e| e.to_string())?;
+            if json_mode {
+                return to_json(&serde_json::json!({
+                    "protocol": "webdav",
+                    "count": songs.len(),
+                    "songs": songs,
+                }));
+            }
+            let mut lines = vec![format!("WebDAV tracks: {}", songs.len())];
+            for (idx, s) in songs.iter().enumerate() {
+                lines.push(format!(
+                    "{:>3}. {} - {} [album={}]",
+                    idx + 1,
+                    s.artist,
+                    s.title,
+                    s.album_name.as_deref().unwrap_or("-")
+                ));
+            }
+            Ok(lines.join("\n"))
+        }
+        NetStorageAction::SmbTest {
+            host,
+            share,
+            base_path,
+            user,
+            pass,
+        } => {
+            let cfg = SmbConfig::new(host, share, base_path, user, pass);
+            SmbClient::new()
+                .test_connection(&cfg)
+                .await
+                .map_err(|e| e.to_string())?;
+            if json_mode {
+                return to_json(&serde_json::json!({
+                    "protocol": "smb",
+                    "host": SmbConfig::normalize_host(&cfg.host),
+                    "share": cfg.normalized_share(),
+                    "connected": true,
+                }));
+            }
+            Ok(format!(
+                "SMB connected: //{}/{}",
+                SmbConfig::normalize_host(&cfg.host),
+                cfg.normalized_share()
+            ))
+        }
+        NetStorageAction::SmbList {
+            host,
+            share,
+            base_path,
+            user,
+            pass,
+            limit,
+        } => {
+            let cfg = SmbConfig::new(host, share, base_path, user, pass);
+            let songs = SmbClient::new()
+                .list_songs(&cfg, limit)
+                .await
+                .map_err(|e| e.to_string())?;
+            if json_mode {
+                return to_json(&serde_json::json!({
+                    "protocol": "smb",
+                    "count": songs.len(),
+                    "songs": songs,
+                }));
+            }
+            let mut lines = vec![format!("SMB tracks: {}", songs.len())];
+            for (idx, s) in songs.iter().enumerate() {
+                lines.push(format!(
+                    "{:>3}. {} - {} [album={}]",
+                    idx + 1,
+                    s.artist,
+                    s.title,
+                    s.album_name.as_deref().unwrap_or("-")
+                ));
+            }
+            Ok(lines.join("\n"))
+        }
+    }
+}
+
 fn cmd_storage(action: StorageAction, paths: &AppPaths, json_mode: bool) -> Result<String, String> {
     match action {
         StorageAction::Paths => {
@@ -1152,5 +1401,93 @@ mod tests {
         assert_eq!(val["nerdStats"]["sampleRateHz"], 44_100);
         assert_eq!(val["nerdStats"]["bitDepth"], 16);
         assert!(val["renderedFrames"].as_u64().unwrap_or(0) > 10_000);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offline_play_webdav_basic_auth_range_stream_succeeds() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let wav = Arc::new(bitchord_audio::build_test_wav_pcm16(44_100, 440.0, 250));
+        let expected_auth = WebDavConfig::basic_auth_header("davuser", "davpass").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let wav_srv = Arc::clone(&wav);
+        let server = tokio::spawn(async move {
+            for _ in 0..8 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut req_buf = vec![0u8; 4096];
+                let n = sock.read(&mut req_buf).await.unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let req = String::from_utf8_lossy(&req_buf[..n]);
+                let ok_auth = req
+                    .lines()
+                    .any(|l| l.eq_ignore_ascii_case(&format!("Authorization: {expected_auth}")));
+                if !ok_auth {
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    continue;
+                }
+                let total = wav_srv.len();
+                let mut start = 0usize;
+                let mut end = total.saturating_sub(1);
+                if let Some(range_line) = req
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("range: bytes="))
+                {
+                    let spec = range_line
+                        .split_once("bytes=")
+                        .map(|(_, s)| s.trim())
+                        .unwrap_or("");
+                    if let Some((a, b)) = spec.split_once('-') {
+                        if let Ok(s) = a.parse::<usize>() {
+                            start = s.min(total);
+                        }
+                        if let Ok(e) = b.parse::<usize>() {
+                            end = e.min(total.saturating_sub(1));
+                        }
+                    }
+                }
+                let slice = if start <= end && start < total {
+                    &wav_srv[start..=end]
+                } else {
+                    &[]
+                };
+                let hdr = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/wav\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    slice.len()
+                );
+                let _ = sock.write_all(hdr.as_bytes()).await;
+                let _ = sock.write_all(slice).await;
+            }
+        });
+
+        let url = format!("webdav:http://{addr}/dav/Daft%20Punk%20-%20Test.wav");
+        let cli = Cli::try_parse_from([
+            "bitchord-cli",
+            "--json",
+            "play",
+            &url,
+            "--remote-user",
+            "davuser",
+            "--remote-pass",
+            "davpass",
+            "--no-output",
+        ])
+        .expect("parse webdav play");
+        let out = run(cli).await.expect("run webdav play");
+        server.abort();
+
+        let val: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        assert_eq!(val["finalState"], "ended");
+        assert_eq!(val["nerdStats"]["sourceName"], "WebDAV");
+        assert_eq!(val["nerdStats"]["sampleRateHz"], 44_100);
+        assert!(val["renderedFrames"].as_u64().unwrap_or(0) > 8_000);
     }
 }

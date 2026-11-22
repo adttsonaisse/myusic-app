@@ -26,7 +26,8 @@ pub use crossfade::{
     HANDOFF_GUARD_MS, MAX_CROSSFADE_SECONDS, MIN_BLEND_TRIM, equal_power_gains,
 };
 pub use decoder::{
-    AudioDecoder, DecodedPacket, DecodedStreamInfo, DecoderError, build_test_wav_pcm16,
+    AudioDecoder, DecodedPacket, DecodedStreamInfo, DecoderError, SeekableReadSource,
+    build_test_wav_pcm16,
 };
 pub use dsp::{
     DspChain, EqTuningSnapshot, LoudnessProcessor, SpatialAudioProcessor,

@@ -5,6 +5,7 @@
 //! never falsely reports `32-bit` just because the DSP pipeline operates in `f32`.
 
 use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -106,6 +107,41 @@ pub struct AudioDecoder {
     decoded_frames: u64,
 }
 
+/// Adapts any seekable `Read + Seek + Send + Sync` byte source (such as
+/// `bitchord_netstorage::SmbRangeReader`) into a Symphonia [`MediaSource`].
+pub struct SeekableReadSource<R> {
+    inner: R,
+    byte_len: Option<u64>,
+}
+
+impl<R: Read + Seek + Send + Sync + 'static> SeekableReadSource<R> {
+    pub fn new(inner: R, byte_len: Option<u64>) -> Self {
+        Self { inner, byte_len }
+    }
+}
+
+impl<R: Read + Seek + Send + Sync + 'static> Read for SeekableReadSource<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<R: Read + Seek + Send + Sync + 'static> Seek for SeekableReadSource<R> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+impl<R: Read + Seek + Send + Sync + 'static> MediaSource for SeekableReadSource<R> {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        self.byte_len
+    }
+}
+
 impl AudioDecoder {
     /// Opens a local audio file on disk.
     pub fn open_path(path: &Path) -> Result<Self, DecoderError> {
@@ -115,6 +151,24 @@ impl AudioDecoder {
             hint.with_extension(ext);
         }
         Self::open_source(Box::new(file), hint)
+    }
+
+    /// Opens any seekable `Read + Seek + Send + Sync` reader (e.g. an SMB2/3 range stream).
+    pub fn open_seekable_reader<R>(
+        reader: R,
+        byte_len: Option<u64>,
+        extension: Option<&str>,
+    ) -> Result<Self, DecoderError>
+    where
+        R: Read + Seek + Send + Sync + 'static,
+    {
+        let mut hint = Hint::new();
+        if let Some(ext) = extension
+            && !ext.trim().is_empty()
+        {
+            hint.with_extension(ext.trim().trim_start_matches('.'));
+        }
+        Self::open_source(Box::new(SeekableReadSource::new(reader, byte_len)), hint)
     }
 
     /// Opens any `MediaSource` (file, memory cursor, or `ChunkedRangeSource`).

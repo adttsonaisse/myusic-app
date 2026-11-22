@@ -159,6 +159,28 @@ pub enum SongSort {
     DateAddedDesc,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebDavSettings {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub username: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmbSettings {
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub share: String,
+    #[serde(default)]
+    pub base_path: String,
+    #[serde(default)]
+    pub username: String,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -285,6 +307,12 @@ pub struct AppSettingsData {
     pub scrobble_delay_seconds: u32,
     #[serde(default = "default_scrobble_min_duration")]
     pub scrobble_min_song_duration_secs: u32,
+
+    // Network Storage (non-secret endpoints; passwords live in Linux Secret Service)
+    #[serde(default)]
+    pub webdav: WebDavSettings,
+    #[serde(default)]
+    pub smb: SmbSettings,
 }
 
 impl Default for AppSettingsData {
@@ -328,6 +356,8 @@ impl Default for AppSettingsData {
             scrobble_delay_percent: 0.5,
             scrobble_delay_seconds: 180,
             scrobble_min_song_duration_secs: 30,
+            webdav: WebDavSettings::default(),
+            smb: SmbSettings::default(),
         }
     }
 }

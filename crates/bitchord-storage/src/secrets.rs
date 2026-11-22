@@ -22,6 +22,8 @@ pub enum SecretKey {
     SpotifyBearerToken,
     SpotifyClientToken,
     ListenTogetherToken,
+    WebDavPassword,
+    SmbPassword,
 }
 
 impl SecretKey {
@@ -35,19 +37,23 @@ impl SecretKey {
             Self::SpotifyBearerToken => "spotify_bearer_token",
             Self::SpotifyClientToken => "spotify_client_token",
             Self::ListenTogetherToken => "listen_together_token",
+            Self::WebDavPassword => "webdav_password",
+            Self::SmbPassword => "smb_password",
         }
     }
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::YoutubeCookie => "BitChord YouTube Music Cookie",
-            Self::YoutubeDataSyncId => "BitChord YouTube Data Sync ID",
-            Self::PaxSenixKey => "BitChord PaxSenix API Key",
-            Self::LastFmSessionKey => "BitChord Last.fm Session Key",
-            Self::ListenBrainzToken => "BitChord ListenBrainz Token",
-            Self::SpotifyBearerToken => "BitChord Spotify Bearer Token",
-            Self::SpotifyClientToken => "BitChord Spotify Client Token",
-            Self::ListenTogetherToken => "BitChord Listen Together Token",
+            Self::YoutubeCookie => "Myusic YouTube Music Cookie",
+            Self::YoutubeDataSyncId => "Myusic YouTube Data Sync ID",
+            Self::PaxSenixKey => "Myusic PaxSenix API Key",
+            Self::LastFmSessionKey => "Myusic Last.fm Session Key",
+            Self::ListenBrainzToken => "Myusic ListenBrainz Token",
+            Self::SpotifyBearerToken => "Myusic Spotify Bearer Token",
+            Self::SpotifyClientToken => "Myusic Spotify Client Token",
+            Self::ListenTogetherToken => "Myusic Listen Together Token",
+            Self::WebDavPassword => "Myusic WebDAV Password",
+            Self::SmbPassword => "Myusic SMB Password",
         }
     }
 }

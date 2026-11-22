@@ -263,6 +263,66 @@ impl LibraryDb {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Atomically replaces all cached songs whose `video_id` starts with `prefix`
+    /// (e.g. `"webdav:"` or `"smb:"`), removing stale remote entries without touching
+    /// YouTube or local disk tracks.
+    pub fn replace_prefixed_songs(&self, prefix: &str, songs: &[Song]) -> Result<usize, DbError> {
+        let like_pattern = format!("{prefix}%");
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM songs WHERE video_id LIKE ?1",
+            params![like_pattern],
+        )?;
+        let now = unix_now_ms();
+        let mut count = 0usize;
+        for song in songs {
+            if !song.video_id.starts_with(prefix) {
+                continue;
+            }
+            let is_explicit: Option<i32> = song.is_explicit.map(i32::from);
+            tx.execute(
+                r#"
+                INSERT INTO songs (
+                    video_id, title, artist, thumbnail_url, duration_text,
+                    album_name, album_id, artist_id,
+                    is_explicit, is_video, local_uri, local_path, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                ON CONFLICT(video_id) DO UPDATE SET
+                    title = excluded.title,
+                    artist = excluded.artist,
+                    thumbnail_url = excluded.thumbnail_url,
+                    duration_text = COALESCE(excluded.duration_text, songs.duration_text),
+                    album_name = excluded.album_name,
+                    album_id = excluded.album_id,
+                    artist_id = excluded.artist_id,
+                    is_explicit = excluded.is_explicit,
+                    is_video = excluded.is_video,
+                    local_uri = excluded.local_uri,
+                    local_path = excluded.local_path,
+                    updated_at = excluded.updated_at
+                "#,
+                params![
+                    song.video_id,
+                    song.title,
+                    song.artist,
+                    song.thumbnail_url,
+                    song.duration_text,
+                    song.album_name,
+                    song.album_id,
+                    song.artist_id,
+                    is_explicit,
+                    i32::from(song.is_video),
+                    song.local_uri,
+                    song.local_path,
+                    now,
+                ],
+            )?;
+            count += 1;
+        }
+        tx.commit()?;
+        Ok(count)
+    }
+
     // ---- Search history (capped at 20, case-insensitive id dedup) -----------
 
     pub fn record_search_history(&self, entity: &SearchHistoryEntity) -> Result<(), DbError> {
@@ -640,6 +700,13 @@ fn row_to_song(row: &rusqlite::Row<'_>) -> rusqlite::Result<Song> {
     song.is_video = row.get::<_, i32>(9)? != 0;
     song.local_uri = row.get(10)?;
     song.local_path = row.get(11)?;
+    if song.video_id.starts_with("webdav:") {
+        song.playback_source = Some("WebDAV".to_owned());
+    } else if song.video_id.starts_with("smb:") {
+        song.playback_source = Some("SMB".to_owned());
+    } else if song.local_path.is_some() {
+        song.playback_source = Some("Local".to_owned());
+    }
     Ok(song)
 }
 

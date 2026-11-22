@@ -45,6 +45,51 @@ pub enum LoadState<T> {
     Error(String),
 }
 
+/// Source filter tabs for the unified Library screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LibrarySourceFilter {
+    #[default]
+    All,
+    Local,
+    WebDav,
+    Smb,
+    YouTube,
+}
+
+impl LibrarySourceFilter {
+    pub const ALL: [Self; 5] = [
+        Self::All,
+        Self::Local,
+        Self::WebDav,
+        Self::Smb,
+        Self::YouTube,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Local => "Local",
+            Self::WebDav => "WebDAV",
+            Self::Smb => "SMB",
+            Self::YouTube => "YouTube",
+        }
+    }
+
+    pub fn matches(self, song: &Song) -> bool {
+        match self {
+            Self::All => true,
+            Self::Local => song.local_path.is_some(),
+            Self::WebDav => song.video_id.starts_with("webdav:"),
+            Self::Smb => song.video_id.starts_with("smb:"),
+            Self::YouTube => {
+                song.local_path.is_none()
+                    && !song.video_id.starts_with("webdav:")
+                    && !song.video_id.starts_with("smb:")
+            }
+        }
+    }
+}
+
 /// Root window view entity mounted onto the running [`AppBackend`] global.
 pub struct BitChordApp {
     pub focus_handle: FocusHandle,
@@ -87,6 +132,7 @@ pub struct BitChordApp {
     pub lyrics_last_frame_at: Instant,
     pub lyrics_manual_scroll_until: Option<Instant>,
     pub library: LibrarySnapshot,
+    pub library_source_filter: LibrarySourceFilter,
     pub party: ListenTogetherState,
     pub party_probe_status: Option<String>,
 
@@ -114,6 +160,14 @@ pub struct BitChordApp {
     pub party_nick_input: Entity<TextInput>,
     pub cookie_input: Entity<TextInput>,
     pub spotify_input: Entity<TextInput>,
+    pub webdav_url_input: Entity<TextInput>,
+    pub webdav_user_input: Entity<TextInput>,
+    pub webdav_pass_input: Entity<TextInput>,
+    pub smb_host_input: Entity<TextInput>,
+    pub smb_share_input: Entity<TextInput>,
+    pub smb_path_input: Entity<TextInput>,
+    pub smb_user_input: Entity<TextInput>,
+    pub smb_pass_input: Entity<TextInput>,
 
     // Subscriptions & background tasks owned by the window
     _subscriptions: Vec<gpui::Subscription>,
@@ -169,6 +223,37 @@ impl BitChordApp {
         });
         let spotify_input =
             cx.new(|cx| TextInput::new("https://open.spotify.com/playlist/...", cx));
+        let webdav_url_input = cx.new(|cx| {
+            TextInput::new(
+                "https://cloud.example.com/remote.php/dav/files/user/Music",
+                cx,
+            )
+            .with_initial(backend.initial_settings.webdav.url.clone())
+        });
+        let webdav_user_input = cx.new(|cx| {
+            TextInput::new("Username (optional)", cx)
+                .with_initial(backend.initial_settings.webdav.username.clone())
+        });
+        let webdav_pass_input = cx
+            .new(|cx| TextInput::new("Password (stored in Secret Service)", cx).with_masked(true));
+        let smb_host_input = cx.new(|cx| {
+            TextInput::new("nas.local or 192.168.1.50:445", cx)
+                .with_initial(backend.initial_settings.smb.host.clone())
+        });
+        let smb_share_input = cx.new(|cx| {
+            TextInput::new("Share name (e.g. Music)", cx)
+                .with_initial(backend.initial_settings.smb.share.clone())
+        });
+        let smb_path_input = cx.new(|cx| {
+            TextInput::new("Subfolder path (optional)", cx)
+                .with_initial(backend.initial_settings.smb.base_path.clone())
+        });
+        let smb_user_input = cx.new(|cx| {
+            TextInput::new("Username (blank = guest)", cx)
+                .with_initial(backend.initial_settings.smb.username.clone())
+        });
+        let smb_pass_input = cx
+            .new(|cx| TextInput::new("Password (stored in Secret Service)", cx).with_masked(true));
 
         let mut subscriptions = Vec::new();
         subscriptions.push(
@@ -278,6 +363,7 @@ impl BitChordApp {
             lyrics_last_frame_at: now,
             lyrics_manual_scroll_until: None,
             library: LibrarySnapshot::default(),
+            library_source_filter: LibrarySourceFilter::All,
             party: ListenTogetherState::default(),
             party_probe_status: None,
             eq_enabled: false,
@@ -297,6 +383,14 @@ impl BitChordApp {
             party_nick_input,
             cookie_input,
             spotify_input,
+            webdav_url_input,
+            webdav_user_input,
+            webdav_pass_input,
+            smb_host_input,
+            smb_share_input,
+            smb_path_input,
+            smb_user_input,
+            smb_pass_input,
             _subscriptions: subscriptions,
             _event_task: event_task,
             art_tasks: HashMap::new(),
@@ -544,12 +638,14 @@ impl BitChordApp {
         let backend = cx.global::<AppBackend>().clone();
         let http = backend.http.clone();
         let cache_dir = backend.paths.cache_dir.clone();
+        let auth_snapshot = backend.remote_auth.read().ok().map(|g| g.clone());
         let key_for_task = normalized.clone();
 
         let task = cx.spawn(async move |this, cx| {
             let url_for_fetch = key_for_task.clone();
             let res = gpui_ce_tokio::Tokio::spawn(cx, async move {
-                fetch_and_decode_artwork(&http, &cache_dir, &url_for_fetch).await
+                fetch_and_decode_artwork(&http, &cache_dir, &url_for_fetch, auth_snapshot.as_ref())
+                    .await
             })
             .await;
 

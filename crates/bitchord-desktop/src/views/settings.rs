@@ -484,7 +484,201 @@ impl BitChordApp {
                             )),
                     ),
             )
-            // 6. XDG Linux Storage Paths
+            // 6. Network Storage (WebDAV & SMB2/3)
+            .child(
+                section_card("Network Storage (WebDAV & SMB2/3)", icons::FOLDER, theme)
+                    // WebDAV
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.text_secondary)
+                                    .child("WebDAV (Nextcloud, OwnCloud, Apache/Nginx DAV)"),
+                            )
+                            .child(div().w_full().child(self.webdav_url_input.clone()))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .child(div().flex_1().child(self.webdav_user_input.clone()))
+                                    .child(div().flex_1().child(self.webdav_pass_input.clone())),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap(px(8.0))
+                                    .child(toggle_chip(
+                                        "webdav-save-btn",
+                                        "Save WebDAV",
+                                        true,
+                                        theme,
+                                        cx.listener(|this, _, _, cx| {
+                                            let url =
+                                                this.webdav_url_input.read(cx).text().to_owned();
+                                            let username =
+                                                this.webdav_user_input.read(cx).text().to_owned();
+                                            let password =
+                                                this.webdav_pass_input.read(cx).text().to_owned();
+                                            this.send(
+                                                BackendCommand::SaveWebDav {
+                                                    url,
+                                                    username,
+                                                    password,
+                                                },
+                                                cx,
+                                            );
+                                            this.webdav_pass_input
+                                                .update(cx, |inp, cx| inp.set_text("", cx));
+                                        }),
+                                    ))
+                                    .child(toggle_chip(
+                                        "webdav-test-btn",
+                                        "Test WebDAV",
+                                        false,
+                                        theme,
+                                        cx.listener(|this, _, _, cx| {
+                                            let url =
+                                                this.webdav_url_input.read(cx).text().to_owned();
+                                            let username =
+                                                this.webdav_user_input.read(cx).text().to_owned();
+                                            let password =
+                                                this.webdav_pass_input.read(cx).text().to_owned();
+                                            this.send(
+                                                BackendCommand::TestWebDav {
+                                                    url,
+                                                    username,
+                                                    password,
+                                                },
+                                                cx,
+                                            );
+                                        }),
+                                    ))
+                                    .child(toggle_chip(
+                                        "webdav-sync-btn",
+                                        "Sync WebDAV Library",
+                                        false,
+                                        theme,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.send(BackendCommand::SyncWebDav, cx);
+                                        }),
+                                    )),
+                            ),
+                    )
+                    // Divider
+                    .child(div().h(px(1.0)).w_full().bg(theme.border))
+                    // SMB2/3
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.text_secondary)
+                                    .child("SMB2/3 Share (NAS, Samba, Windows Share)"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .child(div().flex_1().child(self.smb_host_input.clone()))
+                                    .child(div().flex_1().child(self.smb_share_input.clone())),
+                            )
+                            .child(div().w_full().child(self.smb_path_input.clone()))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .child(div().flex_1().child(self.smb_user_input.clone()))
+                                    .child(div().flex_1().child(self.smb_pass_input.clone())),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap(px(8.0))
+                                    .child(toggle_chip(
+                                        "smb-save-btn",
+                                        "Save SMB",
+                                        true,
+                                        theme,
+                                        cx.listener(|this, _, _, cx| {
+                                            let host =
+                                                this.smb_host_input.read(cx).text().to_owned();
+                                            let share =
+                                                this.smb_share_input.read(cx).text().to_owned();
+                                            let base_path =
+                                                this.smb_path_input.read(cx).text().to_owned();
+                                            let username =
+                                                this.smb_user_input.read(cx).text().to_owned();
+                                            let password =
+                                                this.smb_pass_input.read(cx).text().to_owned();
+                                            this.send(
+                                                BackendCommand::SaveSmb {
+                                                    host,
+                                                    share,
+                                                    base_path,
+                                                    username,
+                                                    password,
+                                                },
+                                                cx,
+                                            );
+                                            this.smb_pass_input
+                                                .update(cx, |inp, cx| inp.set_text("", cx));
+                                        }),
+                                    ))
+                                    .child(toggle_chip(
+                                        "smb-test-btn",
+                                        "Test SMB",
+                                        false,
+                                        theme,
+                                        cx.listener(|this, _, _, cx| {
+                                            let host =
+                                                this.smb_host_input.read(cx).text().to_owned();
+                                            let share =
+                                                this.smb_share_input.read(cx).text().to_owned();
+                                            let base_path =
+                                                this.smb_path_input.read(cx).text().to_owned();
+                                            let username =
+                                                this.smb_user_input.read(cx).text().to_owned();
+                                            let password =
+                                                this.smb_pass_input.read(cx).text().to_owned();
+                                            this.send(
+                                                BackendCommand::TestSmb {
+                                                    host,
+                                                    share,
+                                                    base_path,
+                                                    username,
+                                                    password,
+                                                },
+                                                cx,
+                                            );
+                                        }),
+                                    ))
+                                    .child(toggle_chip(
+                                        "smb-sync-btn",
+                                        "Sync SMB Library",
+                                        false,
+                                        theme,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.send(BackendCommand::SyncSmb, cx);
+                                        }),
+                                    )),
+                            ),
+                    ),
+            )
+            // 7. XDG Linux Storage Paths
             .child(
                 section_card("Linux XDG Directories", icons::FOLDER, theme).child(
                     div()

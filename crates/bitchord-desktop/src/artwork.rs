@@ -11,10 +11,18 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bitchord_model::Song;
+use bitchord_netstorage::{MAX_COVER_BYTES, SmbClient, SmbConfig, WebDavConfig};
 use gpui::RenderImage;
 use image::imageops::FilterType;
 use reqwest::Client;
 use tokio::sync::Semaphore;
+
+/// Shared live network storage credentials for authenticated WebDAV/SMB artwork fetches.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteArtworkAuth {
+    pub webdav: WebDavConfig,
+    pub smb: SmbConfig,
+}
 
 use crate::theme::{ArtworkPalette, rgba_image_to_render_image};
 
@@ -180,6 +188,7 @@ pub async fn fetch_and_decode_artwork(
     http: &Client,
     cache_dir: &Path,
     url: &str,
+    remote_auth: Option<&RemoteArtworkAuth>,
 ) -> Result<CachedArtwork, String> {
     let normalized = normalize_artwork_url(url);
     if normalized.is_empty() {
@@ -201,19 +210,39 @@ pub async fn fetch_and_decode_artwork(
         let _ = std::fs::remove_file(&disk_path);
     }
 
-    let raw_bytes = if normalized.starts_with("http://") || normalized.starts_with("https://") {
+    let raw_bytes = if SmbConfig::is_smb_url(&normalized) {
+        let Some(auth) = remote_auth.filter(|a| a.smb.is_configured()) else {
+            return Err("SMB artwork requires configured SMB share".to_owned());
+        };
         let _permit = fetch_semaphore()
             .acquire()
             .await
             .map_err(|_| "artwork fetch cancelled".to_owned())?;
-        let resp = http
+        let bytes = SmbClient::new()
+            .read_file_capped(&auth.smb, &normalized, MAX_COVER_BYTES)
+            .await
+            .map_err(|e| format!("SMB artwork read failed: {e}"))?;
+        let art = decode_artwork_bytes(&bytes)?;
+        let _ = std::fs::write(&disk_path, &bytes);
+        return Ok(art);
+    } else if normalized.starts_with("http://") || normalized.starts_with("https://") {
+        let _permit = fetch_semaphore()
+            .acquire()
+            .await
+            .map_err(|_| "artwork fetch cancelled".to_owned())?;
+        let mut req = http
             .get(&normalized)
             .timeout(Duration::from_secs(12))
             .header(reqwest::header::USER_AGENT, ARTWORK_USER_AGENT)
             .header(
                 reqwest::header::ACCEPT,
                 "image/webp,image/png,image/jpeg,image/*;q=0.8",
-            )
+            );
+        if let Some(auth_hdr) = remote_auth.and_then(|a| a.webdav.auth_header_for_url(&normalized))
+        {
+            req = req.header(reqwest::header::AUTHORIZATION, auth_hdr);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| format!("artwork request failed: {e}"))?;
