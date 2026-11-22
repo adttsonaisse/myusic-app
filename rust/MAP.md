@@ -45,12 +45,12 @@ Living index for multi-session continuity. Points to `DECISIONS.md`, `GLOSSARY.m
 | `W2-4` | Headless CLI & deterministic replay harness | `crates/bitchord-cli` | `done` | 3/3 CLI tests + binary smoke verified (`search`, `browse`, `artist`, `song-info`, `lyrics`, `resolve`, `jam`, `spotify`, `storage`, `queue-demo`, all with `--json` & `--data-dir` isolation). |
 
 ### Wave 3: Linux Native Audio Engine & Desktop OS Services
-*Depends on `rust/research/linux-audio-engine.md`.*
+*314/314 workspace tests passing across 11 crates, 0 clippy warnings (`-D warnings`), `cargo fmt --check` clean, `#![forbid(unsafe_code)]`, selective `opt-level = 2` for decoders/resampler/DSP.*
 
 | Unit ID | Upstream Kotlin Source | Target Crate | Status | Notes / Verification |
 | --- | --- | --- | --- | --- |
-| `W3-1` | Replaces `app/.../playback/` (Media3/ExoPlayer) | `crates/bitchord-audio` | `open` | `symphonia` (+ optional FFmpeg for ALAC/HLS/DASH) + `cpal`/`pipewire` output, gapless preload, true crossfade 0–12s, speed 0.5x–2.0x, skip silence, EQ + PeakLimiter integration, NerdStats telemetry. |
-| `W3-2` | Replaces Android `MediaSession` & notifications | `crates/bitchord-audio` / `mpris` | `open` | Linux MPRIS2 D-Bus server (`zbus`), media keys, track metadata + cover art exposure, sleep timer. |
+| `W3-1` | Replaces `app/.../playback/` (`AudioEngine`, `DspChain`, `LoudnessProcessor`, `SpatialAudioProcessor`, `CrossfadeController`, `SkipSilence`, `ChunkedDataSource`, `PartySync`) | `crates/bitchord-audio` + `crates/bitchord-cli` | `done` | 29/29 audio tests + 4/4 CLI tests passing (`LoudnessProcessorTest` 6/6, `FloatDspChainTest` 4/4, `CrossfadeState` equal-power `sin²+cos²=1` + `1/sqrt(out+in)` blend trim, `SkipSilenceProcessor` 1.0s threshold + skipped-frame tracking, pure-Rust WSOLA `SonicStretcher` 0.5x–2.0x pitch-preserving, `AudioResampler` on `rubato 5.1`, `AudioDecoder` on `symphonia 0.6.1` + `symphonia-adapter-libopus 0.3.0` linking host `libopus 1.6.1` with authoritative bit depth, 1 MiB `ChunkedRangeSource` with 206 verification/32 MiB cache/403 refusal callback, safe zero-alloc RT `PipeWireSink` on `pipewire 0.10.1` + deterministic `NullAudioSink` over `rtrb 0.4.1`, dual-deck gapless/crossfade `AudioEngine`, `PartySyncCoordinator`, and `bitchord-cli play` live PipeWire + `--no-output` headless smoke verified). |
+| `W3-2` | Replaces Android `MediaSession`, notifications, and `SleepTimer.kt` | `crates/bitchord-audio` (`mpris`, `sleep_timer`) | `done` | Linux MPRIS2 D-Bus server (`mpris-server 0.11.0` on `zbus 6.5.0`, `org.mpris.MediaPlayer2.bitchord` + `.instance<pid>` fallback, hex-encoded `ObjectPath` track IDs, local `file://` art URIs, silent `Position` + explicit `Seeked` signal, wired to `bitchord-cli play --mpris`) + monotonic `SleepTimer` (`Instant` deadline + `after_track`, all 3 `SleepTimerTest` assertions + lifecycle verified). |
 
 ### Wave 4: GPUI Linux Desktop Application
 *Depends on `rust/research/gpui-linux.md`. Isolated from workspace `default-members`.*

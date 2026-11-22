@@ -10,6 +10,7 @@ members = [
     "crates/bitchord-innertube",
     "crates/bitchord-integrations",
     "crates/bitchord-storage",
+    "crates/bitchord-audio",
     "crates/bitchord-cli",
 ]
 # Keep heavy GUI crates (added in Wave 4) out of default-members so core `cargo test`
@@ -24,6 +25,7 @@ default-members = [
     "crates/bitchord-innertube",
     "crates/bitchord-integrations",
     "crates/bitchord-storage",
+    "crates/bitchord-audio",
     "crates/bitchord-cli",
 ]
 
@@ -34,7 +36,10 @@ license = "GPL-3.0-only"
 rust-version = "1.95"
 
 [workspace.dependencies]
+audioadapter-buffers = "5.2"
 base64 = "0.23"
+bitchord-audio = { path = "crates/bitchord-audio" }
+bitchord-dsp-core = { path = "crates/bitchord-dsp-core" }
 bitchord-innertube = { path = "crates/bitchord-innertube" }
 bitchord-integrations = { path = "crates/bitchord-integrations" }
 bitchord-jam = { path = "crates/bitchord-jam" }
@@ -48,22 +53,32 @@ directories = "6"
 flate2 = "1"
 futures-util = "0.3"
 hmac = "0.12"
+libspa = { version = "0.10", features = ["v1_6_0"] }
 lofty = "0.25"
 md-5 = "0.10"
+mpris-server = { version = "0.11", features = ["tokio"] }
 oo7 = "0.7"
 percent-encoding = "2"
+pipewire = "0.10"
 quick-xml = "0.42"
 regex = "1"
 reqwest = { version = "0.13", features = ["json", "form", "query", "gzip"] }
 rquickjs = "0.14"
+rtrb = "0.4"
+rubato = "5.1"
 rusqlite = "0.43"
 scraper = { version = "0.29", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"
 sha2 = "0.10"
+symphonia = { version = "0.6", default-features = false, features = [
+    "opt-simd", "flac", "aac", "alac", "mp3", "vorbis", "pcm", "adpcm",
+    "isomp4", "mkv", "ogg", "wav", "aiff", "all-meta",
+] }
+symphonia-adapter-libopus = { version = "0.3", default-features = false }
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net", "io-util", "process"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net", "io-util", "process", "signal"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 unicode-normalization = "0.1"
 unicode-script = "0.5"
@@ -84,6 +99,23 @@ split-debuginfo = "unpacked"
 [profile.dev.package."*"]
 debug = 0
 opt-level = 0
+
+# Selective optimization for real-time audio decoders, resampler, and DSP so
+# debug playback never suffers xruns on modest laptops (ADR-007).
+[profile.dev.package.symphonia-codec-aac]
+opt-level = 2
+[profile.dev.package.symphonia-bundle-flac]
+opt-level = 2
+[profile.dev.package.symphonia-bundle-mp3]
+opt-level = 2
+[profile.dev.package.symphonia-codec-vorbis]
+opt-level = 2
+[profile.dev.package.symphonia-codec-alac]
+opt-level = 2
+[profile.dev.package.rubato]
+opt-level = 2
+[profile.dev.package.bitchord-dsp-core]
+opt-level = 2
 
 [profile.release]
 lto = "thin"

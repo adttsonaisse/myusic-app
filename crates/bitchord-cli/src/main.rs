@@ -7,11 +7,16 @@
 //! a GUI. Pass `--json` on any command for stable machine-readable output.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use bitchord_audio::{
+    AudioEngine, EqTuningSnapshot, MprisCommand, MprisService, MprisState, PlaybackState,
+    PlaybackStatus, build_mpris_metadata,
+};
+use bitchord_dsp_core::{EqualizerPreset, manual_curve};
 use bitchord_innertube::{
     ContainerPreference, InnertubeClient, InnertubeParser, NativeStreamBackend, ResolveRequest,
     SongInfoRepository, StreamBackend, StreamResolver, UploadedTracks, YtMusicRepository,
@@ -74,6 +79,8 @@ enum Command {
     Lyrics(LyricsArgs),
     /// Resolve a playable audio stream URL (native-first with optional yt-dlp bridge).
     Resolve(ResolveArgs),
+    /// Play a local audio file or YouTube videoId via PipeWire (or headless `--no-output`).
+    Play(PlayArgs),
     /// Listen Together party server utilities and invite parsing.
     Jam {
         #[command(subcommand)]
@@ -202,6 +209,81 @@ struct ResolveArgs {
     no_probe: bool,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliEqPreset {
+    Flat,
+    Acoustic,
+    BassBoost,
+    BassCut,
+    Vocal,
+    TrebleBoost,
+    TrebleCut,
+    Loudness,
+    SpokenWord,
+    Electronic,
+    Rock,
+    HipHop,
+    Jazz,
+    Classical,
+    SmallSpeakers,
+    LateNight,
+}
+
+impl From<CliEqPreset> for EqualizerPreset {
+    fn from(value: CliEqPreset) -> Self {
+        match value {
+            CliEqPreset::Flat => Self::Flat,
+            CliEqPreset::Acoustic => Self::Acoustic,
+            CliEqPreset::BassBoost => Self::BassBoost,
+            CliEqPreset::BassCut => Self::BassCut,
+            CliEqPreset::Vocal => Self::Vocal,
+            CliEqPreset::TrebleBoost => Self::TrebleBoost,
+            CliEqPreset::TrebleCut => Self::TrebleCut,
+            CliEqPreset::Loudness => Self::Loudness,
+            CliEqPreset::SpokenWord => Self::SpokenWord,
+            CliEqPreset::Electronic => Self::Electronic,
+            CliEqPreset::Rock => Self::Rock,
+            CliEqPreset::HipHop => Self::HipHop,
+            CliEqPreset::Jazz => Self::Jazz,
+            CliEqPreset::Classical => Self::Classical,
+            CliEqPreset::SmallSpeakers => Self::SmallSpeakers,
+            CliEqPreset::LateNight => Self::LateNight,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct PlayArgs {
+    /// Local audio file path (FLAC/WAV/Opus/M4A/MP3/OGG) or YouTube videoId.
+    target: String,
+    #[arg(long, value_enum, default_value_t = StreamBackendMode::Auto)]
+    backend: StreamBackendMode,
+    #[arg(long, default_value_t = u32::MAX)]
+    max_kbps: u32,
+    #[arg(long, default_value_t = 1.0)]
+    volume: f32,
+    #[arg(long, default_value_t = 1.0)]
+    speed: f32,
+    #[arg(long)]
+    skip_silence: bool,
+    #[arg(long)]
+    spatial: bool,
+    #[arg(long, value_enum)]
+    eq_preset: Option<CliEqPreset>,
+    /// Arm monotonic sleep timer (minutes).
+    #[arg(long)]
+    sleep_minutes: Option<u32>,
+    /// Stop playback automatically after N seconds.
+    #[arg(long)]
+    duration_secs: Option<f64>,
+    /// Run deterministic headless NullAudioSink (full decode + DSP pipeline without PipeWire).
+    #[arg(long)]
+    no_output: bool,
+    /// Expose org.mpris.MediaPlayer2.bitchord on session D-Bus during live playback.
+    #[arg(long)]
+    mpris: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum JamAction {
     /// Probe GET /healthz on a Listen Together server.
@@ -293,6 +375,7 @@ async fn run(cli: Cli) -> Result<String, String> {
         } => cmd_song_info(&video_id, &title, &artist, json_mode).await,
         Command::Lyrics(args) => cmd_lyrics(args, json_mode).await,
         Command::Resolve(args) => cmd_resolve(args, json_mode).await,
+        Command::Play(args) => cmd_play(args, json_mode).await,
         Command::Jam { action } => cmd_jam(action, json_mode).await,
         Command::Spotify { action } => cmd_spotify(action, json_mode).await,
         Command::Storage { action } => cmd_storage(action, &paths, json_mode),
@@ -504,6 +587,205 @@ async fn cmd_resolve(args: ResolveArgs, json_mode: bool) -> Result<String, Strin
         stream.mime_type,
         stream.kbps,
         stream.url
+    ))
+}
+
+async fn cmd_play(args: PlayArgs, json_mode: bool) -> Result<String, String> {
+    let mut engine = if args.no_output {
+        AudioEngine::with_null_sink()
+    } else {
+        AudioEngine::with_pipewire().map_err(|e| e.to_string())?
+    };
+
+    engine.set_volume(args.volume);
+    engine.set_speed(args.speed);
+    engine.set_skip_silence(args.skip_silence);
+    engine.set_spatial_audio(args.spatial);
+    if let Some(preset) = args.eq_preset {
+        let ep: EqualizerPreset = preset.into();
+        let curve = manual_curve(ep.bands_db());
+        engine.set_eq(EqTuningSnapshot::from_curve(true, &curve, 0.0));
+    }
+    if let Some(mins) = args.sleep_minutes {
+        engine.sleep_timer_mut().start(mins);
+    }
+
+    let target_path = Path::new(&args.target);
+    if target_path.exists() {
+        let tags = read_local_audio_tags(target_path);
+        let fallback_title = target_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Local Track")
+            .to_owned();
+        let title = tags
+            .as_ref()
+            .and_then(|t| t.title.clone())
+            .unwrap_or(fallback_title);
+        let artist = tags
+            .as_ref()
+            .and_then(|t| t.artist.clone())
+            .unwrap_or_else(|| "Local File".to_owned());
+        let mut song = Song::new(&args.target, title, artist, None);
+        song.album_name = tags.and_then(|t| t.album);
+        engine
+            .load_file(target_path, song, None)
+            .map_err(|e| e.to_string())?;
+    } else {
+        let http = Arc::new(build_shared_http_client());
+        let client = Arc::new(InnertubeClient::with_http_client(Arc::clone(&http)));
+        let uploads = Arc::new(UploadedTracks::default());
+        let backend: Arc<dyn StreamBackend> = match args.backend {
+            StreamBackendMode::Native => Arc::new(NativeStreamBackend::new(client)),
+            #[cfg(feature = "ytdlp-bridge")]
+            StreamBackendMode::Ytdlp => Arc::new(YtDlpStreamBackend::new()),
+            StreamBackendMode::Auto => {
+                #[cfg(feature = "ytdlp-bridge")]
+                {
+                    Arc::new(FallbackStreamBackend::new(
+                        NativeStreamBackend::new(client),
+                        YtDlpStreamBackend::new(),
+                    ))
+                }
+                #[cfg(not(feature = "ytdlp-bridge"))]
+                {
+                    Arc::new(NativeStreamBackend::new(client))
+                }
+            }
+        };
+        let resolver = StreamResolver::new(Arc::clone(&http), backend, uploads);
+        let req = ResolveRequest::for_playback(&args.target, args.max_kbps);
+        let stream = resolver.resolve(req).await.map_err(|e| e.to_string())?;
+        let song = Song::new(&args.target, &args.target, &stream.client_name, None);
+        let rt = tokio::runtime::Handle::current();
+        engine
+            .load_stream((*http).clone(), rt, stream, song, None)
+            .map_err(|e| e.to_string())?;
+    }
+
+    if args.no_output {
+        let report = engine
+            .drain_to_eof_null(args.duration_secs)
+            .map_err(|e| e.to_string())?;
+        if json_mode {
+            return to_json(&report);
+        }
+        let stats = report.nerd_stats.as_ref();
+        return Ok(format!(
+            "state={:?} outRate={}Hz frames={} duration={}ms peak={:.3} rms={:.3} underruns={}\nsource={:?} codec={:?} srcRate={:?}Hz bitDepth={:?}",
+            report.final_state,
+            report.output_sample_rate_hz,
+            report.rendered_frames,
+            report.rendered_duration_ms,
+            report.peak_level,
+            report.rms_level,
+            report.underruns,
+            stats.and_then(|s| s.source_name.as_deref()),
+            stats.and_then(|s| s.mime_type.as_deref()),
+            stats.and_then(|s| s.sample_rate_hz),
+            stats.and_then(|s| s.bit_depth),
+        ));
+    }
+
+    let mut mpris_pair = if args.mpris {
+        match MprisService::start().await {
+            Ok((svc, rx)) => Some((svc, rx)),
+            Err(err) => {
+                eprintln!("warning: MPRIS2 unavailable ({err})");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    engine.play();
+    let started = Instant::now();
+    let max_dur = args
+        .duration_secs
+        .map(|s| Duration::from_secs_f64(s.max(0.0)));
+    let mut ticker = tokio::time::interval(Duration::from_millis(50));
+
+    loop {
+        if let Some((ref svc, ref mut rx)) = mpris_pair {
+            while let Ok(cmd) = rx.try_recv() {
+                match cmd {
+                    MprisCommand::Play => engine.play(),
+                    MprisCommand::Pause => engine.pause(),
+                    MprisCommand::PlayPause => engine.toggle_play_pause(),
+                    MprisCommand::Stop | MprisCommand::Quit => engine.stop(),
+                    MprisCommand::SetVolume(v) => engine.set_volume(v as f32),
+                    MprisCommand::SetRate(r) => engine.set_speed(r as f32),
+                    MprisCommand::SeekRelativeUs(delta_us) => {
+                        let cur = engine.position_ms() as i64;
+                        let target = (cur + delta_us / 1_000).max(0) as u64;
+                        if let Ok(actual) = engine.seek_ms(target) {
+                            let _ = svc.notify_seeked(actual).await;
+                        }
+                    }
+                    MprisCommand::SetPositionUs { position_us, .. } => {
+                        let target = (position_us / 1_000).max(0) as u64;
+                        if let Ok(actual) = engine.seek_ms(target) {
+                            let _ = svc.notify_seeked(actual).await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let snap = engine.snapshot();
+            let mut mpris_state = MprisState {
+                playback_status: match snap.state {
+                    PlaybackState::Playing | PlaybackState::Buffering => PlaybackStatus::Playing,
+                    PlaybackState::Paused => PlaybackStatus::Paused,
+                    PlaybackState::Stopped | PlaybackState::Ended | PlaybackState::Error => {
+                        PlaybackStatus::Stopped
+                    }
+                },
+                rate: f64::from(snap.speed),
+                volume: f64::from(snap.volume),
+                position_us: (snap.position_ms as i64).saturating_mul(1_000),
+                can_seek: snap.duration_ms > 0,
+                ..MprisState::default()
+            };
+            if let Some(ref song) = snap.current_song {
+                mpris_state.metadata = build_mpris_metadata(song, snap.duration_ms, None);
+            }
+            let _ = svc.publish_state(mpris_state).await;
+            svc.set_position_ms(snap.position_ms);
+        }
+
+        let snap = engine.snapshot();
+        if matches!(
+            snap.state,
+            PlaybackState::Ended | PlaybackState::Stopped | PlaybackState::Error
+        ) {
+            break;
+        }
+        if let Some(limit) = max_dur
+            && started.elapsed() >= limit
+        {
+            engine.stop();
+            break;
+        }
+
+        tokio::select! {
+            _ = ticker.tick() => {
+                engine.tick(50);
+            }
+            _ = tokio::signal::ctrl_c() => {
+                engine.stop();
+                break;
+            }
+        }
+    }
+
+    let snap = engine.snapshot();
+    if json_mode {
+        return to_json(&snap);
+    }
+    Ok(format!(
+        "state={:?} position={}ms/{}ms underruns={}",
+        snap.state, snap.position_ms, snap.duration_ms, snap.underruns
     ))
 }
 
@@ -838,5 +1120,36 @@ mod tests {
         let val: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert_eq!(val["currentIndex"], 0);
         assert_eq!(val["order"], serde_json::json!(["a", "u1", "b", "c"]));
+    }
+
+    #[tokio::test]
+    async fn offline_play_no_output_decodes_wav_runs_eq_spatial_and_reports_nerd_stats() {
+        let wav_path =
+            std::env::temp_dir().join(format!("bitchord-cli-play-{}.wav", std::process::id()));
+        let wav = bitchord_audio::build_test_wav_pcm16(44_100, 440.0, 300);
+        std::fs::write(&wav_path, &wav).expect("write temp wav");
+        let path_str = wav_path.to_string_lossy().into_owned();
+
+        let cli = Cli::try_parse_from([
+            "bitchord-cli",
+            "--json",
+            "play",
+            &path_str,
+            "--no-output",
+            "--eq-preset",
+            "bass-boost",
+            "--spatial",
+        ])
+        .expect("parse play");
+        let out = run(cli).await.expect("run play --no-output");
+        let _ = std::fs::remove_file(&wav_path);
+
+        let val: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        assert_eq!(val["outputSampleRateHz"], 48_000);
+        assert_eq!(val["finalState"], "ended");
+        assert_eq!(val["underruns"], 0);
+        assert_eq!(val["nerdStats"]["sampleRateHz"], 44_100);
+        assert_eq!(val["nerdStats"]["bitDepth"], 16);
+        assert!(val["renderedFrames"].as_u64().unwrap_or(0) > 10_000);
     }
 }

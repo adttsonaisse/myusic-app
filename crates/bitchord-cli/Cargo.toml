@@ -14,6 +14,8 @@ default = ["ytdlp-bridge"]
 ytdlp-bridge = ["bitchord-innertube/ytdlp-bridge"]
 
 [dependencies]
+bitchord-audio.workspace = true
+bitchord-dsp-core.workspace = true
 bitchord-innertube.workspace = true
 bitchord-integrations.workspace = true
 bitchord-jam.workspace = true
