@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use bitchord_automix::TransitionPlan;
 use bitchord_innertube::{PlayerClient, ResolvedStream};
 use bitchord_integrations::NerdStatsSnapshot;
 use bitchord_model::{Song, duration_millis};
@@ -99,6 +100,8 @@ pub struct PlaybackSnapshot {
     pub output_sample_rate_hz: u32,
     /// `true` only when hardware clock matches source rate with zero resampling or DSP alteration.
     pub bit_perfect_active: bool,
+    /// Active or armed Smart Automix / LoopMix transition summary (if planned).
+    pub automix_plan_summary: Option<String>,
 }
 
 /// Summary produced by headless [`AudioEngine::drain_to_eof_null`] runs (`--no-output`).
@@ -249,6 +252,8 @@ pub struct AudioEngine {
     deck_b: DeckSlot,
     crossfade: CrossfadeState,
     crossfade_outgoing: DeckId,
+    planned_transition: Option<TransitionPlan>,
+    active_transition: Option<TransitionPlan>,
     sleep_timer: SleepTimer,
 
     state: PlaybackState,
@@ -309,6 +314,8 @@ impl AudioEngine {
             deck_b: DeckSlot::new(producers.deck_b),
             crossfade: CrossfadeState::new(0),
             crossfade_outgoing: DeckId::A,
+            planned_transition: None,
+            active_transition: None,
             sleep_timer: SleepTimer::new(),
             state: PlaybackState::Stopped,
             volume: 1.0,
@@ -842,25 +849,46 @@ impl AudioEngine {
         self.deck_b.stop_worker();
         self.send_flush_async(DeckId::A);
         self.send_flush_async(DeckId::B);
+        self.send_rt(RtCommand::OpenTransition(DeckId::A));
+        self.send_rt(RtCommand::OpenTransition(DeckId::B));
         self.crossfade.phase = CrossfadePhase::Idle;
         self.crossfade.handed_off = false;
+        self.planned_transition = None;
+        self.active_transition = None;
         self.send_active_solo_gains();
         self.sync_null_commands();
         self.state = PlaybackState::Stopped;
     }
 
-    /// Seeks the active deck cleanly to `target_ms`, flushing stale ring buffer frames.
-    pub fn seek_ms(&mut self, target_ms: u64) -> Result<u64, EngineError> {
-        let active = self.crossfade.active_deck;
-        if self.crossfade.is_transitioning() {
-            self.crossfade.phase = CrossfadePhase::Idle;
-            self.deck_mut(active.other()).stop_worker();
-            self.send_flush_async(active.other());
-            self.send_active_solo_gains();
+    /// Arms or clears an Automix / LoopMix [`TransitionPlan`] for the preloaded standby deck.
+    /// When the standby deck is already loaded and the plan specifies a non-zero `incoming_cue_sec`,
+    /// seeks the standby deck cleanly to that cue point before the blend triggers.
+    pub fn set_transition_plan(&mut self, plan: Option<TransitionPlan>) {
+        let valid = plan.filter(TransitionPlan::is_active);
+        if let Some(ref p) = valid {
+            let standby = self.crossfade.active_deck.other();
+            if self.deck(standby).is_loaded() {
+                if p.incoming_cue_sec > 0.25 {
+                    let cue_ms = (p.incoming_cue_sec * 1_000.0).round() as u64;
+                    let _ = self.seek_deck_ms(standby, cue_ms);
+                }
+                let rate = (self.speed * p.incoming_playback_rate).clamp(MIN_SPEED, MAX_SPEED);
+                self.deck(standby)
+                    .apply_dynamic_params(rate, self.skip_silence);
+            }
         }
+        self.planned_transition = valid;
+    }
 
+    pub fn transition_plan(&self) -> Option<&TransitionPlan> {
+        self.active_transition
+            .as_ref()
+            .or(self.planned_transition.as_ref())
+    }
+
+    fn seek_deck_ms(&mut self, deck: DeckId, target_ms: u64) -> Result<u64, EngineError> {
         let Some(shared) = self
-            .deck(active)
+            .deck(deck)
             .worker
             .as_ref()
             .map(|w| Arc::clone(&w.shared))
@@ -882,13 +910,29 @@ impl AudioEngine {
             thread::sleep(Duration::from_millis(1));
         }
 
-        self.flush_deck_sync(active);
+        self.flush_deck_sync(deck);
         shared.seek_gate.store(false, Ordering::Release);
+        Ok(shared.base_position_ms.load(Ordering::Acquire))
+    }
 
+    /// Seeks the active deck cleanly to `target_ms`, flushing stale ring buffer frames.
+    pub fn seek_ms(&mut self, target_ms: u64) -> Result<u64, EngineError> {
+        let active = self.crossfade.active_deck;
+        if self.crossfade.is_transitioning() {
+            self.crossfade.phase = CrossfadePhase::Idle;
+            self.active_transition = None;
+            self.send_rt(RtCommand::OpenTransition(DeckId::A));
+            self.send_rt(RtCommand::OpenTransition(DeckId::B));
+            self.deck_mut(active.other()).stop_worker();
+            self.send_flush_async(active.other());
+            self.send_active_solo_gains();
+        }
+
+        let landed = self.seek_deck_ms(active, target_ms)?;
         if self.state == PlaybackState::Ended {
             self.state = PlaybackState::Paused;
         }
-        Ok(shared.base_position_ms.load(Ordering::Acquire))
+        Ok(landed)
     }
 
     pub fn set_volume(&mut self, volume: f32) {
@@ -996,29 +1040,79 @@ impl AudioEngine {
         let active = self.crossfade.active_deck;
         let standby = active.other();
 
-        // 2. Arm equal-power crossfade when approaching EOF with a preloaded standby deck.
+        // 2. Arm Automix TransitionPlan (if armed) or standard equal-power crossfade.
         if self.crossfade.phase == CrossfadePhase::Idle && self.deck(standby).is_loaded() {
             let pos = self.position_ms();
             let dur = self.duration_ms();
-            if self.crossfade.should_start_crossfade(pos, dur) {
+            if let Some(plan) = self.planned_transition.as_ref()
+                && plan.is_active()
+                && pos >= (plan.transition_start_sec * 1_000.0).round() as u64
+            {
+                let plan = self.planned_transition.take().expect("checked above");
+                let rate = (self.speed * plan.incoming_playback_rate).clamp(MIN_SPEED, MAX_SPEED);
+                self.deck(standby)
+                    .apply_dynamic_params(rate, self.skip_silence);
+                self.crossfade_outgoing = active;
+                let fade_ms = ((plan.duration_sec * 1_000.0).round() as u64).max(500);
+                self.crossfade.begin_fade(fade_ms);
+                self.active_transition = Some(plan);
+            } else if self.planned_transition.is_none()
+                && self.crossfade.should_start_crossfade(pos, dur)
+            {
                 self.crossfade_outgoing = active;
                 let fade_ms = u64::from(self.crossfade.crossfade_seconds) * 1_000;
                 self.crossfade.begin_fade(fade_ms);
             }
         }
 
-        // 3. Advance active transition (Crossfade / SleepFade / Bailing).
+        // 3. Advance active transition (Automix / Crossfade / SleepFade / Bailing).
         if self.crossfade.is_transitioning() {
             let prev_phase = self.crossfade.phase;
             let (gains, _handed_off, finished) = self.crossfade.advance(delta_ms);
-            let (gain_a, gain_b) = match self.crossfade_outgoing {
+            let progress = self.crossfade.progress();
+            let out_deck = self.crossfade_outgoing;
+            let in_deck = out_deck.other();
+            let (gain_a, gain_b) = match out_deck {
                 DeckId::A => (gains.outgoing, gains.incoming),
                 DeckId::B => (gains.incoming, gains.outgoing),
             };
             self.send_rt(RtCommand::SetMixGains { gain_a, gain_b });
             self.send_rt(RtCommand::SetBlendTrim(gains.blend_trim));
 
+            let plan_step = self.active_transition.as_ref().map(|plan| {
+                (
+                    plan.filter_cutoffs_at(progress),
+                    plan.incoming_playback_rate,
+                )
+            });
+            if let Some(((out_lp, out_hp, in_lp, in_hp), incoming_rate)) = plan_step {
+                self.send_rt(RtCommand::SetTransitionCutoffs {
+                    deck: out_deck,
+                    lowpass_hz: out_lp,
+                    highpass_hz: out_hp,
+                });
+                self.send_rt(RtCommand::SetTransitionCutoffs {
+                    deck: in_deck,
+                    lowpass_hz: in_lp,
+                    highpass_hz: in_hp,
+                });
+                // Smoothly relax incoming beatmatch stretch back to native speed over final 25%.
+                if progress > 0.75 && (incoming_rate - 1.0).abs() > 0.002 {
+                    let relax = ((progress - 0.75) / 0.25).clamp(0.0, 1.0);
+                    let cur_mult = incoming_rate + (1.0 - incoming_rate) * relax;
+                    let rate = (self.speed * cur_mult).clamp(MIN_SPEED, MAX_SPEED);
+                    self.deck(in_deck)
+                        .apply_dynamic_params(rate, self.skip_silence);
+                }
+            }
+
             if finished {
+                self.active_transition = None;
+                self.send_rt(RtCommand::OpenTransition(DeckId::A));
+                self.send_rt(RtCommand::OpenTransition(DeckId::B));
+                let cur_active = self.crossfade.active_deck;
+                self.deck(cur_active)
+                    .apply_dynamic_params(self.speed, self.skip_silence);
                 match prev_phase {
                     CrossfadePhase::SleepFade => {
                         self.pause();
@@ -1100,6 +1194,7 @@ impl AudioEngine {
             output_format_label: self.backend.format_label().to_owned(),
             output_sample_rate_hz: self.backend.sample_rate(),
             bit_perfect_active: self.is_bit_perfect_active(slot),
+            automix_plan_summary: self.transition_plan().map(|p| p.summary.clone()),
         }
     }
 
@@ -1643,5 +1738,57 @@ mod tests {
             "opening frames must not be clipped: got {}ms",
             report.rendered_duration_ms
         );
+    }
+
+    #[test]
+    fn headless_engine_executes_automix_dj_bass_swap_transition_plan() {
+        let wav_a = build_test_wav_pcm16(48_000, 220.0, 2_400);
+        let wav_b = build_test_wav_pcm16(48_000, 440.0, 2_400);
+
+        let mut engine = AudioEngine::with_null_sink();
+        engine
+            .load_bytes(
+                wav_a,
+                Some("wav".to_owned()),
+                Song::new("a", "Track A", "DJ A", None),
+                None,
+            )
+            .expect("load A");
+        engine
+            .preload_next_bytes(
+                wav_b,
+                Some("wav".to_owned()),
+                Song::new("b", "Track B", "DJ B", None),
+                None,
+            )
+            .expect("preload B");
+
+        let plan = TransitionPlan {
+            style: bitchord_automix::TransitionStyle::DjBassSwap,
+            filter_variant: bitchord_automix::FilterTransitionVariant::None,
+            transition_start_sec: 0.4,
+            duration_sec: 1.6,
+            incoming_cue_sec: 0.0,
+            incoming_playback_rate: 1.03,
+            bass_swap_fraction: Some(0.50),
+            vocal_clash_avoided: false,
+            harmonic_match: true,
+            beats_matched: true,
+            phrase_bars: 8,
+            outgoing_bpm: 124.0,
+            incoming_bpm: 120.4,
+            summary: "DJ Bass Swap · 124->120 BPM (1.03x) · 8 bars · Harmonic".to_owned(),
+        };
+        engine.set_transition_plan(Some(plan));
+        assert!(engine.snapshot().automix_plan_summary.is_some());
+
+        engine.wait_prebuffer(200, Duration::from_millis(500));
+        let report = engine
+            .drain_to_eof_null(None)
+            .expect("drain automix bass swap");
+        assert_eq!(engine.active_deck(), DeckId::B);
+        assert_eq!(report.song.as_ref().map(|s| s.video_id.as_str()), Some("b"));
+        assert!(engine.snapshot().automix_plan_summary.is_none());
+        assert!(report.rendered_duration_ms >= 2_500 && report.rendered_duration_ms <= 4_200);
     }
 }

@@ -107,6 +107,14 @@ impl CrossfadeState {
         !matches!(self.phase, CrossfadePhase::Idle)
     }
 
+    /// Normalized progress `0.0..=1.0` of the currently running transition.
+    pub fn progress(&self) -> f32 {
+        if self.duration_ms == 0 {
+            return 0.0;
+        }
+        (self.elapsed_ms as f32 / self.duration_ms as f32).clamp(0.0, 1.0)
+    }
+
     pub fn set_crossfade_seconds(&mut self, secs: u32) {
         self.crossfade_seconds = secs.min(MAX_CROSSFADE_SECONDS);
     }

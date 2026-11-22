@@ -14,10 +14,12 @@ default = ["wayland", "x11", "ytdlp-bridge"]
 wayland = ["gpui-ce/wayland", "gpui_ce_platform/wayland"]
 x11 = ["gpui-ce/x11", "gpui_ce_platform/x11"]
 ytdlp-bridge = ["bitchord-innertube/ytdlp-bridge"]
+automix-onnx = ["bitchord-automix/automix-onnx", "bitchord-audio/automix-onnx"]
 
 [dependencies]
 async-channel.workspace = true
 bitchord-audio.workspace = true
+bitchord-automix.workspace = true
 bitchord-dsp-core.workspace = true
 bitchord-innertube.workspace = true
 bitchord-integrations.workspace = true

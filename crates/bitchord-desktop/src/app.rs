@@ -145,6 +145,9 @@ pub struct BitChordApp {
     pub audio_output_pref: AudioOutputPreference,
     pub selected_alsa_device: String,
     pub audio_devices: Vec<AlsaDeviceInfo>,
+    pub automix_mode: bitchord_automix::AutomixMode,
+    pub automix_phrase_bars: u32,
+    pub onnx_automix_status: bitchord_automix::OnnxAutomixStatus,
     pub discord_rpc_enabled: bool,
 
     // Artwork LRU cache + active Now Playing mesh backdrop
@@ -330,6 +333,7 @@ impl BitChordApp {
             output_format_label: "F32LE".to_owned(),
             output_sample_rate_hz: bitchord_audio::OUTPUT_SAMPLE_RATE,
             bit_perfect_active: false,
+            automix_plan_summary: None,
         };
 
         // Trigger initial Home feed + Library load immediately.
@@ -386,6 +390,9 @@ impl BitChordApp {
                 backend.initial_settings.alsa_exclusive_device.clone()
             },
             audio_devices: Vec::new(),
+            automix_mode: backend.initial_settings.automix_mode,
+            automix_phrase_bars: backend.initial_settings.automix_phrase_bars,
+            onnx_automix_status: backend.onnx_automix_status.clone(),
             discord_rpc_enabled: backend.initial_settings.discord_rpc_enabled,
             artwork_cache: ArtworkCache::default(),
             default_mesh: ArtworkPalette::default().build_mesh_render_image(),

@@ -471,6 +471,73 @@ fn codec_id_to_mime(codec: AudioCodecId) -> &'static str {
     }
 }
 
+/// Decodes any supported local audio file (FLAC, MP3, OGG, Opus, AAC/M4A, WAV, AIFF,
+/// DSF/DFF/DST) into a [`bitchord_automix::TrackAnalysis`], streaming straight into
+/// 11,025 Hz mono DSP analysis to keep memory overhead minimal on laptops, and
+/// optionally refining with ONNX (`beat_this_final0_q8.onnx` / `vocals_umxhq_int8.onnx`)
+/// when `automix-onnx` and model assets are present.
+pub fn analyze_audio_file(
+    path: &Path,
+    onnx: Option<&bitchord_automix::OnnxModelPaths>,
+) -> Result<bitchord_automix::TrackAnalysis, DecoderError> {
+    let mut decoder = AudioDecoder::open_path(path)?;
+    let rate = decoder.info().sample_rate_hz.max(8_000);
+    let use_onnx_buf = cfg!(feature = "automix-onnx")
+        && onnx.is_some_and(|p| {
+            p.runtime_dylib.is_some() && (p.beat_model.is_some() || p.vocal_model.is_some())
+        });
+
+    if use_onnx_buf {
+        // Cap full-rate stereo ONNX buffer at 8 minutes to protect 7.5 GiB laptop RAM.
+        let cap_samples = (rate as usize).saturating_mul(2).saturating_mul(480);
+        let mut stereo = Vec::new();
+        while let Some(pkt) = decoder.next_packet()? {
+            if stereo.len() < cap_samples {
+                let rem = cap_samples - stereo.len();
+                let take = pkt.samples.len().min(rem);
+                stereo.extend_from_slice(&pkt.samples[..take]);
+            } else {
+                break;
+            }
+        }
+        Ok(bitchord_automix::analyze_stereo_with_optional_onnx(
+            &stereo, rate, onnx,
+        ))
+    } else {
+        let mut analyzer = bitchord_automix::StreamingAnalyzer::new(rate);
+        while let Some(pkt) = decoder.next_packet()? {
+            analyzer.push_stereo(&pkt.samples);
+        }
+        Ok(analyzer.finish())
+    }
+}
+
+/// Encodes interleaved stereo `f32` PCM (`-1.0..=1.0`) as a 16-bit WAV byte buffer.
+pub fn build_test_wav_from_stereo_f32(sample_rate: u32, stereo: &[f32]) -> Vec<u8> {
+    let frames = stereo.len() / 2;
+    let data_bytes = (frames * 4) as u32;
+    let riff_size = 36 + data_bytes;
+    let mut wav = Vec::with_capacity((44 + data_bytes) as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&riff_size.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&(sample_rate * 4).to_le_bytes());
+    wav.extend_from_slice(&4u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_bytes.to_le_bytes());
+    for &s in &stereo[..frames * 2] {
+        let q = (s.clamp(-1.0, 1.0) * 32_767.0).round() as i16;
+        wav.extend_from_slice(&q.to_le_bytes());
+    }
+    wav
+}
+
 /// Builds a valid minimal 16-bit stereo PCM WAV byte buffer for tests and CLI smoke checks.
 pub fn build_test_wav_pcm16(sample_rate: u32, freq_hz: f64, duration_ms: u64) -> Vec<u8> {
     use std::f64::consts::PI;

@@ -7,6 +7,7 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bitchord_automix::TrackAnalysis;
 use bitchord_model::{EntityType, SearchHistoryEntity, Song};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -14,7 +15,7 @@ use thiserror::Error;
 
 use crate::downloads::{SavedCollection, SavedSongMetadata};
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 const MAX_SEARCH_HISTORY: usize = 20;
 
 #[derive(Debug, Error)]
@@ -176,10 +177,58 @@ impl LibraryDb {
                 );
                 "#,
             )?;
+        }
+        if version < 2 {
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS track_analysis (
+                    video_id TEXT PRIMARY KEY,
+                    analysis_json TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                "#,
+            )?;
             self.conn
                 .pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         Ok(())
+    }
+
+    // ---- Track Automix analysis cache --------------------------------------
+
+    pub fn upsert_track_analysis(
+        &self,
+        video_id: &str,
+        analysis: &TrackAnalysis,
+    ) -> Result<(), DbError> {
+        let now = unix_now_ms();
+        let json = serde_json::to_string(analysis)?;
+        self.conn.execute(
+            r#"
+            INSERT INTO track_analysis (video_id, analysis_json, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(video_id) DO UPDATE SET
+                analysis_json = excluded.analysis_json,
+                updated_at = excluded.updated_at
+            "#,
+            params![video_id, json, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_track_analysis(&self, video_id: &str) -> Result<Option<TrackAnalysis>, DbError> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT analysis_json FROM track_analysis WHERE video_id = ?1",
+                params![video_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match raw {
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
+        }
     }
 
     // ---- Songs cache --------------------------------------------------------
@@ -842,5 +891,26 @@ mod tests {
 
         db.delete_playlist("pl-1").expect("delete playlist");
         assert!(db.playlist_tracks("pl-1").unwrap().is_empty());
+
+        // Automix track_analysis JSON cache round-trip (schema v2).
+        let analysis = TrackAnalysis {
+            bpm: 124.5,
+            beat_interval: 60.0 / 124.5,
+            beat_confidence: 0.88,
+            key: 21,
+            key_confidence: 0.72,
+            duration: 210.0,
+            audible_start_time: 0.5,
+            content_end_time: 206.0,
+            ..TrackAnalysis::default()
+        };
+        db.upsert_track_analysis("vid1", &analysis)
+            .expect("upsert analysis");
+        let loaded_analysis = db
+            .get_track_analysis("vid1")
+            .expect("get analysis")
+            .expect("cached analysis present");
+        assert!((loaded_analysis.bpm - 124.5).abs() < 1e-4);
+        assert_eq!(loaded_analysis.key, 21);
     }
 }

@@ -9,9 +9,14 @@ description = "Linux native dual-deck audio engine (Symphonia + libopus + PipeWi
 [lints]
 workspace = true
 
+[features]
+default = []
+automix-onnx = ["bitchord-automix/automix-onnx"]
+
 [dependencies]
 alsa.workspace = true
 audioadapter-buffers.workspace = true
+bitchord-automix.workspace = true
 bitchord-dsp-core.workspace = true
 bitchord-innertube.workspace = true
 bitchord-integrations.workspace = true

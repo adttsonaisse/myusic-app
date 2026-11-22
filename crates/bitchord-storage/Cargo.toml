@@ -10,6 +10,7 @@ description = "XDG settings, Linux Secret Service keyring, SQLite library/histor
 workspace = true
 
 [dependencies]
+bitchord-automix.workspace = true
 bitchord-lyrics.workspace = true
 bitchord-model.workspace = true
 directories.workspace = true

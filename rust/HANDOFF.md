@@ -1,43 +1,35 @@
-# BitChord Rust Port — Session Handoff
+# BitChord / Myusic Rust Port — Session Handoff
 
-## Current Status — v1 Core Music Player COMPLETE!
-- **Completed**: Foundation setup + all 3 primary-source research reports + **Wave 0** (`W0-1`..`W0-4`) + **Wave 1** (`W1-1`..`W1-3`) + **Wave 2** (`W2-1`..`W2-4`) + **Wave 3** (`W3-1`..`W3-2`) + **Wave 4** (`W4-1`..`W4-3`).
-- **Locked Decisions**: `ADR-001`..`ADR-009` in `rust/DECISIONS.md` (`gpui-ce 0.3.x`, PipeWire native audio, Go backend protocol parity, laptop compilation caps, per-wave checkpoints).
-- **Final v1 Gate** (`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo clippy -j 2 -p bitchord-desktop --all-targets -- -D warnings`, `cargo test`, `cargo test -j 2 -p bitchord-desktop`, `cargo build -j 2 -p bitchord-desktop`, and 4s live Wayland/Vulkan/PipeWire/MPRIS2/Tray startup smoke test): **ALL PASS**:
-  - `bitchord-model`: 24 passed
-  - `bitchord-jam`: 15 passed
-  - `bitchord-dsp-core`: 5 passed
-  - `bitchord-matcher`: 7 passed
-  - `bitchord-queue`: 13 passed
-  - `bitchord-lyrics`: 133 passed
-  - `bitchord-innertube`: 30 passed
-  - `bitchord-integrations`: 30 passed
-  - `bitchord-storage`: 24 passed
-  - `bitchord-audio`: 29 passed
-  - `bitchord-cli`: 4 passed
-  - `bitchord-desktop`: 4 passed (+ live Wayland/Vulkan/PipeWire/Tray startup smoke PASS)
-  - **Total**: **318/318 tests passing across 12 crates**, 0 clippy warnings, `#![forbid(unsafe_code)]`, Rust MSRV 1.95.
+## Current Status — v1 Core Music Player + v2 Audio Advanced & Network Storage COMPLETE!
+- **Completed**: Foundation setup + all 3 primary-source research reports + **v1 Waves 0–4** + **QA Rounds 1–2** + **v2 Waves 5A–5D**:
+  - **Wave 5A (`55d5139`) — Network Storage**: Pure-Rust `bitchord-netstorage` crate with WebDAV (`PROPFIND` BFS, `MKCOL`, `HEAD`, `PUT`, Basic Auth, folder cover-art pairing) & SMB2/3 (`smb 0.12`, `SmbRangeReader` 128 KiB LRU seekable streaming), Secret Service credential storage, CLI `netstorage` + remote `play`, and Desktop Settings/Library integration.
+  - **Wave 5B (`1f834c4`) — Bit-Perfect Exclusive Audio**: Safe `alsa 0.12` hardware output (`AlsaExclusiveSink` on `hw:X,Y`, `enumerate_alsa_devices`, USB DAC detection, `S32_LE`/`S24_3LE`/`FLOAT_LE`/`S16_LE` bit-exact converters), PipeWire dynamic `node.force-rate` native clock switching, honest `bit_perfect_active` audit, CLI `devices` + `play --output-mode`, and Desktop Settings/Now Playing pipeline telemetry.
+  - **Wave 5C (`dbdab4e`) — DSD / DST Playback**: Pure-Rust `#![forbid(unsafe_code)]` DSF & DSDIFF/DFF parser (`DSD64`..`DSD1024`), nibble-LUT Blackman-windowed sinc `DsdBlockDecimator` (`DSD -> 176.4 kHz f32`), pure-Rust ISO/IEC 14496-3 Subpart 10 `DstDecoder` + CRC-32 (`0x8000_0011`), `DopPacker` (DoP v1.1 `0x05`/`0xFA` framing), transparent sniffing in `AudioDecoder`, local/WebDAV/SMB scanning, and `MHz · 1-bit` Hi-Res telemetry.
+  - **Wave 5D — Automix ONNX + LoopMix**: Pure-Rust `bitchord-automix` crate (`StreamingAnalyzer` + DSP tempo/PLL beat/downbeat/phrase/Krumhansl-Schmuckler key/vocal analyzer, `TransitionPolicy`, `TransitionPlanner` with 8/16-bar phrases, Camelot harmonic scoring, vocal-clash avoidance, DJ Bass Swap & Filter Sweep, `LoopMix` analytical tempo-ramp clock & pure-Rust biquad bridge renderer, exact Beat-This Mel & UMX-HQ STFT spectrograms, plus optional CPU-throttled `--features automix-onnx` dynamic `ort` backend <=2 threads with arena disabled), SQLite schema v2 `track_analysis` cache, live `AudioEngine` RT filter & beatmatched speed execution, CLI `automix {status, analyze, plan}`, and Desktop Settings/Now Playing controls.
+- **Locked Decisions**: `ADR-001`..`ADR-009` in `rust/DECISIONS.md` (`gpui-ce 0.3.x`, PipeWire + ALSA Exclusive audio, Go backend protocol parity, laptop compilation caps, per-wave checkpoints).
+- **Zero `unsafe` across all 14 workspace crates** (`#![forbid(unsafe_code)]`, Rust MSRV 1.95).
 
 ## How to Run Locally
-- Launch Desktop App (Wayland/X11 + PipeWire + MPRIS2 + Tray):
+- Launch Desktop App (`Myusic`, Wayland/X11 + PipeWire/ALSA + MPRIS2 + Tray):
   ```bash
   cd /home/adttsonaisse/Documents/Coding/bitchord-rs
   ./target/debug/bitchord-desktop
   # or rebuild incrementally: cargo run -j 2 -p bitchord-desktop
+  # optional ONNX Runtime feature: cargo build -j 2 -p bitchord-desktop --features automix-onnx
   ```
 - Launch Headless CLI:
   ```bash
-  cargo run -p bitchord-cli -- search "Kavinsky Nightcall"
-  cargo run -p bitchord-cli -- play /path/to/track.flac --mpris --eq-preset bass-boost
+  cargo run -p bitchord-cli -- devices
+  cargo run -p bitchord-cli -- automix status
+  cargo run -p bitchord-cli -- automix analyze /path/to/track.flac
+  cargo run -p bitchord-cli -- automix plan /path/to/a.flac /path/to/b.flac --mode advanced
+  cargo run -p bitchord-cli -- play /path/to/track.dsf --output-mode pipewire-force-rate
+  cargo run -p bitchord-cli -- netstorage webdav-list --url https://nas.local/dav/music --user me --pass secret
   ```
 
-## Next Roadmap (v2 — Deferred per `ADR-003`)
-1. **Automix ONNX & LoopMix**: Wrap `native/analyzer` + `native/loopmix` via `cc`/`cxx` + `ort` (`beat_this_final0_q8.onnx`, `vocals_umxhq_int8.onnx`), then lift to pure Rust (`1e-6` tolerance) + port `shared/.../playback/smart/`.
-2. **DSD / DST Playback**: Wrap `app/src/main/cpp/dsd/` via FFI then lift to pure Rust.
-3. **Bit-Perfect Exclusive Audio**: ALSA `hw:card,dev` exclusive output + PipeWire Pro Audio force-rate + optional `nusb` direct USB DAC.
-4. **Network Storage**: SMB2/3 (`pavao`/`smb`) and WebDAV (`reqwest-dav`).
-5. **Pluggable JS Modules**: Pooled `rquickjs` sandbox (12 modules × 3 VMs).
-6. **Linux Packaging**: Arch Linux `PKGBUILD`, `.desktop` entry, SVG/PNG icons, `bitchord://` URI handler, Flatpak/AppImage.
+## Remaining Optional Roadmap
+1. **Pluggable JS Modules**: Pooled `rquickjs` sandbox (12 modules x 3 VMs).
+2. **Linux Packaging**: Arch Linux `PKGBUILD`, `.desktop` entry, SVG/PNG icons, `bitchord://` URI handler, Flatpak/AppImage.
 
 ## Key Files
 - Plan & unit states: `rust/MAP.md`

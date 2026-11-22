@@ -1,0 +1,20 @@
+[package]
+name = "bitchord-automix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Optional CPU-throttled ONNX Runtime backend (<=2 threads, arena disabled) loaded dynamically
+# from `ORT_DYLIB_PATH` or system `libonnxruntime.so`.
+automix-onnx = ["dep:ort"]
+
+[dependencies]
+ort = { version = "2.0.0-rc.15", optional = true, default-features = false, features = ["std", "load-dynamic", "api-20"] }
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

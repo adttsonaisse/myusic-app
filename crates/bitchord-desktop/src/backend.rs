@@ -16,8 +16,11 @@ use async_channel::{Receiver, Sender};
 use bitchord_audio::{
     AlsaDeviceInfo, AudioDecoder, AudioEngine, AudioOutputMode, DecodedPacket, EqTuningSnapshot,
     MprisCommand, MprisService, MprisState, OUTPUT_SAMPLE_RATE, PlaybackSnapshot, PlaybackState,
-    PlaybackStatus, RefusalCallback, build_mpris_metadata, enumerate_alsa_devices,
-    open_http_decoder,
+    PlaybackStatus, RefusalCallback, analyze_audio_file, build_mpris_metadata,
+    enumerate_alsa_devices, open_http_decoder,
+};
+use bitchord_automix::{
+    AutomixMode, OnnxAutomixStatus, OnnxModelPaths, TrackAnalysis, TransitionPlan, plan_transition,
 };
 use bitchord_dsp_core::{EqCurve, EqLayout, EqualizerPreset, manual_curve};
 use bitchord_innertube::{
@@ -164,6 +167,10 @@ pub enum BackendCommand {
     SetSkipSilence(bool),
     SetSpatial(bool),
     SetCrossfadeSeconds(u32),
+    SetAutomix {
+        mode: AutomixMode,
+        phrase_bars: u32,
+    },
     SetEq {
         enabled: bool,
         preset: EqualizerPreset,
@@ -273,6 +280,7 @@ pub struct AppBackend {
     pub http: Client,
     pub paths: AppPaths,
     pub initial_settings: AppSettingsData,
+    pub onnx_automix_status: OnnxAutomixStatus,
     pub remote_auth: Arc<RwLock<RemoteArtworkAuth>>,
 }
 
@@ -284,6 +292,7 @@ impl AppBackend {
         let paths = AppPaths::resolve();
         let settings_store = SettingsStore::new(paths.settings_file());
         let initial_settings = settings_store.load().unwrap_or_default();
+        let onnx_automix_status = OnnxModelPaths::discover(&paths.models_dir()).status();
         let http = build_shared_http_client();
         let remote_auth = Arc::new(RwLock::new(RemoteArtworkAuth {
             webdav: WebDavConfig::new(
@@ -330,6 +339,7 @@ impl AppBackend {
             http,
             paths,
             initial_settings,
+            onnx_automix_status,
             remote_auth,
         }
     }
@@ -371,6 +381,10 @@ enum InternalTrackMsg {
         prebuffered: Vec<DecodedPacket>,
         loudness_db: Option<f64>,
         source_label: String,
+    },
+    AutomixPlanned {
+        generation: u64,
+        plan: TransitionPlan,
     },
 }
 
@@ -514,9 +528,13 @@ fn run_backend_thread(
 
     let (track_tx, track_rx) = async_channel::bounded::<InternalTrackMsg>(16);
     let load_gen = Arc::new(AtomicU64::new(0));
+    let analysis_sem = Arc::new(tokio::sync::Semaphore::new(1));
+    let onnx_paths = Arc::new(OnnxModelPaths::discover(&paths.models_dir()));
 
     let mut queue_items: Vec<Song> = Vec::new();
     let mut current_index: Option<usize> = None;
+    let mut current_playing_song: Option<Song> = None;
+    let mut preloaded_next_song: Option<Song> = None;
     let mut shuffle = false;
     let mut repeat_all = false;
     let mut repeat_one = false;
@@ -626,6 +644,8 @@ fn run_backend_thread(
                             let snap = engine.snapshot();
                             last_state = snap.state;
                             last_song_vid = Some(song.video_id.clone());
+                            current_playing_song = Some(song.clone());
+                            preloaded_next_song = None;
                             last_published_pos_ms = snap.position_ms;
                             let _ = evt_tx
                                 .try_send(BackendEvent::PlaybackUpdated(Box::new(snap.clone())));
@@ -699,13 +719,47 @@ fn run_backend_thread(
                     if load_gen.load(Ordering::Acquire) != generation {
                         continue;
                     }
-                    let _ = engine.preload_prepared_decoder(
-                        *decoder,
-                        prebuffered,
-                        song,
-                        loudness_db,
-                        Some(&source_label),
-                    );
+                    let next_for_plan = song.clone();
+                    if engine
+                        .preload_prepared_decoder(
+                            *decoder,
+                            prebuffered,
+                            song,
+                            loudness_db,
+                            Some(&source_label),
+                        )
+                        .is_ok()
+                    {
+                        preloaded_next_song = Some(next_for_plan.clone());
+                        if settings.automix_mode != AutomixMode::Off
+                            && let Some(ref cur_song) = current_playing_song
+                        {
+                            spawn_automix_planning(
+                                generation,
+                                Arc::clone(&load_gen),
+                                &rt,
+                                Arc::clone(&analysis_sem),
+                                paths.clone(),
+                                Arc::clone(&onnx_paths),
+                                settings.automix_mode,
+                                settings.automix_phrase_bars,
+                                settings.crossfade_seconds,
+                                cur_song.clone(),
+                                next_for_plan,
+                                track_tx.clone(),
+                            );
+                        }
+                    }
+                }
+                InternalTrackMsg::AutomixPlanned { generation, plan } => {
+                    if load_gen.load(Ordering::Acquire) != generation {
+                        continue;
+                    }
+                    if plan.is_active() {
+                        engine.set_transition_plan(Some(plan));
+                        let _ = evt_tx
+                            .try_send(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                    }
                 }
             }
         }
@@ -1231,6 +1285,42 @@ fn run_backend_thread(
                     engine.set_crossfade_seconds(secs);
                     settings.crossfade_seconds = secs;
                     let _ = settings_store.save(&settings);
+                    let _ =
+                        evt_tx.try_send(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                }
+                BackendCommand::SetAutomix { mode, phrase_bars } => {
+                    let bars = match phrase_bars {
+                        8 | 16 => phrase_bars,
+                        _ => 0,
+                    };
+                    settings.automix_mode = mode;
+                    settings.automix_phrase_bars = bars;
+                    let _ = settings_store.save(&settings);
+                    if mode == AutomixMode::Off {
+                        engine.set_transition_plan(None);
+                    } else if let (Some(cur_song), Some(next_song)) =
+                        (current_playing_song.clone(), preloaded_next_song.clone())
+                    {
+                        let generation = load_gen.load(Ordering::Acquire);
+                        spawn_automix_planning(
+                            generation,
+                            Arc::clone(&load_gen),
+                            &rt,
+                            Arc::clone(&analysis_sem),
+                            paths.clone(),
+                            Arc::clone(&onnx_paths),
+                            mode,
+                            bars,
+                            settings.crossfade_seconds,
+                            cur_song,
+                            next_song,
+                            track_tx.clone(),
+                        );
+                    }
+                    let _ = evt_tx.try_send(BackendEvent::StatusNotice(format!(
+                        "Automix mode: {}",
+                        mode.label()
+                    )));
                     let _ =
                         evt_tx.try_send(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                 }
@@ -2124,6 +2214,96 @@ fn spawn_preload_next(
                 .await;
         }
     });
+}
+
+/// Runs throttled (max 1 concurrent job) Automix musical analysis for the outgoing and
+/// preloaded incoming tracks, consulting and populating SQLite's `track_analysis` cache,
+/// then plans a transition and sends it back to the dual-deck engine.
+#[allow(clippy::too_many_arguments)]
+fn spawn_automix_planning(
+    generation: u64,
+    load_gen: Arc<AtomicU64>,
+    rt: &Handle,
+    sem: Arc<tokio::sync::Semaphore>,
+    paths: AppPaths,
+    onnx_paths: Arc<OnnxModelPaths>,
+    mode: AutomixMode,
+    phrase_bars: u32,
+    crossfade_seconds: u32,
+    outgoing: Song,
+    incoming: Song,
+    track_tx: Sender<InternalTrackMsg>,
+) {
+    rt.spawn(async move {
+        let Ok(_permit) = sem.acquire().await else {
+            return;
+        };
+        if load_gen.load(Ordering::Acquire) != generation {
+            return;
+        }
+        let res = tokio::task::spawn_blocking(move || {
+            let out_a = load_or_analyze_song(&paths, &onnx_paths, &outgoing);
+            let in_a = load_or_analyze_song(&paths, &onnx_paths, &incoming);
+            plan_transition(mode, phrase_bars, crossfade_seconds, &out_a, &in_a)
+        })
+        .await;
+        if load_gen.load(Ordering::Acquire) != generation {
+            return;
+        }
+        if let Ok(plan) = res
+            && plan.is_active()
+        {
+            let _ = track_tx
+                .send(InternalTrackMsg::AutomixPlanned { generation, plan })
+                .await;
+        }
+    });
+}
+
+fn load_or_analyze_song(
+    paths: &AppPaths,
+    onnx_paths: &OnnxModelPaths,
+    song: &Song,
+) -> TrackAnalysis {
+    let db = LibraryDb::open(&paths.db_file()).ok();
+    if let Some(ref db) = db
+        && let Ok(Some(cached)) = db.get_track_analysis(&song.video_id)
+        && cached.duration > 1.0
+    {
+        return cached;
+    }
+
+    // Resolve local file path from `song.local_path` or downloaded file URI in SQLite.
+    let local_file: Option<PathBuf> = song
+        .local_path
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+        .or_else(|| {
+            db.as_ref()
+                .and_then(|d| d.get_download(&song.video_id).ok().flatten())
+                .and_then(|meta| meta.uri.strip_prefix("file://").map(PathBuf::from))
+                .filter(|p| p.is_file())
+        });
+
+    if let Some(path) = local_file
+        && let Ok(analysis) = analyze_audio_file(&path, Some(onnx_paths))
+    {
+        if let Some(ref db) = db {
+            let _ = db.upsert_track_analysis(&song.video_id, &analysis);
+        }
+        return analysis;
+    }
+
+    // Graceful duration-only fallback for uncached remote streams so smooth transitions remain safe.
+    let dur_sec = (duration_millis(song.duration_text.as_deref()) as f64 / 1_000.0).max(0.0);
+    TrackAnalysis {
+        key: -1,
+        duration: dur_sec,
+        audible_start_time: 0.0,
+        content_end_time: dur_sec,
+        ..TrackAnalysis::default()
+    }
 }
 
 type PreparedDecoderResult = (AudioDecoder, Vec<DecodedPacket>, Option<f64>, String);

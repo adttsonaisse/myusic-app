@@ -63,12 +63,18 @@ Living index for multi-session continuity. Points to `DECISIONS.md`, `GLOSSARY.m
 
 ---
 
-## v2 Roadmap (Deferred After v1 Core Player Is Stable)
-- **Automix ONNX & LoopMix**: Wrap `native/analyzer` + `native/loopmix` (Signalsmith Stretch) via `cc`/`cxx` + `ort` (`beat_this_final0_q8.onnx`, `vocals_umxhq_int8.onnx`), then lift to pure Rust (`1e-6` tolerance) + port `shared/.../playback/smart/`.
-- **DSD / DST Playback**: Wrap `app/src/main/cpp/dsd/` via FFI then lift to pure Rust.
-- **Bit-Perfect Exclusive Audio**: ALSA `hw:card,dev` exclusive output + PipeWire Pro Audio force-rate + optional `nusb` direct USB DAC.
-- **Network Storage**: SMB2/3 (`smb`/`pavao`) and WebDAV (`reqwest-dav`).
-- **Pluggable JS Modules**: `rquickjs` pooled sandbox replacing `QuickJsExecutor` (LRU 12 modules × 3 VMs).
+## v2 Audio Advanced & Network Storage — Wave Plan (`COMPLETE`)
+*14 workspace crates (`342` core tests + `7` desktop tests = `349/349` passing), 0 clippy warnings (`-D warnings`, both default and `--features automix-onnx`), `cargo fmt --check` clean, `#![forbid(unsafe_code)]`.*
+
+| Unit ID | Upstream Reference | Target Crate(s) | Status | Notes / Verification |
+| --- | --- | --- | --- | --- |
+| `W5A` | `shared/.../data/remote/{WebDav,Smb,RemoteSong}*` | `crates/bitchord-netstorage` + `storage` + `audio` + `cli` + `desktop` | `done` | Pure-Rust WebDAV (`PROPFIND` BFS, `MKCOL`, `HEAD`, `PUT`, Basic Auth, folder artwork) & SMB2/3 (`smb 0.12`, 128 KiB LRU `SmbRangeReader`), Secret Service credentials, CLI `netstorage` + remote `play`, Desktop Settings/Library filter chips & artwork loading (`55d5139`). |
+| `W5B` | Bit-perfect hardware audio & USB DACs | `crates/bitchord-audio` (`alsa_output`, `output`, `engine`) + `storage` + `cli` + `desktop` | `done` | Safe `alsa 0.12` direct `hw:X,Y` `AlsaExclusiveSink` (`S32_LE`/`S24_3LE`/`FLOAT_LE`/`S16_LE`), `/proc/asound` + `/sys/class/sound` USB DAC probing, PipeWire `node.force-rate` native clock switching, honest `bit_perfect_active` audit, CLI `devices` & Desktop Settings/Stats UI (`1f834c4`). |
+| `W5C` | `app/src/main/cpp/dsd/` + `native/dsd/` (`Dsf`, `Dsdiff`, `Dst`, `DoP`) | `crates/bitchord-audio` (`dsd`, `decoder`) + `cli` + `desktop` | `done` | 100% safe pure-Rust DSF & DSDIFF/DFF parser (`DSD64`..`DSD1024`), nibble-LUT Blackman-windowed sinc `DsdBlockDecimator` (`176.4 kHz f32`), ISO/IEC 14496-3 Subpart 10 `DstDecoder` + CRC-32 (`0x8000_0011`), DoP v1.1 (`0x05`/`0xFA`) packer, transparent `AudioDecoder` sniffing, `MHz · 1-bit` telemetry (`dbdab4e`). |
+| `W5D` | `shared/.../playback/smart/*` + `native/{analyzer,loopmix}/*` + ONNX Beat-This / UMX-HQ | `crates/bitchord-automix` + `storage` + `audio` + `cli` + `desktop` | `done` | Pure-Rust DSP analyzer (11,025 Hz streaming, spectral flux, autocorrelation BPM + PLL beats + 4/4 downbeats + 8-bar phrases + Krumhansl-Schmuckler 24-key + bass/vocal curves), `TransitionPolicy`, `TransitionPlanner` (DJ Bass Swap, Filter Sweep, 8/16-bar Phrase Mix, vocal clash avoidance), `LoopMix` analytical clock + biquad renderer, Beat-This Mel & UMX-HQ STFT spectrograms, optional CPU-throttled `--features automix-onnx` dynamic `ort` backend (<=2 threads, arena disabled), SQLite schema v2 `track_analysis` cache, live `AudioEngine` RT execution, CLI `automix`, and Desktop Settings/Now Playing UI. |
+
+### Remaining Optional Post-v2 Items
+- **Pluggable JS Modules**: `rquickjs` pooled sandbox replacing `QuickJsExecutor` (LRU 12 modules x 3 VMs).
 - **Linux Packaging**: Arch Linux `PKGBUILD`, `.desktop`, icons, `bitchord://` URI handler, Flatpak/AppImage.
 
 ---

@@ -7,6 +7,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use bitchord_automix::AutomixMode;
 use bitchord_lyrics::LyricsSource;
 use bitchord_model::{AudioQuality, LastPlayerScreen, LibrarySort, LibraryViewType, PlayerTheme};
 use serde::{Deserialize, Serialize};
@@ -272,6 +273,11 @@ pub struct AppSettingsData {
     pub gapless_playback: bool,
     #[serde(default)]
     pub crossfade_seconds: u32,
+    #[serde(default)]
+    pub automix_mode: AutomixMode,
+    /// Preferred Automix phrase length in bars (`0` = auto, `8` = 8-bar, `16` = 16-bar).
+    #[serde(default)]
+    pub automix_phrase_bars: u32,
     #[serde(default = "default_volume")]
     pub volume: f32,
     #[serde(default)]
@@ -359,6 +365,8 @@ impl Default for AppSettingsData {
             alsa_exclusive_device: String::new(),
             gapless_playback: true,
             crossfade_seconds: 0,
+            automix_mode: AutomixMode::Off,
+            automix_phrase_bars: 0,
             volume: 1.0,
             muted: false,
             replay_gain_enabled: false,

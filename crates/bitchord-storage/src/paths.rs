@@ -86,6 +86,12 @@ impl AppPaths {
         self.cache_dir.join("artwork")
     }
 
+    /// Directory where optional Automix ONNX models (`beat_this_final0_q8.onnx`,
+    /// `vocals_umxhq_int8.onnx`) and `libonnxruntime.so` may be placed.
+    pub fn models_dir(&self) -> PathBuf {
+        self.data_dir.join("models")
+    }
+
     /// Active download target directory given whether `export_downloads` is enabled.
     pub fn active_downloads_dir(&self, export_downloads: bool) -> &Path {
         if export_downloads {

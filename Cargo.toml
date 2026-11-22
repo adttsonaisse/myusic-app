@@ -11,6 +11,7 @@ members = [
     "crates/bitchord-integrations",
     "crates/bitchord-storage",
     "crates/bitchord-netstorage",
+    "crates/bitchord-automix",
     "crates/bitchord-audio",
     "crates/bitchord-cli",
     "crates/bitchord-desktop",
@@ -28,6 +29,7 @@ default-members = [
     "crates/bitchord-integrations",
     "crates/bitchord-storage",
     "crates/bitchord-netstorage",
+    "crates/bitchord-automix",
     "crates/bitchord-audio",
     "crates/bitchord-cli",
 ]
@@ -44,6 +46,7 @@ async-channel = "2"
 audioadapter-buffers = "5.2"
 base64 = "0.23"
 bitchord-audio = { path = "crates/bitchord-audio" }
+bitchord-automix = { path = "crates/bitchord-automix" }
 bitchord-dsp-core = { path = "crates/bitchord-dsp-core" }
 bitchord-innertube = { path = "crates/bitchord-innertube" }
 bitchord-integrations = { path = "crates/bitchord-integrations" }

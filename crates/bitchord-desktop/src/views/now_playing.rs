@@ -521,7 +521,13 @@ impl BitChordApp {
                                             },
                                             self.playback.underruns,
                                             self.playback.skipped_silence_ms,
-                                        )),
+                                        ))
+                                        .when_some(
+                                            self.playback.automix_plan_summary.clone(),
+                                            |el, plan_line| {
+                                                el.child(format!("Automix: {plan_line}"))
+                                            },
+                                        ),
                                 )
                             }),
                     )

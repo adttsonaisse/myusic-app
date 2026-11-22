@@ -35,7 +35,7 @@ pub use crossfade::{
 };
 pub use decoder::{
     AudioDecoder, DecodedPacket, DecodedStreamInfo, DecoderError, SeekableReadSource,
-    build_test_wav_pcm16,
+    analyze_audio_file, build_test_wav_from_stereo_f32, build_test_wav_pcm16,
 };
 pub use dsd::{
     DSD_FILTER_CUTOFF_HZ, DSD_PCM_RATE_HZ, DSF_BLOCK_BYTES, DST_FRAME_BYTES_PER_CH,

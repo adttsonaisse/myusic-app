@@ -3,6 +3,7 @@
 //! with crisp vector SVG section headers and clean interactive controls.
 
 use bitchord_audio::PRESETS as SLEEP_PRESETS;
+use bitchord_automix::AutomixMode;
 use bitchord_dsp_core::{EqLayout, EqualizerPreset};
 use bitchord_storage::AudioOutputPreference;
 use gpui::prelude::*;
@@ -327,7 +328,90 @@ impl BitChordApp {
                             }),
                     ),
             )
-            // 3. 7-Band SVF Equalizer
+            // 3b. Smart Automix & LoopMix
+            .child(
+                section_card("Smart Automix & LoopMix", icons::SHUFFLE, theme)
+                    .child(div().flex().flex_wrap().gap(px(8.0)).children(
+                        AutomixMode::ALL.into_iter().enumerate().map(|(i, mode)| {
+                            toggle_chip(
+                                ("automix-mode", i),
+                                mode.label(),
+                                self.automix_mode == mode,
+                                theme,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.automix_mode = mode;
+                                    this.send(
+                                        BackendCommand::SetAutomix {
+                                            mode,
+                                            phrase_bars: this.automix_phrase_bars,
+                                        },
+                                        cx,
+                                    );
+                                    cx.notify();
+                                }),
+                            )
+                        }),
+                    ))
+                    .when(self.automix_mode.is_smart(), |el| {
+                        el.child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(theme.text_secondary)
+                                        .child("Phrase Length:"),
+                                )
+                                .children(
+                                    [(0u32, "Auto"), (8u32, "8 Bars"), (16u32, "16 Bars")]
+                                        .into_iter()
+                                        .map(|(bars, label)| {
+                                            toggle_chip(
+                                                ("automix-bars", bars as usize),
+                                                label,
+                                                self.automix_phrase_bars == bars,
+                                                theme,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.automix_phrase_bars = bars;
+                                                    this.send(
+                                                        BackendCommand::SetAutomix {
+                                                            mode: this.automix_mode,
+                                                            phrase_bars: bars,
+                                                        },
+                                                        cx,
+                                                    );
+                                                    cx.notify();
+                                                }),
+                                            )
+                                        }),
+                                ),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .child(format!(
+                                "Analyzer: {} · Models dir: {} (beat_this: {}, vocals_umxhq: {})",
+                                self.onnx_automix_status.active_backend_label,
+                                self.onnx_automix_status.models_dir,
+                                if self.onnx_automix_status.beat_model_present {
+                                    "present"
+                                } else {
+                                    "optional"
+                                },
+                                if self.onnx_automix_status.vocal_model_present {
+                                    "present"
+                                } else {
+                                    "optional"
+                                },
+                            )),
+                    ),
+            )
+            // 4. 7-Band SVF Equalizer
             .child(
                 section_card("Equalizer (10-Slot Float32 SVF)", icons::SLIDERS, theme)
                     .child(

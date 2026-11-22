@@ -105,6 +105,11 @@ enum Command {
     },
     /// Enumerate Linux ALSA hardware playback endpoints and USB DACs for bit-perfect output.
     Devices,
+    /// Smart Automix / LoopMix musical analyzer and transition planner (pure-Rust DSP + optional ONNX).
+    Automix {
+        #[command(subcommand)]
+        action: AutomixAction,
+    },
     /// Deterministic queue state machine smoke command for replay verification.
     QueueDemo {
         /// Comma-separated video IDs.
@@ -413,6 +418,45 @@ enum NetStorageAction {
     },
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliAutomixMode {
+    Standard,
+    Smart,
+    Advanced,
+    LoopMix,
+}
+
+impl From<CliAutomixMode> for bitchord_automix::AutomixMode {
+    fn from(value: CliAutomixMode) -> Self {
+        match value {
+            CliAutomixMode::Standard => Self::Standard,
+            CliAutomixMode::Smart => Self::Smart,
+            CliAutomixMode::Advanced => Self::SmartAdvanced,
+            CliAutomixMode::LoopMix => Self::LoopMix,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum AutomixAction {
+    /// Inspect optional ONNX Runtime and model weights status (`beat_this_final0_q8.onnx` / `vocals_umxhq_int8.onnx`).
+    Status,
+    /// Analyze a local audio file (FLAC, MP3, WAV, OGG, M4A, DSF, DFF) for BPM, key, downbeats, and mix cues.
+    Analyze { path: PathBuf },
+    /// Analyze two local audio files and plan a Smart Automix / DJ / LoopMix transition between them.
+    Plan {
+        outgoing: PathBuf,
+        incoming: PathBuf,
+        #[arg(long, value_enum, default_value_t = CliAutomixMode::Advanced)]
+        mode: CliAutomixMode,
+        /// Preferred phrase length in bars (`0` = auto, `8` = 8-bar, `16` = 16-bar).
+        #[arg(long, default_value_t = 0)]
+        phrase_bars: u32,
+        #[arg(long, default_value_t = 8)]
+        crossfade_seconds: u32,
+    },
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OutputMessage<T: Serialize> {
@@ -461,6 +505,7 @@ async fn run(cli: Cli) -> Result<String, String> {
         Command::Storage { action } => cmd_storage(action, &paths, json_mode),
         Command::Netstorage { action } => cmd_netstorage(action, json_mode).await,
         Command::Devices => cmd_devices(json_mode),
+        Command::Automix { action } => cmd_automix(action, &paths, json_mode),
         Command::QueueDemo { tracks, play_next } => cmd_queue_demo(tracks, play_next, json_mode),
     }
 }
@@ -1341,6 +1386,97 @@ fn cmd_queue_demo(
     ))
 }
 
+fn cmd_automix(action: AutomixAction, paths: &AppPaths, json_mode: bool) -> Result<String, String> {
+    let onnx_paths = bitchord_automix::OnnxModelPaths::discover(&paths.models_dir());
+    match action {
+        AutomixAction::Status => {
+            let status = onnx_paths.status();
+            if json_mode {
+                return to_json(&status);
+            }
+            Ok(format!(
+                "backend={}\nmodels_dir={}\nfeature_compiled={} runtime_available={} beat_model={} vocal_model={}",
+                status.active_backend_label,
+                status.models_dir,
+                status.feature_compiled,
+                status.runtime_available,
+                status.beat_model_present,
+                status.vocal_model_present
+            ))
+        }
+        AutomixAction::Analyze { path } => {
+            let analysis = bitchord_audio::analyze_audio_file(&path, Some(&onnx_paths))
+                .map_err(|e| format!("failed to analyze {}: {e}", path.display()))?;
+            if json_mode {
+                return to_json(&analysis);
+            }
+            Ok(format!(
+                "file={} bpm={:.1} (conf={:.2}) key={} ({}) beats={} downbeats={} phrases={} duration={:.1}s audible={:.1}..{:.1}s",
+                path.display(),
+                analysis.bpm,
+                analysis.beat_confidence,
+                analysis.key_label(),
+                analysis.camelot_code().unwrap_or("-"),
+                analysis.beats.len(),
+                analysis.downbeats.len(),
+                analysis.phrase_boundaries.len(),
+                analysis.duration,
+                analysis.audible_start_time,
+                analysis.content_end_time
+            ))
+        }
+        AutomixAction::Plan {
+            outgoing,
+            incoming,
+            mode,
+            phrase_bars,
+            crossfade_seconds,
+        } => {
+            let out_a = bitchord_audio::analyze_audio_file(&outgoing, Some(&onnx_paths))
+                .map_err(|e| format!("failed to analyze outgoing {}: {e}", outgoing.display()))?;
+            let in_a = bitchord_audio::analyze_audio_file(&incoming, Some(&onnx_paths))
+                .map_err(|e| format!("failed to analyze incoming {}: {e}", incoming.display()))?;
+            let automix_mode: bitchord_automix::AutomixMode = mode.into();
+            let plan = bitchord_automix::plan_transition(
+                automix_mode,
+                phrase_bars,
+                crossfade_seconds,
+                &out_a,
+                &in_a,
+            );
+            let loop_mix = bitchord_automix::plan_loop_mix(&out_a, &in_a);
+            if json_mode {
+                return to_json(&serde_json::json!({
+                    "plan": plan,
+                    "loopMix": loop_mix,
+                    "outgoing": {
+                        "bpm": out_a.bpm,
+                        "key": out_a.key_label(),
+                        "camelot": out_a.camelot_code(),
+                        "beatConfidence": out_a.beat_confidence,
+                    },
+                    "incoming": {
+                        "bpm": in_a.bpm,
+                        "key": in_a.key_label(),
+                        "camelot": in_a.camelot_code(),
+                        "beatConfidence": in_a.beat_confidence,
+                    }
+                }));
+            }
+            Ok(format!(
+                "summary={}\nstart={:.2}s dur={:.2}s in_cue={:.2}s rate={:.3}x beats_matched={} harmonic={}",
+                plan.summary,
+                plan.transition_start_sec,
+                plan.duration_sec,
+                plan.incoming_cue_sec,
+                plan.incoming_playback_rate,
+                plan.beats_matched,
+                plan.harmonic_match
+            ))
+        }
+    }
+}
+
 fn to_json<T: Serialize>(value: &T) -> Result<String, String> {
     serde_json::to_string_pretty(value).map_err(|e| e.to_string())
 }
@@ -1575,5 +1711,58 @@ mod tests {
         assert_eq!(val["nerdStats"]["sampleRateHz"], 2_822_400);
         assert_eq!(val["nerdStats"]["bitDepth"], 1);
         assert!(val["renderedFrames"].as_u64().unwrap_or(0) > 1_000);
+    }
+
+    #[tokio::test]
+    async fn offline_automix_analyze_and_plan_commands_detect_bpm_and_plan_transition() {
+        let pid = std::process::id();
+        let path_a = std::env::temp_dir().join(format!("bitchord_cli_am_a_{pid}.wav"));
+        let path_b = std::env::temp_dir().join(format!("bitchord_cli_am_b_{pid}.wav"));
+        let pcm_a = bitchord_automix::synth_beat_track_stereo(124.0, 22.0, 44_100);
+        let pcm_b = bitchord_automix::synth_beat_track_stereo(126.0, 22.0, 44_100);
+        std::fs::write(
+            &path_a,
+            bitchord_audio::build_test_wav_from_stereo_f32(44_100, &pcm_a),
+        )
+        .expect("write wav a");
+        std::fs::write(
+            &path_b,
+            bitchord_audio::build_test_wav_from_stereo_f32(44_100, &pcm_b),
+        )
+        .expect("write wav b");
+
+        let cli_a = Cli::try_parse_from([
+            "bitchord-cli",
+            "--json",
+            "automix",
+            "analyze",
+            path_a.to_str().expect("utf8"),
+        ])
+        .expect("parse analyze");
+        let out_a = run(cli_a).await.expect("run analyze");
+        let val_a: serde_json::Value = serde_json::from_str(&out_a).expect("valid json");
+        let bpm_a = val_a["bpm"].as_f64().unwrap_or(0.0);
+        assert!((bpm_a - 124.0).abs() <= 2.0, "got bpm={bpm_a}");
+
+        let cli_plan = Cli::try_parse_from([
+            "bitchord-cli",
+            "--json",
+            "automix",
+            "plan",
+            path_a.to_str().expect("utf8"),
+            path_b.to_str().expect("utf8"),
+            "--mode",
+            "advanced",
+            "--phrase-bars",
+            "8",
+        ])
+        .expect("parse plan");
+        let out_plan = run(cli_plan).await.expect("run plan");
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+
+        let val_plan: serde_json::Value = serde_json::from_str(&out_plan).expect("valid json");
+        assert_eq!(val_plan["plan"]["beatsMatched"], true);
+        assert!(val_plan["loopMix"].is_object());
     }
 }

@@ -12,9 +12,11 @@ workspace = true
 [features]
 default = ["ytdlp-bridge"]
 ytdlp-bridge = ["bitchord-innertube/ytdlp-bridge"]
+automix-onnx = ["bitchord-automix/automix-onnx", "bitchord-audio/automix-onnx"]
 
 [dependencies]
 bitchord-audio.workspace = true
+bitchord-automix.workspace = true
 bitchord-dsp-core.workspace = true
 bitchord-innertube.workspace = true
 bitchord-integrations.workspace = true
