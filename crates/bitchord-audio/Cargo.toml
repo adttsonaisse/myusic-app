@@ -10,6 +10,7 @@ description = "Linux native dual-deck audio engine (Symphonia + libopus + PipeWi
 workspace = true
 
 [dependencies]
+alsa.workspace = true
 audioadapter-buffers.workspace = true
 bitchord-dsp-core.workspace = true
 bitchord-innertube.workspace = true

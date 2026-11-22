@@ -159,6 +159,31 @@ pub enum SongSort {
     DateAddedDesc,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AudioOutputPreference {
+    #[default]
+    PipeWireAuto,
+    PipeWireForceRate,
+    AlsaExclusive,
+}
+
+impl AudioOutputPreference {
+    pub const ALL: [Self; 3] = [
+        Self::PipeWireAuto,
+        Self::PipeWireForceRate,
+        Self::AlsaExclusive,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PipeWireAuto => "PipeWire Auto (48 kHz)",
+            Self::PipeWireForceRate => "PipeWire Force-Rate",
+            Self::AlsaExclusive => "ALSA Exclusive (hw:)",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WebDavSettings {
@@ -237,6 +262,10 @@ pub struct AppSettingsData {
     pub auto_sync_playlists: bool,
     #[serde(default)]
     pub output_pcm_mode: OutputPcmMode,
+    #[serde(default)]
+    pub audio_output_mode: AudioOutputPreference,
+    #[serde(default)]
+    pub alsa_exclusive_device: String,
 
     // Playback & DSP
     #[serde(default = "default_true")]
@@ -326,6 +355,8 @@ impl Default for AppSettingsData {
             export_downloads: false,
             auto_sync_playlists: false,
             output_pcm_mode: OutputPcmMode::Pcm16,
+            audio_output_mode: AudioOutputPreference::PipeWireAuto,
+            alsa_exclusive_device: String::new(),
             gapless_playback: true,
             crossfade_seconds: 0,
             volume: 1.0,

@@ -14,9 +14,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_channel::{Receiver, Sender};
 use bitchord_audio::{
-    AudioDecoder, AudioEngine, DecodedPacket, EqTuningSnapshot, MprisCommand, MprisService,
-    MprisState, PlaybackSnapshot, PlaybackState, PlaybackStatus, RefusalCallback,
-    build_mpris_metadata, open_http_decoder,
+    AlsaDeviceInfo, AudioDecoder, AudioEngine, AudioOutputMode, DecodedPacket, EqTuningSnapshot,
+    MprisCommand, MprisService, MprisState, OUTPUT_SAMPLE_RATE, PlaybackSnapshot, PlaybackState,
+    PlaybackStatus, RefusalCallback, build_mpris_metadata, enumerate_alsa_devices,
+    open_http_decoder,
 };
 use bitchord_dsp_core::{EqCurve, EqLayout, EqualizerPreset, manual_curve};
 use bitchord_innertube::{
@@ -44,9 +45,9 @@ use bitchord_netstorage::{
 };
 use bitchord_queue::{QueueSource, QueueTimeline};
 use bitchord_storage::{
-    AppPaths, AppSettingsData, DbStats, KeyringSecretStore, LibraryDb, LocalPlaylist,
-    SavedSongMetadata, SecretKey, SecretStore, SettingsStore, SmbSettings, WebDavSettings,
-    read_local_audio_tags,
+    AppPaths, AppSettingsData, AudioOutputPreference, DbStats, KeyringSecretStore, LibraryDb,
+    LocalPlaylist, SavedSongMetadata, SecretKey, SecretStore, SettingsStore, SmbSettings,
+    WebDavSettings, read_local_audio_tags,
 };
 use gpui::Global;
 use reqwest::Client;
@@ -205,6 +206,11 @@ pub enum BackendCommand {
     },
     SyncSmb,
     SetStreamBackend(StreamBackendChoice),
+    SetAudioOutput {
+        mode: AudioOutputPreference,
+        alsa_device: String,
+    },
+    RefreshAudioDevices,
     SetDiscordRpc(bool),
     ImportSpotifyPlaylist(String),
     PartyProbeServer(String),
@@ -228,6 +234,7 @@ pub enum BackendEvent {
         pipewire_active: bool,
         message: String,
     },
+    AudioDevicesLoaded(Vec<AlsaDeviceInfo>),
     PlaybackUpdated(Box<PlaybackSnapshot>),
     QueueUpdated(QueueViewSnapshot),
     HomeLoading,
@@ -367,6 +374,21 @@ enum InternalTrackMsg {
     },
 }
 
+fn to_engine_output_mode(pref: AudioOutputPreference, alsa_device: &str) -> AudioOutputMode {
+    match pref {
+        AudioOutputPreference::PipeWireAuto => AudioOutputMode::PipeWireAuto,
+        AudioOutputPreference::PipeWireForceRate => AudioOutputMode::PipeWireForceRate,
+        AudioOutputPreference::AlsaExclusive => {
+            let dev = if alsa_device.trim().is_empty() {
+                "hw:0,0".to_owned()
+            } else {
+                alsa_device.trim().to_owned()
+            };
+            AudioOutputMode::AlsaExclusive { device: dev }
+        }
+    }
+}
+
 fn build_stream_resolver(
     http: &Arc<Client>,
     innertube: &Arc<InnertubeClient>,
@@ -409,14 +431,27 @@ fn run_backend_thread(
     cmd_rx: Receiver<BackendCommand>,
     evt_tx: Sender<BackendEvent>,
 ) {
-    let (mut engine, pipewire_active, audio_msg) = match AudioEngine::with_pipewire() {
-        Ok(eng) => (eng, true, "PipeWire 48 kHz F32LE audio active".to_owned()),
-        Err(err) => (
-            AudioEngine::with_null_sink(),
-            false,
-            format!("PipeWire unavailable ({err}); running in silent null-sink mode"),
-        ),
-    };
+    let desired_mode =
+        to_engine_output_mode(settings.audio_output_mode, &settings.alsa_exclusive_device);
+    let (mut engine, pipewire_active, audio_msg) =
+        match AudioEngine::with_output_mode(desired_mode.clone(), OUTPUT_SAMPLE_RATE, None) {
+            Ok(eng) => (eng, true, format!("{} active", desired_mode.label())),
+            Err(primary_err) => match AudioEngine::with_pipewire() {
+                Ok(eng) => (
+                    eng,
+                    true,
+                    format!(
+                        "{} unavailable ({primary_err}); fell back to PipeWire Auto",
+                        desired_mode.label()
+                    ),
+                ),
+                Err(err) => (
+                    AudioEngine::with_null_sink(),
+                    false,
+                    format!("PipeWire unavailable ({err}); running in silent null-sink mode"),
+                ),
+            },
+        };
     engine.set_volume(settings.volume);
     engine.set_muted(settings.muted);
     engine.set_crossfade_seconds(settings.crossfade_seconds);
@@ -425,6 +460,7 @@ fn run_backend_thread(
         pipewire_active,
         message: audio_msg,
     });
+    let _ = evt_tx.send_blocking(BackendEvent::AudioDevicesLoaded(enumerate_alsa_devices()));
 
     let http_arc = Arc::new(http.clone());
     let innertube = Arc::new(InnertubeClient::with_http_client(Arc::clone(&http_arc)));
@@ -1574,6 +1610,40 @@ fn run_backend_thread(
                     let _ = evt_tx.try_send(BackendEvent::StatusNotice(format!(
                         "Stream resolver set to {}",
                         choice.label()
+                    )));
+                }
+                BackendCommand::SetAudioOutput { mode, alsa_device } => {
+                    let clean_dev = alsa_device.trim().to_owned();
+                    let engine_mode = to_engine_output_mode(mode, &clean_dev);
+                    match engine.set_output_mode(engine_mode.clone(), None, None) {
+                        Ok(()) => {
+                            settings.audio_output_mode = mode;
+                            if !clean_dev.is_empty() {
+                                settings.alsa_exclusive_device = clean_dev;
+                            }
+                            let _ = settings_store.save(&settings);
+                            let _ = evt_tx.try_send(BackendEvent::StatusNotice(format!(
+                                "Audio output switched to {}",
+                                engine_mode.label()
+                            )));
+                            let _ = evt_tx.try_send(BackendEvent::PlaybackUpdated(Box::new(
+                                engine.snapshot(),
+                            )));
+                        }
+                        Err(err) => {
+                            let _ = evt_tx.try_send(BackendEvent::ErrorNotice(format!(
+                                "Cannot switch output to {}: {err}",
+                                engine_mode.label()
+                            )));
+                        }
+                    }
+                }
+                BackendCommand::RefreshAudioDevices => {
+                    let devices = enumerate_alsa_devices();
+                    let count = devices.len();
+                    let _ = evt_tx.try_send(BackendEvent::AudioDevicesLoaded(devices));
+                    let _ = evt_tx.try_send(BackendEvent::StatusNotice(format!(
+                        "Detected {count} ALSA hardware playback endpoint(s)"
                     )));
                 }
                 BackendCommand::SetDiscordRpc(enabled) => {

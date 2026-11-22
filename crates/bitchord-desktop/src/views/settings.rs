@@ -4,6 +4,7 @@
 
 use bitchord_audio::PRESETS as SLEEP_PRESETS;
 use bitchord_dsp_core::{EqLayout, EqualizerPreset};
+use bitchord_storage::AudioOutputPreference;
 use gpui::prelude::*;
 use gpui::{Context, FontWeight, Window, div, px};
 
@@ -113,7 +114,102 @@ impl BitChordApp {
                         )),
                 ),
             )
-            // 2. Playback & Crossfade + Stream Backend (ADR-004)
+            // 2. Audio Output & Bit-Perfect Exclusive DAC (`Wave 5B`)
+            .child(
+                section_card("Audio Output & Bit-Perfect DAC", icons::VOLUME_HIGH, theme)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(8.0))
+                            .children(AudioOutputPreference::ALL.into_iter().map(|pref| {
+                                let is_sel = self.audio_output_pref == pref;
+                                toggle_chip(
+                                    ("out-mode", pref as usize),
+                                    pref.label(),
+                                    is_sel,
+                                    theme,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.audio_output_pref = pref;
+                                        let dev = this.selected_alsa_device.clone();
+                                        this.send(
+                                            BackendCommand::SetAudioOutput {
+                                                mode: pref,
+                                                alsa_device: dev,
+                                            },
+                                            cx,
+                                        );
+                                        cx.notify();
+                                    }),
+                                )
+                            }))
+                            .child(toggle_chip(
+                                "out-refresh-devices",
+                                "Refresh Devices",
+                                false,
+                                theme,
+                                cx.listener(|this, _, _, cx| {
+                                    this.send(BackendCommand::RefreshAudioDevices, cx);
+                                }),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(if self.playback.bit_perfect_active {
+                                theme.accent
+                            } else {
+                                theme.text_muted
+                            })
+                            .child(format!(
+                                "Active output: {} · {} Hz {} · Bit-Perfect: {}",
+                                self.playback.output_device_label,
+                                self.playback.output_sample_rate_hz,
+                                self.playback.output_format_label,
+                                if self.playback.bit_perfect_active {
+                                    "ACTIVE (bit-exact native clock)"
+                                } else {
+                                    "Off (shared mixer, resampled, or DSP/volume active)"
+                                }
+                            )),
+                    )
+                    .when(!self.audio_devices.is_empty(), |el| {
+                        el.child(div().flex().flex_wrap().gap(px(8.0)).children(
+                            self.audio_devices.iter().enumerate().map(|(i, dev)| {
+                                let hw_id = dev.hw_id.clone();
+                                let is_sel = self.selected_alsa_device == dev.hw_id;
+                                let suffix = if dev.is_usb_dac {
+                                    " [USB DAC]"
+                                } else if dev.busy {
+                                    " [busy]"
+                                } else {
+                                    ""
+                                };
+                                toggle_chip(
+                                    ("alsa-dev", i),
+                                    format!("{}{suffix}", dev.display_name),
+                                    is_sel,
+                                    theme,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.selected_alsa_device = hw_id.clone();
+                                        this.audio_output_pref =
+                                            AudioOutputPreference::AlsaExclusive;
+                                        this.send(
+                                            BackendCommand::SetAudioOutput {
+                                                mode: AudioOutputPreference::AlsaExclusive,
+                                                alsa_device: hw_id.clone(),
+                                            },
+                                            cx,
+                                        );
+                                        cx.notify();
+                                    }),
+                                )
+                            }),
+                        ))
+                    }),
+            )
+            // 3. Playback & Crossfade + Stream Backend (ADR-004)
             .child(
                 section_card("Playback, Crossfade & Stream Backend", icons::DISC, theme)
                     .child(

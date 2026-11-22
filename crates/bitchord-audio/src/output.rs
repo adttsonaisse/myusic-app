@@ -18,8 +18,10 @@ use libspa::pod::Pod;
 use pipewire as pw;
 use pw::properties::properties;
 use rtrb::{Consumer, Producer, RingBuffer};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::alsa_output::AlsaExclusiveSink;
 use crate::crossfade::DeckId;
 use crate::dsp::{DspChain, EqTuningSnapshot};
 
@@ -43,8 +45,38 @@ const MAX_RT_CHUNK_FRAMES: usize = 4_096;
 pub enum OutputError {
     #[error("PipeWire initialization/connection failed: {0}")]
     PipeWire(String),
-    #[error("failed to spawn PipeWire audio thread: {0}")]
+    #[error("ALSA exclusive output failed: {0}")]
+    Alsa(String),
+    #[error("failed to spawn audio output thread: {0}")]
     ThreadSpawn(#[from] std::io::Error),
+}
+
+/// Selected Linux audio output mode (`Wave 5B`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum AudioOutputMode {
+    /// Standard PipeWire shared stream at 48 kHz F32LE (always mixes smoothly with desktop audio).
+    #[default]
+    PipeWireAuto,
+    /// PipeWire Pro Audio / dynamic clock switching requesting the track's exact native sample rate.
+    PipeWireForceRate,
+    /// Direct hardware ALSA `hw:card,dev` exclusive output bypassing OS mixing and resampling.
+    AlsaExclusive { device: String },
+}
+
+impl AudioOutputMode {
+    /// Whether this mode switches output hardware clock rate to match each track's native rate.
+    pub fn tracks_native_rate(&self) -> bool {
+        matches!(self, Self::PipeWireForceRate | Self::AlsaExclusive { .. })
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::PipeWireAuto => "PipeWire Auto (48 kHz)".to_owned(),
+            Self::PipeWireForceRate => "PipeWire Force-Rate (Native Clock)".to_owned(),
+            Self::AlsaExclusive { device } => format!("ALSA Exclusive ({device})"),
+        }
+    }
 }
 
 /// Lock-free, heap-free (`Copy`) command sent from the engine/UI thread to the RT mixer.
@@ -182,7 +214,7 @@ pub struct RtMixerState {
 }
 
 impl RtMixerState {
-    fn new_pair(sample_rate: u32) -> (Self, SinkProducers) {
+    pub(crate) fn new_pair(sample_rate: u32) -> (Self, SinkProducers) {
         let (tx_a, rx_a) = RingBuffer::<f32>::new(RING_CAPACITY_SAMPLES);
         let (tx_b, rx_b) = RingBuffer::<f32>::new(RING_CAPACITY_SAMPLES);
         let (cmd_tx, cmd_rx) = RingBuffer::<RtCommand>::new(CMD_RING_CAPACITY);
@@ -501,6 +533,7 @@ enum PwControl {
 /// Live PipeWire native stereo `F32LE` output stream running on a dedicated OS thread.
 pub struct PipeWireSink {
     sample_rate: u32,
+    force_rate: bool,
     ctrl_tx: pw::channel::Sender<PwControl>,
     thread: Option<JoinHandle<()>>,
 }
@@ -508,6 +541,15 @@ pub struct PipeWireSink {
 impl PipeWireSink {
     /// Spawns a PipeWire playback stream at `sample_rate` (default `48_000 Hz`).
     pub fn spawn(sample_rate: u32) -> Result<(Self, SinkProducers), OutputError> {
+        Self::spawn_with_force_rate(sample_rate, false)
+    }
+
+    /// Spawns a PipeWire stream, optionally hinting `node.force-rate` / `node.rate`
+    /// so PipeWire switches compatible DACs to the track's native sample rate.
+    pub fn spawn_with_force_rate(
+        sample_rate: u32,
+        force_rate: bool,
+    ) -> Result<(Self, SinkProducers), OutputError> {
         let (rt_state, producers) = RtMixerState::new_pair(sample_rate);
         let (ctrl_tx, ctrl_rx) = pw::channel::channel::<PwControl>();
         let (ready_tx, ready_rx) = std_mpsc::sync_channel::<Result<(), String>>(1);
@@ -515,13 +557,14 @@ impl PipeWireSink {
         let thread = thread::Builder::new()
             .name("bitchord-pw-audio".to_owned())
             .spawn(move || {
-                run_pipewire_loop(sample_rate, rt_state, ctrl_rx, ready_tx);
+                run_pipewire_loop(sample_rate, force_rate, rt_state, ctrl_rx, ready_tx);
             })?;
 
         match ready_rx.recv() {
             Ok(Ok(())) => Ok((
                 Self {
                     sample_rate,
+                    force_rate,
                     ctrl_tx,
                     thread: Some(thread),
                 },
@@ -543,6 +586,10 @@ impl PipeWireSink {
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
+
+    pub fn force_rate(&self) -> bool {
+        self.force_rate
+    }
 }
 
 impl Drop for PipeWireSink {
@@ -556,6 +603,7 @@ impl Drop for PipeWireSink {
 
 fn run_pipewire_loop(
     sample_rate: u32,
+    force_rate: bool,
     rt_state: RtMixerState,
     ctrl_rx: pw::channel::Receiver<PwControl>,
     ready_tx: std_mpsc::SyncSender<Result<(), String>>,
@@ -591,17 +639,21 @@ fn run_pipewire_loop(
         }
     });
 
-    let stream = match pw::stream::StreamBox::new(
-        &core,
-        "bitchord-playback",
-        properties! {
-            *pw::keys::MEDIA_TYPE => "Audio",
-            *pw::keys::MEDIA_ROLE => "Music",
-            *pw::keys::MEDIA_CATEGORY => "Playback",
-            *pw::keys::APP_NAME => "Myusic",
-            *pw::keys::AUDIO_CHANNELS => "2",
-        },
-    ) {
+    let mut props = properties! {
+        *pw::keys::MEDIA_TYPE => "Audio",
+        *pw::keys::MEDIA_ROLE => "Music",
+        *pw::keys::MEDIA_CATEGORY => "Playback",
+        *pw::keys::APP_NAME => "Myusic",
+        *pw::keys::AUDIO_CHANNELS => "2",
+    };
+    if force_rate {
+        let rate_frac = format!("1/{sample_rate}");
+        let rate_str = sample_rate.to_string();
+        props.insert("node.rate", rate_frac);
+        props.insert("node.force-rate", rate_str);
+    }
+
+    let stream = match pw::stream::StreamBox::new(&core, "bitchord-playback", props) {
         Ok(s) => s,
         Err(err) => {
             let _ = ready_tx.send(Err(format!("StreamBox::new: {err}")));
@@ -724,6 +776,7 @@ impl NullAudioSink {
 /// Concrete output backend held by [`crate::engine::AudioEngine`].
 pub enum AudioBackend {
     PipeWire(PipeWireSink),
+    AlsaExclusive(AlsaExclusiveSink),
     Null(Box<NullAudioSink>),
 }
 
@@ -731,14 +784,40 @@ impl AudioBackend {
     pub fn sample_rate(&self) -> u32 {
         match self {
             Self::PipeWire(pw) => pw.sample_rate(),
+            Self::AlsaExclusive(alsa) => alsa.sample_rate(),
             Self::Null(null) => null.sample_rate(),
+        }
+    }
+
+    pub fn device_label(&self) -> String {
+        match self {
+            Self::PipeWire(pw) if pw.force_rate() => "PipeWire (Force-Rate)".to_owned(),
+            Self::PipeWire(_) => "PipeWire".to_owned(),
+            Self::AlsaExclusive(alsa) => format!("ALSA Exclusive ({})", alsa.device()),
+            Self::Null(_) => "Headless NullSink".to_owned(),
+        }
+    }
+
+    pub fn format_label(&self) -> &'static str {
+        match self {
+            Self::PipeWire(_) | Self::Null(_) => "F32LE",
+            Self::AlsaExclusive(alsa) => alsa.format().label(),
+        }
+    }
+
+    /// `true` when this backend bypasses fixed-rate OS resampling (ALSA Exclusive or PipeWire Force-Rate).
+    pub fn supports_bit_perfect(&self) -> bool {
+        match self {
+            Self::AlsaExclusive(_) => true,
+            Self::PipeWire(pw) => pw.force_rate(),
+            Self::Null(_) => false,
         }
     }
 
     pub fn as_null_mut(&mut self) -> Option<&mut NullAudioSink> {
         match self {
             Self::Null(null) => Some(null.as_mut()),
-            Self::PipeWire(_) => None,
+            Self::PipeWire(_) | Self::AlsaExclusive(_) => None,
         }
     }
 }

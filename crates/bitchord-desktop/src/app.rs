@@ -9,13 +9,14 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use bitchord_audio::{PlaybackSnapshot, PlaybackState};
+use bitchord_audio::{AlsaDeviceInfo, AudioOutputMode, PlaybackSnapshot, PlaybackState};
 use bitchord_dsp_core::{EqLayout, EqualizerPreset};
 use bitchord_integrations::ListenTogetherState;
 use bitchord_model::{
     BrowseItem, BrowseType, EntityType, HomeFeed, PlaybackSourceType, SearchFilter,
     SearchHistoryEntity, SearchResult, Song,
 };
+use bitchord_storage::AudioOutputPreference;
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, Context, Decorations, Entity, FocusHandle, Focusable, ListAlignment, ListOffset,
@@ -141,6 +142,9 @@ pub struct BitChordApp {
     pub eq_preset: EqualizerPreset,
     pub eq_bands_db: [f32; EqLayout::MANUAL_COUNT],
     pub stream_backend: StreamBackendChoice,
+    pub audio_output_pref: AudioOutputPreference,
+    pub selected_alsa_device: String,
+    pub audio_devices: Vec<AlsaDeviceInfo>,
     pub discord_rpc_enabled: bool,
 
     // Artwork LRU cache + active Now Playing mesh backdrop
@@ -321,6 +325,11 @@ impl BitChordApp {
             peak_level: 0.0,
             skipped_silence_ms: 0,
             last_error: None,
+            output_mode: AudioOutputMode::PipeWireAuto,
+            output_device_label: "PipeWire".to_owned(),
+            output_format_label: "F32LE".to_owned(),
+            output_sample_rate_hz: bitchord_audio::OUTPUT_SAMPLE_RATE,
+            bit_perfect_active: false,
         };
 
         // Trigger initial Home feed + Library load immediately.
@@ -370,6 +379,13 @@ impl BitChordApp {
             eq_preset: EqualizerPreset::Flat,
             eq_bands_db: [0.0; EqLayout::MANUAL_COUNT],
             stream_backend: StreamBackendChoice::Auto,
+            audio_output_pref: backend.initial_settings.audio_output_mode,
+            selected_alsa_device: if backend.initial_settings.alsa_exclusive_device.is_empty() {
+                "hw:0,0".to_owned()
+            } else {
+                backend.initial_settings.alsa_exclusive_device.clone()
+            },
+            audio_devices: Vec::new(),
             discord_rpc_enabled: backend.initial_settings.discord_rpc_enabled,
             artwork_cache: ArtworkCache::default(),
             default_mesh: ArtworkPalette::default().build_mesh_render_image(),
@@ -763,6 +779,14 @@ impl BitChordApp {
                 if !pipewire_active {
                     self.audio_banner = Some(message);
                 }
+            }
+            BackendEvent::AudioDevicesLoaded(devices) => {
+                if self.selected_alsa_device == "hw:0,0"
+                    && let Some(usb) = devices.iter().find(|d| d.is_usb_dac)
+                {
+                    self.selected_alsa_device = usb.hw_id.clone();
+                }
+                self.audio_devices = devices;
             }
             BackendEvent::PlaybackUpdated(snap) => {
                 let snap = *snap;

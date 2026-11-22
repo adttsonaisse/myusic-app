@@ -21,13 +21,14 @@ use symphonia::core::formats::probe::Hint;
 use thiserror::Error;
 use tokio::runtime::Handle;
 
+use crate::alsa_output::AlsaExclusiveSink;
 use crate::chunked_source::{ChunkedRangeSource, RefusalCallback};
 use crate::crossfade::{CrossfadePhase, CrossfadeState, DeckId};
 use crate::decoder::{AudioDecoder, DecodedPacket, DecodedStreamInfo, DecoderError};
 use crate::dsp::{EqTuningSnapshot, loudness_db_to_linear_gain};
 use crate::output::{
-    AudioBackend, NullAudioSink, OUTPUT_CHANNELS, OUTPUT_SAMPLE_RATE, OutputError, PipeWireSink,
-    RtCommand, RtMetrics, SinkProducers,
+    AudioBackend, AudioOutputMode, NullAudioSink, OUTPUT_CHANNELS, OUTPUT_SAMPLE_RATE, OutputError,
+    PipeWireSink, RtCommand, RtMetrics, SinkProducers,
 };
 use crate::resampler::{AudioResampler, ResamplerError};
 use crate::skip_silence::SkipSilenceProcessor;
@@ -92,6 +93,12 @@ pub struct PlaybackSnapshot {
     pub peak_level: f32,
     pub skipped_silence_ms: u64,
     pub last_error: Option<String>,
+    pub output_mode: AudioOutputMode,
+    pub output_device_label: String,
+    pub output_format_label: String,
+    pub output_sample_rate_hz: u32,
+    /// `true` only when hardware clock matches source rate with zero resampling or DSP alteration.
+    pub bit_perfect_active: bool,
 }
 
 /// Summary produced by headless [`AudioEngine::drain_to_eof_null`] runs (`--no-output`).
@@ -251,14 +258,26 @@ pub struct AudioEngine {
     skip_silence: bool,
     spatial_audio: bool,
     eq_snapshot: EqTuningSnapshot,
+    output_mode: AudioOutputMode,
     next_flush_epoch: u64,
 }
 
 impl AudioEngine {
     /// Creates an engine connected to the live Linux PipeWire audio server (`48 kHz F32LE`).
     pub fn with_pipewire() -> Result<Self, EngineError> {
-        let (sink, producers) = PipeWireSink::spawn(OUTPUT_SAMPLE_RATE)?;
-        Ok(Self::from_parts(AudioBackend::PipeWire(sink), producers))
+        Self::with_output_mode(AudioOutputMode::PipeWireAuto, OUTPUT_SAMPLE_RATE, None)
+    }
+
+    /// Creates an engine using the specified [`AudioOutputMode`] (PipeWire Auto,
+    /// PipeWire Force-Rate, or direct ALSA Exclusive `hw:X,Y`).
+    pub fn with_output_mode(
+        mode: AudioOutputMode,
+        sample_rate: u32,
+        preferred_bits: Option<u32>,
+    ) -> Result<Self, EngineError> {
+        let rate = sample_rate.clamp(8_000, 384_000);
+        let (backend, producers) = spawn_backend_for_mode(&mode, rate, preferred_bits)?;
+        Ok(Self::from_parts(backend, producers, mode))
     }
 
     /// Creates a deterministic headless engine backed by [`NullAudioSink`]
@@ -270,10 +289,18 @@ impl AudioEngine {
     /// Creates a headless engine at a custom output sample rate.
     pub fn with_null_sink_rate(sample_rate: u32) -> Self {
         let (sink, producers) = NullAudioSink::new(sample_rate);
-        Self::from_parts(AudioBackend::Null(Box::new(sink)), producers)
+        Self::from_parts(
+            AudioBackend::Null(Box::new(sink)),
+            producers,
+            AudioOutputMode::PipeWireAuto,
+        )
     }
 
-    fn from_parts(backend: AudioBackend, producers: SinkProducers) -> Self {
+    fn from_parts(
+        backend: AudioBackend,
+        producers: SinkProducers,
+        output_mode: AudioOutputMode,
+    ) -> Self {
         Self {
             backend,
             cmd_tx: producers.commands,
@@ -290,7 +317,108 @@ impl AudioEngine {
             skip_silence: false,
             spatial_audio: false,
             eq_snapshot: EqTuningSnapshot::off(),
+            output_mode,
             next_flush_epoch: 0,
+        }
+    }
+
+    pub fn output_mode(&self) -> &AudioOutputMode {
+        &self.output_mode
+    }
+
+    /// Switches live audio output backend (PipeWire Auto / PipeWire Force-Rate / ALSA Exclusive)
+    /// while preserving volume, mute, EQ, spatial, speed, and crossfade settings.
+    pub fn set_output_mode(
+        &mut self,
+        mode: AudioOutputMode,
+        sample_rate: Option<u32>,
+        preferred_bits: Option<u32>,
+    ) -> Result<(), EngineError> {
+        self.stop();
+        let target_rate = match &mode {
+            AudioOutputMode::PipeWireAuto => OUTPUT_SAMPLE_RATE,
+            AudioOutputMode::PipeWireForceRate | AudioOutputMode::AlsaExclusive { .. } => {
+                sample_rate
+                    .or_else(|| {
+                        self.deck(self.crossfade.active_deck)
+                            .stream_info
+                            .as_ref()
+                            .map(|i| i.sample_rate_hz)
+                    })
+                    .unwrap_or(OUTPUT_SAMPLE_RATE)
+                    .clamp(8_000, 384_000)
+            }
+        };
+        let (backend, producers) = spawn_backend_for_mode(&mode, target_rate, preferred_bits)?;
+        self.install_backend(backend, producers, mode);
+        Ok(())
+    }
+
+    fn install_backend(
+        &mut self,
+        backend: AudioBackend,
+        producers: SinkProducers,
+        mode: AudioOutputMode,
+    ) {
+        self.deck_a.stop_worker();
+        self.deck_b.stop_worker();
+        self.backend = backend;
+        self.cmd_tx = producers.commands;
+        self.metrics = producers.metrics;
+        self.deck_a = DeckSlot::new(producers.deck_a);
+        self.deck_b = DeckSlot::new(producers.deck_b);
+        self.output_mode = mode;
+        self.next_flush_epoch = 0;
+
+        // Re-apply user DSP/transport parameters to the newly spawned RT mixer.
+        let vol = self.volume;
+        let muted = self.muted;
+        let spatial = self.spatial_audio;
+        let eq = self.eq_snapshot;
+        self.send_rt(RtCommand::SetVolume(vol));
+        self.send_rt(RtCommand::SetMuted(muted));
+        self.send_rt(RtCommand::SetSpatial(spatial));
+        self.send_rt(RtCommand::SetEq(eq));
+        self.send_active_solo_gains();
+        self.sync_null_commands();
+    }
+
+    /// Re-opens the hardware output at `target_rate` when operating in native-clock mode
+    /// (`PipeWireForceRate` or `AlsaExclusive`). Falls back cleanly to existing sink if
+    /// hardware refuses that rate.
+    fn maybe_match_hardware_rate(&mut self, target_rate: u32, preferred_bits: Option<u32>) {
+        if !self.output_mode.tracks_native_rate() {
+            return;
+        }
+        if matches!(self.backend, AudioBackend::Null(_)) {
+            return;
+        }
+        let target = target_rate.clamp(8_000, 384_000);
+        if self.backend.sample_rate() == target {
+            return;
+        }
+        let mode = self.output_mode.clone();
+        // Release the current hardware handle before re-opening the same ALSA device at the new rate!
+        let was_alsa = matches!(mode, AudioOutputMode::AlsaExclusive { .. });
+        if was_alsa {
+            let (tmp_null, tmp_prod) = NullAudioSink::new(target);
+            self.install_backend(
+                AudioBackend::Null(Box::new(tmp_null)),
+                tmp_prod,
+                mode.clone(),
+            );
+        }
+        if let Ok((backend, producers)) = spawn_backend_for_mode(&mode, target, preferred_bits) {
+            self.install_backend(backend, producers, mode);
+        } else if was_alsa {
+            // Hardware refused the new rate; fall back cleanly to PipeWire 48 kHz so playback continues.
+            if let Ok((pw_sink, pw_prod)) = PipeWireSink::spawn(OUTPUT_SAMPLE_RATE) {
+                self.install_backend(
+                    AudioBackend::PipeWire(pw_sink),
+                    pw_prod,
+                    AudioOutputMode::PipeWireAuto,
+                );
+            }
         }
     }
 
@@ -578,11 +706,28 @@ impl AudioEngine {
     fn load_into_deck(
         &mut self,
         deck_id: DeckId,
-        spec: AudioSourceSpec,
+        mut spec: AudioSourceSpec,
         song: Song,
         loudness_db: Option<f64>,
         source_label: Option<&str>,
     ) -> Result<DecodedStreamInfo, EngineError> {
+        // When loading the active deck in native-clock mode (PipeWire Force-Rate or ALSA Exclusive),
+        // inspect source sample rate up front and switch the hardware clock to match bit-for-bit!
+        if deck_id == self.crossfade.active_deck && self.output_mode.tracks_native_rate() {
+            if !matches!(spec, AudioSourceSpec::PreparedDecoder { .. }) {
+                let (dec, prebuf) = open_decoder_for_spec(spec)?;
+                spec = AudioSourceSpec::PreparedDecoder {
+                    decoder: Box::new(dec),
+                    prebuffered: prebuf.into_iter().collect(),
+                };
+            }
+            if let AudioSourceSpec::PreparedDecoder { ref decoder, .. } = spec {
+                let target_rate = decoder.info().sample_rate_hz;
+                let preferred_bits = decoder.info().bit_depth;
+                self.maybe_match_hardware_rate(target_rate, preferred_bits);
+            }
+        }
+
         // Stop any existing worker on this deck and wait until the RT thread has
         // actually flushed its ring buffer so sample 0 of the new track is never dropped.
         self.deck_mut(deck_id).stop_worker();
@@ -950,7 +1095,33 @@ impl AudioEngine {
             peak_level: self.metrics.peak_level(),
             skipped_silence_ms: slot.skipped_silence_ms(),
             last_error: slot.last_error(),
+            output_mode: self.output_mode.clone(),
+            output_device_label: self.backend.device_label(),
+            output_format_label: self.backend.format_label().to_owned(),
+            output_sample_rate_hz: self.backend.sample_rate(),
+            bit_perfect_active: self.is_bit_perfect_active(slot),
         }
+    }
+
+    /// Honest bit-perfect audit: true ONLY when native-clock output matches source rate
+    /// with zero resampling, zero EQ/Spatial/speed/silence processing, and unity gain.
+    fn is_bit_perfect_active(&self, slot: &DeckSlot) -> bool {
+        if !self.backend.supports_bit_perfect() {
+            return false;
+        }
+        let Some(ref info) = slot.stream_info else {
+            return false;
+        };
+        let same_rate = self.backend.sample_rate() == info.sample_rate_hz;
+        let dsp_bypassed = !self.eq_snapshot.enabled
+            && !self.spatial_audio
+            && !self.skip_silence
+            && (self.speed - 1.0).abs() < 1e-4
+            && !self.muted
+            && (self.volume - 1.0).abs() < 1e-4
+            && (slot.loudness_gain - 1.0).abs() < 1e-4
+            && self.crossfade.phase == CrossfadePhase::Idle;
+        same_rate && dsp_bypassed
     }
 
     /// Renders `frames` stereo frames synchronously when backed by [`NullAudioSink`].
@@ -1047,6 +1218,27 @@ impl AudioEngine {
 impl Drop for AudioEngine {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+fn spawn_backend_for_mode(
+    mode: &AudioOutputMode,
+    sample_rate: u32,
+    preferred_bits: Option<u32>,
+) -> Result<(AudioBackend, SinkProducers), EngineError> {
+    match mode {
+        AudioOutputMode::PipeWireAuto => {
+            let (sink, producers) = PipeWireSink::spawn_with_force_rate(OUTPUT_SAMPLE_RATE, false)?;
+            Ok((AudioBackend::PipeWire(sink), producers))
+        }
+        AudioOutputMode::PipeWireForceRate => {
+            let (sink, producers) = PipeWireSink::spawn_with_force_rate(sample_rate, true)?;
+            Ok((AudioBackend::PipeWire(sink), producers))
+        }
+        AudioOutputMode::AlsaExclusive { device } => {
+            let (sink, producers) = AlsaExclusiveSink::spawn(device, sample_rate, preferred_bits)?;
+            Ok((AudioBackend::AlsaExclusive(sink), producers))
+        }
     }
 }
 

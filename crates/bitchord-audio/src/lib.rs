@@ -4,6 +4,7 @@
 //! streaming, Listen Together sync coordinator, monotonic sleep timer, and
 //! MPRIS2 D-Bus server for BitChord Linux Desktop (`Wave 3`).
 
+pub mod alsa_output;
 pub mod chunked_source;
 pub mod crossfade;
 pub mod decoder;
@@ -16,6 +17,12 @@ pub mod resampler;
 pub mod skip_silence;
 pub mod sleep_timer;
 pub mod time_stretch;
+
+pub use alsa_output::{
+    AlsaDeviceInfo, AlsaExclusiveSink, AlsaSampleFormat, PROBE_SAMPLE_RATES, convert_f32_to_s16le,
+    convert_f32_to_s24_3le, convert_f32_to_s32le, enumerate_alsa_devices, parse_proc_asound_cards,
+    parse_proc_asound_pcm,
+};
 
 pub use chunked_source::{
     ChunkedRangeSource, DEFAULT_CHUNK_BYTES, MAX_CACHE_BYTES, MAX_EMPTY_RANGES,
@@ -43,9 +50,9 @@ pub use mpris::{
     encode_mpris_track_id,
 };
 pub use output::{
-    AudioBackend, CMD_RING_CAPACITY, NullAudioSink, OUTPUT_CHANNELS, OUTPUT_SAMPLE_RATE,
-    OutputError, PipeWireSink, RING_CAPACITY_SAMPLES, RtCommand, RtMetrics, RtMixerState,
-    SinkProducers,
+    AudioBackend, AudioOutputMode, CMD_RING_CAPACITY, NullAudioSink, OUTPUT_CHANNELS,
+    OUTPUT_SAMPLE_RATE, OutputError, PipeWireSink, RING_CAPACITY_SAMPLES, RtCommand, RtMetrics,
+    RtMixerState, SinkProducers,
 };
 pub use party_sync::{LocalPlaybackView, PartySyncCoordinator, ReconcileAction};
 pub use resampler::{AudioResampler, ResamplerError};

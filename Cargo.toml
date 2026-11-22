@@ -39,6 +39,7 @@ license = "GPL-3.0-only"
 rust-version = "1.95"
 
 [workspace.dependencies]
+alsa = "0.12"
 async-channel = "2"
 audioadapter-buffers = "5.2"
 base64 = "0.23"

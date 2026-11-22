@@ -507,7 +507,15 @@ impl BitChordApp {
                                                 .unwrap_or("-"),
                                         ))
                                         .child(format!(
-                                            "Pipeline: PipeWire 48 kHz F32LE · Underruns: {} · Skipped: {}ms",
+                                            "Pipeline: {} ({} Hz {}) · {}Underruns: {} · Skipped: {}ms",
+                                            self.playback.output_device_label,
+                                            self.playback.output_sample_rate_hz,
+                                            self.playback.output_format_label,
+                                            if self.playback.bit_perfect_active {
+                                                "BIT-PERFECT · "
+                                            } else {
+                                                ""
+                                            },
                                             self.playback.underruns,
                                             self.playback.skipped_silence_ms,
                                         )),

@@ -13,8 +13,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bitchord_audio::{
-    AudioDecoder, AudioEngine, EqTuningSnapshot, MprisCommand, MprisService, MprisState,
-    PlaybackState, PlaybackStatus, build_mpris_metadata,
+    AudioDecoder, AudioEngine, AudioOutputMode, EqTuningSnapshot, MprisCommand, MprisService,
+    MprisState, OUTPUT_SAMPLE_RATE, PlaybackState, PlaybackStatus, build_mpris_metadata,
+    enumerate_alsa_devices,
 };
 use bitchord_dsp_core::{EqualizerPreset, manual_curve};
 use bitchord_innertube::{
@@ -102,6 +103,8 @@ enum Command {
         #[command(subcommand)]
         action: NetStorageAction,
     },
+    /// Enumerate Linux ALSA hardware playback endpoints and USB DACs for bit-perfect output.
+    Devices,
     /// Deterministic queue state machine smoke command for replay verification.
     QueueDemo {
         /// Comma-separated video IDs.
@@ -258,6 +261,13 @@ impl From<CliEqPreset> for EqualizerPreset {
     }
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliOutputMode {
+    PipewireAuto,
+    PipewireForceRate,
+    AlsaExclusive,
+}
+
 #[derive(Debug, Args)]
 struct PlayArgs {
     /// Local audio file path, WebDAV URL (`http(s)://...` / `webdav:...`), SMB URL (`smb://host/share/path`), or YouTube videoId.
@@ -268,6 +278,12 @@ struct PlayArgs {
     /// Optional password for WebDAV Basic Auth or SMB2/3 login.
     #[arg(long, default_value = "")]
     remote_pass: String,
+    /// Linux audio output backend mode.
+    #[arg(long, value_enum, default_value_t = CliOutputMode::PipewireAuto)]
+    output_mode: CliOutputMode,
+    /// ALSA hardware device ID when `--output-mode alsa-exclusive` is chosen (e.g. `hw:1,0`).
+    #[arg(long, default_value = "hw:0,0")]
+    alsa_device: String,
     #[arg(long, value_enum, default_value_t = StreamBackendMode::Auto)]
     backend: StreamBackendMode,
     #[arg(long, default_value_t = u32::MAX)]
@@ -444,6 +460,7 @@ async fn run(cli: Cli) -> Result<String, String> {
         Command::Spotify { action } => cmd_spotify(action, json_mode).await,
         Command::Storage { action } => cmd_storage(action, &paths, json_mode),
         Command::Netstorage { action } => cmd_netstorage(action, json_mode).await,
+        Command::Devices => cmd_devices(json_mode),
         Command::QueueDemo { tracks, play_next } => cmd_queue_demo(tracks, play_next, json_mode),
     }
 }
@@ -659,7 +676,14 @@ async fn cmd_play(args: PlayArgs, json_mode: bool) -> Result<String, String> {
     let mut engine = if args.no_output {
         AudioEngine::with_null_sink()
     } else {
-        AudioEngine::with_pipewire().map_err(|e| e.to_string())?
+        let mode = match args.output_mode {
+            CliOutputMode::PipewireAuto => AudioOutputMode::PipeWireAuto,
+            CliOutputMode::PipewireForceRate => AudioOutputMode::PipeWireForceRate,
+            CliOutputMode::AlsaExclusive => AudioOutputMode::AlsaExclusive {
+                device: args.alsa_device.clone(),
+            },
+        };
+        AudioEngine::with_output_mode(mode, OUTPUT_SAMPLE_RATE, None).map_err(|e| e.to_string())?
     };
 
     engine.set_volume(args.volume);
@@ -1146,6 +1170,41 @@ async fn cmd_netstorage(action: NetStorageAction, json_mode: bool) -> Result<Str
             Ok(lines.join("\n"))
         }
     }
+}
+
+fn cmd_devices(json_mode: bool) -> Result<String, String> {
+    let devices = enumerate_alsa_devices();
+    if json_mode {
+        return to_json(&serde_json::json!({
+            "count": devices.len(),
+            "devices": devices,
+        }));
+    }
+    if devices.is_empty() {
+        return Ok("No ALSA hardware playback devices found.".to_owned());
+    }
+    let mut lines = vec![format!("ALSA playback devices: {}", devices.len())];
+    for dev in &devices {
+        let rates = if dev.supported_rates.is_empty() {
+            if dev.busy {
+                "busy (held by PipeWire/PulseAudio)".to_owned()
+            } else {
+                "unknown".to_owned()
+            }
+        } else {
+            dev.supported_rates
+                .iter()
+                .map(|r| format!("{:.1}k", f64::from(*r) / 1_000.0))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let tag = if dev.is_usb_dac { " [USB DAC]" } else { "" };
+        lines.push(format!(
+            "  {}  {}{}  rates=[{}]",
+            dev.hw_id, dev.display_name, tag, rates
+        ));
+    }
+    Ok(lines.join("\n"))
 }
 
 fn cmd_storage(action: StorageAction, paths: &AppPaths, json_mode: bool) -> Result<String, String> {
