@@ -14,9 +14,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_channel::{Receiver, Sender};
 use bitchord_audio::{
-    AudioDecoder, AudioEngine, EqTuningSnapshot, MprisCommand, MprisService, MprisState,
-    PlaybackSnapshot, PlaybackState, PlaybackStatus, RefusalCallback, build_mpris_metadata,
-    open_http_decoder,
+    AudioDecoder, AudioEngine, DecodedPacket, EqTuningSnapshot, MprisCommand, MprisService,
+    MprisState, PlaybackSnapshot, PlaybackState, PlaybackStatus, RefusalCallback,
+    build_mpris_metadata, open_http_decoder,
 };
 use bitchord_dsp_core::{EqCurve, EqLayout, EqualizerPreset, manual_curve};
 use bitchord_innertube::{
@@ -290,11 +290,16 @@ struct PartyRuntime {
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Minimum decoded audio buffered off-thread before starting PipeWire playback
+/// so the opening notes play cleanly from exact sample 0 without skipping or stuttering.
+const INITIAL_PREBUFFER_MS: u64 = 600;
+
 enum InternalTrackMsg {
     Ready {
         generation: u64,
         song: Song,
         decoder: Box<AudioDecoder>,
+        prebuffered: Vec<DecodedPacket>,
         loudness_db: Option<f64>,
         source_label: String,
     },
@@ -307,6 +312,7 @@ enum InternalTrackMsg {
         generation: u64,
         song: Song,
         decoder: Box<AudioDecoder>,
+        prebuffered: Vec<DecodedPacket>,
         loudness_db: Option<f64>,
         source_label: String,
     },
@@ -490,6 +496,7 @@ fn run_backend_thread(
                     generation,
                     song,
                     decoder,
+                    prebuffered,
                     loudness_db,
                     source_label,
                 } => {
@@ -498,13 +505,15 @@ fn run_backend_thread(
                     }
                     match engine.load_prepared_decoder(
                         *decoder,
+                        prebuffered,
                         song.clone(),
                         loudness_db,
                         Some(&source_label),
                     ) {
                         Ok(info) => {
-                            // Brief prebuffer (~100 ms PCM) guarantees 0 initial PipeWire underruns.
-                            engine.wait_prebuffer(100, Duration::from_millis(450));
+                            // Confirm pre-decoded opening frames are committed to rtrb
+                            // (after RT FlushDeck ack!) before unpausing PipeWire.
+                            engine.wait_prebuffer(500, Duration::from_millis(600));
                             engine.play();
                             let snap = engine.snapshot();
                             last_state = snap.state;
@@ -574,6 +583,7 @@ fn run_backend_thread(
                     generation,
                     song,
                     decoder,
+                    prebuffered,
                     loudness_db,
                     source_label,
                 } => {
@@ -582,6 +592,7 @@ fn run_backend_thread(
                     }
                     let _ = engine.preload_prepared_decoder(
                         *decoder,
+                        prebuffered,
                         song,
                         loudness_db,
                         Some(&source_label),
@@ -1656,12 +1667,13 @@ fn start_async_song_load(
             return;
         }
         match prepared {
-            Ok((decoder, loudness_db, source_label)) => {
+            Ok((decoder, prebuffered, loudness_db, source_label)) => {
                 let _ = tx
                     .send(InternalTrackMsg::Ready {
                         generation,
                         song,
                         decoder: Box::new(decoder),
+                        prebuffered,
                         loudness_db,
                         source_label,
                     })
@@ -1696,7 +1708,7 @@ fn spawn_preload_next(
         if load_gen.load(Ordering::Acquire) != generation {
             return;
         }
-        if let Ok((decoder, loudness_db, source_label)) =
+        if let Ok((decoder, prebuffered, loudness_db, source_label)) =
             prepare_track_decoder(&http, &rt_c, &resolver, &next_song, &load_gen, generation).await
             && load_gen.load(Ordering::Acquire) == generation
         {
@@ -1705,6 +1717,7 @@ fn spawn_preload_next(
                     generation,
                     song: next_song,
                     decoder: Box::new(decoder),
+                    prebuffered,
                     loudness_db,
                     source_label,
                 })
@@ -1713,6 +1726,8 @@ fn spawn_preload_next(
     });
 }
 
+type PreparedDecoderResult = (AudioDecoder, Vec<DecodedPacket>, Option<f64>, String);
+
 async fn prepare_track_decoder(
     http: &Arc<Client>,
     rt: &Handle,
@@ -1720,28 +1735,45 @@ async fn prepare_track_decoder(
     song: &Song,
     load_gen: &Arc<AtomicU64>,
     generation: u64,
-) -> Result<(AudioDecoder, Option<f64>, String), String> {
-    // 1. Local file path (instant, offline).
+) -> Result<PreparedDecoderResult, String> {
+    // 1. Local file path (instant, offline; pre-decode opening packets cleanly).
     if let Some(ref local) = song.local_path
         && Path::new(local).exists()
     {
         let p = PathBuf::from(local);
-        let dec = tokio::task::spawn_blocking(move || AudioDecoder::open_path(&p))
-            .await
-            .map_err(|e| format!("decode task join error: {e}"))?
-            .map_err(|e| e.to_string())?;
-        return Ok((dec, None, "Local".to_owned()));
+        let gen_check = Arc::clone(load_gen);
+        let (dec, prebuf) = tokio::task::spawn_blocking(move || {
+            let mut dec = AudioDecoder::open_path(&p).map_err(|e| e.to_string())?;
+            let prebuf = dec
+                .prebuffer_ms(INITIAL_PREBUFFER_MS, || {
+                    gen_check.load(Ordering::Acquire) != generation
+                })
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>((dec, prebuf))
+        })
+        .await
+        .map_err(|e| format!("decode task join error: {e}"))??;
+        return Ok((dec, prebuf, None, "Local".to_owned()));
     }
     if Path::new(&song.video_id).exists() {
         let p = PathBuf::from(&song.video_id);
-        let dec = tokio::task::spawn_blocking(move || AudioDecoder::open_path(&p))
-            .await
-            .map_err(|e| format!("decode task join error: {e}"))?
-            .map_err(|e| e.to_string())?;
-        return Ok((dec, None, "Local".to_owned()));
+        let gen_check = Arc::clone(load_gen);
+        let (dec, prebuf) = tokio::task::spawn_blocking(move || {
+            let mut dec = AudioDecoder::open_path(&p).map_err(|e| e.to_string())?;
+            let prebuf = dec
+                .prebuffer_ms(INITIAL_PREBUFFER_MS, || {
+                    gen_check.load(Ordering::Acquire) != generation
+                })
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>((dec, prebuf))
+        })
+        .await
+        .map_err(|e| format!("decode task join error: {e}"))??;
+        return Ok((dec, prebuf, None, "Local".to_owned()));
     }
 
-    // 2. Remote YouTube Music stream with automatic 403/404/410 profile-refusal retry.
+    // 2. Remote YouTube Music stream with automatic 403/404/410 profile-refusal retry
+    //    and off-thread 600 ms opening prebuffer so playback never clips the intro.
     let mut last_err = String::new();
     for attempt in 0..2 {
         if load_gen.load(Ordering::Acquire) != generation {
@@ -1769,15 +1801,20 @@ async fn prepare_track_decoder(
         let loudness = stream.loudness_db;
         let label = stream.client_name.clone();
         let stream_clone = stream.clone();
+        let gen_check = Arc::clone(load_gen);
 
         let open_res = tokio::task::spawn_blocking(move || {
-            open_http_decoder(http_clone, rt_clone, &stream_clone, Some(on_refused))
+            let mut dec = open_http_decoder(http_clone, rt_clone, &stream_clone, Some(on_refused))?;
+            let prebuf = dec.prebuffer_ms(INITIAL_PREBUFFER_MS, || {
+                gen_check.load(Ordering::Acquire) != generation
+            })?;
+            Ok::<_, bitchord_audio::EngineError>((dec, prebuf))
         })
         .await
         .map_err(|e| format!("decoder open join error: {e}"))?;
 
         match open_res {
-            Ok(dec) => return Ok((dec, loudness, label)),
+            Ok((dec, prebuf)) => return Ok((dec, prebuf, loudness, label)),
             Err(err) => {
                 last_err = err.to_string();
                 let was_refused = refused_flag.load(Ordering::Acquire)

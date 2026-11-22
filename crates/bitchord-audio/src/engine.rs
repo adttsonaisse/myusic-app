@@ -3,6 +3,7 @@
 //! `SonicStretcher`, `AudioResampler`, lock-free `rtrb` rings, PipeWire/Null RT
 //! DSP (`DspChain`), equal-power crossfade, gapless preload, and [`SleepTimer`].
 
+use std::collections::VecDeque;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
@@ -22,7 +23,7 @@ use tokio::runtime::Handle;
 
 use crate::chunked_source::{ChunkedRangeSource, RefusalCallback};
 use crate::crossfade::{CrossfadePhase, CrossfadeState, DeckId};
-use crate::decoder::{AudioDecoder, DecodedStreamInfo, DecoderError};
+use crate::decoder::{AudioDecoder, DecodedPacket, DecodedStreamInfo, DecoderError};
 use crate::dsp::{EqTuningSnapshot, loudness_db_to_linear_gain};
 use crate::output::{
     AudioBackend, NullAudioSink, OUTPUT_CHANNELS, OUTPUT_SAMPLE_RATE, OutputError, PipeWireSink,
@@ -36,6 +37,7 @@ use crate::time_stretch::{MAX_SPEED, MIN_SPEED, SonicStretcher};
 const SLEEP_FADE_MS: u64 = 2_000;
 const WORKER_IDLE_SLEEP: Duration = Duration::from_millis(2);
 const SEEK_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+const FLUSH_ACK_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -121,8 +123,12 @@ pub enum AudioSourceSpec {
         stream: Box<ResolvedStream>,
         on_refused: Option<RefusalCallback>,
     },
-    /// Already-opened decoder (allows non-blocking off-thread header probing).
-    PreparedDecoder(Box<AudioDecoder>),
+    /// Already-opened decoder plus optional opening packets decoded off-thread
+    /// so playback starts cleanly from exact sample 0 with prebuffered PCM.
+    PreparedDecoder {
+        decoder: Box<AudioDecoder>,
+        prebuffered: Vec<DecodedPacket>,
+    },
 }
 
 struct WorkerShared {
@@ -245,6 +251,7 @@ pub struct AudioEngine {
     skip_silence: bool,
     spatial_audio: bool,
     eq_snapshot: EqTuningSnapshot,
+    next_flush_epoch: u64,
 }
 
 impl AudioEngine {
@@ -283,6 +290,7 @@ impl AudioEngine {
             skip_silence: false,
             spatial_audio: false,
             eq_snapshot: EqTuningSnapshot::off(),
+            next_flush_epoch: 0,
         }
     }
 
@@ -323,6 +331,32 @@ impl AudioEngine {
     fn sync_null_commands(&mut self) {
         if let Some(null) = self.backend.as_null_mut() {
             null.drain_commands();
+        }
+    }
+
+    fn send_flush_async(&mut self, deck_id: DeckId) -> u64 {
+        self.next_flush_epoch = self.next_flush_epoch.saturating_add(1);
+        let epoch = self.next_flush_epoch;
+        self.send_rt(RtCommand::FlushDeck {
+            deck: deck_id,
+            epoch,
+        });
+        epoch
+    }
+
+    /// Sends a monotonically tagged `FlushDeck` and waits until the RT audio thread
+    /// acknowledges completing that exact epoch, guaranteeing that newly pushed
+    /// opening samples of the next track (or post-seek audio) can NEVER be wiped
+    /// by a delayed flush sitting in the command ring.
+    fn flush_deck_sync(&mut self, deck_id: DeckId) {
+        let target_epoch = self.send_flush_async(deck_id);
+        self.sync_null_commands();
+        let deadline = Instant::now() + FLUSH_ACK_TIMEOUT;
+        while self.metrics.flush_ack(deck_id) < target_epoch {
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -408,11 +442,12 @@ impl AudioEngine {
         Ok(info)
     }
 
-    /// Loads an already-opened [`AudioDecoder`] onto the active deck without
-    /// blocking on HTTP range header probing on the calling thread.
+    /// Loads an already-opened [`AudioDecoder`] (plus any opening packets pre-decoded
+    /// off-thread) onto the active deck without blocking on HTTP probing.
     pub fn load_prepared_decoder(
         &mut self,
         decoder: AudioDecoder,
+        prebuffered: Vec<DecodedPacket>,
         song: Song,
         loudness_db: Option<f64>,
         source_label: Option<&str>,
@@ -421,7 +456,10 @@ impl AudioEngine {
         self.stop();
         let info = self.load_into_deck(
             active,
-            AudioSourceSpec::PreparedDecoder(Box::new(decoder)),
+            AudioSourceSpec::PreparedDecoder {
+                decoder: Box::new(decoder),
+                prebuffered,
+            },
             song,
             loudness_db,
             source_label,
@@ -431,11 +469,12 @@ impl AudioEngine {
         Ok(info)
     }
 
-    /// Preloads an already-opened [`AudioDecoder`] onto the standby deck for
-    /// instant gapless or crossfade transitions.
+    /// Preloads an already-opened [`AudioDecoder`] (plus optional pre-decoded packets)
+    /// onto the standby deck for instant gapless or crossfade transitions.
     pub fn preload_prepared_decoder(
         &mut self,
         decoder: AudioDecoder,
+        prebuffered: Vec<DecodedPacket>,
         song: Song,
         loudness_db: Option<f64>,
         source_label: Option<&str>,
@@ -443,7 +482,10 @@ impl AudioEngine {
         let standby = self.crossfade.active_deck.other();
         self.load_into_deck(
             standby,
-            AudioSourceSpec::PreparedDecoder(Box::new(decoder)),
+            AudioSourceSpec::PreparedDecoder {
+                decoder: Box::new(decoder),
+                prebuffered,
+            },
             song,
             loudness_db,
             source_label,
@@ -541,10 +583,10 @@ impl AudioEngine {
         loudness_db: Option<f64>,
         source_label: Option<&str>,
     ) -> Result<DecodedStreamInfo, EngineError> {
-        // Stop any existing worker on this deck and flush its ring buffer.
+        // Stop any existing worker on this deck and wait until the RT thread has
+        // actually flushed its ring buffer so sample 0 of the new track is never dropped.
         self.deck_mut(deck_id).stop_worker();
-        self.send_rt(RtCommand::FlushDeck(deck_id));
-        self.sync_null_commands();
+        self.flush_deck_sync(deck_id);
 
         let output_rate = self.output_sample_rate();
         let speed = self.speed;
@@ -653,8 +695,8 @@ impl AudioEngine {
         self.send_rt(RtCommand::SetPaused(true));
         self.deck_a.stop_worker();
         self.deck_b.stop_worker();
-        self.send_rt(RtCommand::FlushDeck(DeckId::A));
-        self.send_rt(RtCommand::FlushDeck(DeckId::B));
+        self.send_flush_async(DeckId::A);
+        self.send_flush_async(DeckId::B);
         self.crossfade.phase = CrossfadePhase::Idle;
         self.crossfade.handed_off = false;
         self.send_active_solo_gains();
@@ -668,7 +710,7 @@ impl AudioEngine {
         if self.crossfade.is_transitioning() {
             self.crossfade.phase = CrossfadePhase::Idle;
             self.deck_mut(active.other()).stop_worker();
-            self.send_rt(RtCommand::FlushDeck(active.other()));
+            self.send_flush_async(active.other());
             self.send_active_solo_gains();
         }
 
@@ -695,8 +737,7 @@ impl AudioEngine {
             thread::sleep(Duration::from_millis(1));
         }
 
-        self.send_rt(RtCommand::FlushDeck(active));
-        self.sync_null_commands();
+        self.flush_deck_sync(active);
         shared.seek_gate.store(false, Ordering::Release);
 
         if self.state == PlaybackState::Ended {
@@ -842,7 +883,7 @@ impl AudioEngine {
                     CrossfadePhase::Fading => {
                         let outgoing = self.crossfade_outgoing;
                         self.deck_mut(outgoing).stop_worker();
-                        self.send_rt(RtCommand::FlushDeck(outgoing));
+                        self.send_flush_async(outgoing);
                         self.send_active_solo_gains();
                     }
                     _ => {
@@ -875,7 +916,7 @@ impl AudioEngine {
                 self.send_rt(RtCommand::StreamBoundary(standby));
                 self.send_active_solo_gains();
                 self.deck_mut(active).stop_worker();
-                self.send_rt(RtCommand::FlushDeck(active));
+                self.send_flush_async(active);
                 self.sync_null_commands();
             } else {
                 self.send_rt(RtCommand::SetPaused(true));
@@ -1028,26 +1069,34 @@ pub fn open_http_decoder(
     Ok(AudioDecoder::open_source(Box::new(source), hint)?)
 }
 
-fn open_decoder_for_spec(spec: AudioSourceSpec) -> Result<AudioDecoder, EngineError> {
+fn open_decoder_for_spec(
+    spec: AudioSourceSpec,
+) -> Result<(AudioDecoder, VecDeque<DecodedPacket>), EngineError> {
     match spec {
-        AudioSourceSpec::LocalFile(path) => Ok(AudioDecoder::open_path(&path)?),
+        AudioSourceSpec::LocalFile(path) => Ok((AudioDecoder::open_path(&path)?, VecDeque::new())),
         AudioSourceSpec::MemoryBytes { bytes, extension } => {
             let mut hint = Hint::new();
             if let Some(ext) = extension {
                 hint.with_extension(&ext);
             }
-            Ok(AudioDecoder::open_source(
-                Box::new(Cursor::new(bytes)),
-                hint,
-            )?)
+            Ok((
+                AudioDecoder::open_source(Box::new(Cursor::new(bytes)), hint)?,
+                VecDeque::new(),
+            ))
         }
         AudioSourceSpec::HttpStream {
             http,
             rt,
             stream,
             on_refused,
-        } => open_http_decoder(http, rt, &stream, on_refused),
-        AudioSourceSpec::PreparedDecoder(dec) => Ok(*dec),
+        } => Ok((
+            open_http_decoder(http, rt, &stream, on_refused)?,
+            VecDeque::new(),
+        )),
+        AudioSourceSpec::PreparedDecoder {
+            decoder,
+            prebuffered,
+        } => Ok((*decoder, VecDeque::from(prebuffered))),
     }
 }
 
@@ -1077,8 +1126,8 @@ fn run_decode_worker(
     shared: Arc<WorkerShared>,
     ready_tx: std_mpsc::SyncSender<Result<DecodedStreamInfo, EngineError>>,
 ) -> Producer<f32> {
-    let mut decoder = match open_decoder_for_spec(spec) {
-        Ok(dec) => dec,
+    let (mut decoder, mut prebuffered) = match open_decoder_for_spec(spec) {
+        Ok(pair) => pair,
         Err(err) => {
             let _ = ready_tx.send(Err(err));
             return producer;
@@ -1117,6 +1166,7 @@ fn run_decode_worker(
         let pending_seek = shared.seek_target_ms.swap(-1, Ordering::AcqRel);
         if pending_seek >= 0 {
             let target = pending_seek as u64;
+            prebuffered.clear();
             match decoder.seek_ms(target) {
                 Ok(actual_ms) => {
                     skip_proc.reset();
@@ -1155,8 +1205,14 @@ fn run_decode_worker(
         skip_proc.enabled = shared.skip_silence.load(Ordering::Relaxed);
         stretcher.set_speed(f32::from_bits(shared.speed_bits.load(Ordering::Relaxed)));
 
-        // 3. Decode -> SkipSilence -> SonicStretcher -> AudioResampler -> rtrb Producer.
-        match decoder.next_packet() {
+        // 3. Drain pre-decoded opening packets first (zero network latency!), then decode live.
+        let next_pkt = if let Some(pkt) = prebuffered.pop_front() {
+            Ok(Some(pkt))
+        } else {
+            decoder.next_packet()
+        };
+
+        match next_pkt {
             Ok(Some(pkt)) => {
                 skip_proc.process(&pkt.samples, &mut skip_buf);
                 shared
@@ -1328,6 +1384,62 @@ mod tests {
         assert!(
             report.rendered_duration_ms >= 470 && report.rendered_duration_ms <= 530,
             "total_gapless_ms={}",
+            report.rendered_duration_ms
+        );
+    }
+
+    #[test]
+    fn prepared_prebuffered_track_preserves_opening_samples_and_full_duration() {
+        let wav_old = build_test_wav_pcm16(48_000, 220.0, 400);
+        let wav_new = build_test_wav_pcm16(48_000, 440.0, 800);
+
+        let mut engine = AudioEngine::with_null_sink();
+        engine
+            .load_bytes(
+                wav_old,
+                Some("wav".to_owned()),
+                Song::new("old", "Old Track", "Artist", None),
+                None,
+            )
+            .expect("load old");
+        engine.wait_prebuffer(50, Duration::from_millis(500));
+        engine.play();
+        let _ = engine.render_null_frames(1_024).expect("render old");
+
+        // Pre-decode 500 ms off-thread just like `bitchord-desktop/src/backend.rs`.
+        let mut hint = Hint::new();
+        hint.with_extension("wav");
+        let mut dec =
+            AudioDecoder::open_source(Box::new(Cursor::new(wav_new)), hint).expect("open new wav");
+        let prebuf = dec.prebuffer_ms(500, || false).expect("prebuffer 500ms");
+        assert!(
+            !prebuf.is_empty(),
+            "expected prebuffered opening packets before play"
+        );
+        let first_pkt_peak = prebuf[0]
+            .samples
+            .iter()
+            .fold(0.0_f32, |m, &s| m.max(s.abs()));
+        assert!(first_pkt_peak > 0.2, "expected audible opening packet");
+
+        engine
+            .load_prepared_decoder(
+                dec,
+                prebuf,
+                Song::new("new", "New Track", "Artist", None),
+                None,
+                Some("Test"),
+            )
+            .expect("load prepared");
+        engine.wait_prebuffer(500, Duration::from_millis(500));
+
+        let report = engine
+            .drain_to_eof_null(None)
+            .expect("drain prepared track");
+        assert_eq!(report.underruns, 0);
+        assert!(
+            report.rendered_duration_ms >= 770 && report.rendered_duration_ms <= 830,
+            "opening frames must not be clipped: got {}ms",
             report.rendered_duration_ms
         );
     }

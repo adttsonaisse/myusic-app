@@ -75,7 +75,10 @@ pub enum RtCommand {
     SetMuted(bool),
     SetPaused(bool),
     StreamBoundary(DeckId),
-    FlushDeck(DeckId),
+    FlushDeck {
+        deck: DeckId,
+        epoch: u64,
+    },
     ResetPlayedFrames(DeckId),
 }
 
@@ -84,6 +87,8 @@ pub enum RtCommand {
 pub struct RtMetrics {
     played_frames_a: AtomicU64,
     played_frames_b: AtomicU64,
+    flush_ack_a: AtomicU64,
+    flush_ack_b: AtomicU64,
     underrun_count: AtomicU64,
     peak_level_bits: AtomicU32,
     paused: AtomicBool,
@@ -94,6 +99,13 @@ impl RtMetrics {
         match deck {
             DeckId::A => self.played_frames_a.load(Ordering::Acquire),
             DeckId::B => self.played_frames_b.load(Ordering::Acquire),
+        }
+    }
+
+    pub fn flush_ack(&self, deck: DeckId) -> u64 {
+        match deck {
+            DeckId::A => self.flush_ack_a.load(Ordering::Acquire),
+            DeckId::B => self.flush_ack_b.load(Ordering::Acquire),
         }
     }
 
@@ -124,6 +136,17 @@ impl RtMetrics {
         match deck {
             DeckId::A => self.played_frames_a.store(0, Ordering::Release),
             DeckId::B => self.played_frames_b.store(0, Ordering::Release),
+        }
+    }
+
+    fn set_flush_ack(&self, deck: DeckId, epoch: u64) {
+        match deck {
+            DeckId::A => {
+                self.flush_ack_a.store(epoch, Ordering::Release);
+            }
+            DeckId::B => {
+                self.flush_ack_b.store(epoch, Ordering::Release);
+            }
         }
     }
 }
@@ -260,7 +283,7 @@ impl RtMixerState {
                     DeckId::A => self.dsp_a.on_stream_boundary(),
                     DeckId::B => self.dsp_b.on_stream_boundary(),
                 },
-                RtCommand::FlushDeck(deck) => {
+                RtCommand::FlushDeck { deck, epoch } => {
                     match deck {
                         DeckId::A => {
                             drain_ring(&mut self.rx_a);
@@ -274,6 +297,7 @@ impl RtMixerState {
                         }
                     }
                     self.metrics.reset_played_frames(deck);
+                    self.metrics.set_flush_ack(deck, epoch);
                 }
                 RtCommand::ResetPlayedFrames(deck) => {
                     self.metrics.reset_played_frames(deck);
@@ -770,9 +794,15 @@ mod tests {
         let _ = sink.render_frames(512);
         assert!(prod.metrics.underruns() >= 1);
 
-        // FlushDeck resets played frames and drains cleanly.
-        prod.commands.push(RtCommand::FlushDeck(DeckId::A)).unwrap();
+        // FlushDeck resets played frames, acknowledges epoch, and drains cleanly.
+        prod.commands
+            .push(RtCommand::FlushDeck {
+                deck: DeckId::A,
+                epoch: 7,
+            })
+            .unwrap();
         let _ = sink.render_frames(16);
         assert_eq!(prod.metrics.played_frames(DeckId::A), 0);
+        assert_eq!(prod.metrics.flush_ack(DeckId::A), 7);
     }
 }

@@ -199,6 +199,32 @@ impl AudioDecoder {
         &self.info
     }
 
+    /// Pre-decodes at least `min_ms` of opening audio packets starting from exact
+    /// sample 0 so playback can begin immediately without network stall or clipped intro.
+    /// Returns early if `should_cancel()` becomes `true` or EOF is reached.
+    pub fn prebuffer_ms(
+        &mut self,
+        min_ms: u64,
+        should_cancel: impl Fn() -> bool,
+    ) -> Result<Vec<DecodedPacket>, DecoderError> {
+        let target_frames = (u64::from(self.info.sample_rate_hz.max(1)) * min_ms) / 1_000;
+        let mut packets = Vec::new();
+        let mut frames_acc = 0u64;
+        while frames_acc < target_frames {
+            if should_cancel() {
+                break;
+            }
+            match self.next_packet()? {
+                Some(pkt) => {
+                    frames_acc = frames_acc.saturating_add(pkt.frames as u64);
+                    packets.push(pkt);
+                }
+                None => break,
+            }
+        }
+        Ok(packets)
+    }
+
     /// Seeks to `position_ms` (accurate mode when supported) and resets the codec state.
     pub fn seek_ms(&mut self, position_ms: u64) -> Result<u64, DecoderError> {
         let target = SeekTo::Time {
