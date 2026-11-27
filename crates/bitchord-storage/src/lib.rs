@@ -17,7 +17,11 @@ pub mod secrets;
 pub mod settings;
 pub mod tagger;
 
-pub use db::{DbError, DbStats, LibraryDb, ListeningRecord, LocalPlaylist};
+pub use db::{
+    CachedLyrics, CachedStream, DEFAULT_LYRICS_CACHE_TTL_MS, DEFAULT_LYRICS_NOT_FOUND_TTL_MS,
+    DEFAULT_STREAM_CACHE_TTL_MS, DbError, DbStats, LibraryDb, ListeningRecord, LocalPlaylist,
+    SongMetadata, format_duration_ms,
+};
 pub use downloads::{
     Container, DownloadStore, DownloadStoreError, MAX_STEM_CHARS, PendingDownload, Probe,
     SavedCollection, SavedSongMetadata, Storable, estimated_kbps, resolved_download_dates, sniff,
