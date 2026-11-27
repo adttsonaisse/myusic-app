@@ -18,10 +18,11 @@ pub mod settings;
 pub mod tagger;
 
 pub use db::{
-    ArtworkIndexEntry, CachedLyrics, CachedStream, DEFAULT_ARTWORK_CACHE_MAX_BYTES,
-    DEFAULT_LYRICS_CACHE_TTL_MS, DEFAULT_LYRICS_NOT_FOUND_TTL_MS, DEFAULT_STREAM_CACHE_TTL_MS,
-    DbError, DbStats, LibraryDb, ListeningRecord, LocalPlaylist, SearchHistoryRecord,
-    SongMetadata, format_duration_ms,
+    ArtworkIndexEntry, CachedBrowseEntry, CachedLyrics, CachedStream,
+    DEFAULT_ARTWORK_CACHE_MAX_BYTES, DEFAULT_BROWSE_CACHE_TTL_MS, DEFAULT_LYRICS_CACHE_TTL_MS,
+    DEFAULT_LYRICS_NOT_FOUND_TTL_MS, DEFAULT_STREAM_CACHE_TTL_MS, DbError, DbStats, LibraryDb,
+    ListeningRecord, LocalPlaylist, PlaybackSessionState, SearchHistoryRecord, SongMetadata,
+    format_duration_ms,
 };
 pub use downloads::{
     Container, DownloadStore, DownloadStoreError, MAX_STEM_CHARS, PendingDownload, Probe,
@@ -33,9 +34,10 @@ pub use secrets::{
     InMemorySecretStore, KeyringSecretStore, SecretError, SecretKey, SecretStore, SecretValue,
 };
 pub use settings::{
-    AppFont, AppSettingsData, AudioOutputPreference, DEFAULT_UPGRADE_LENGTH_SLACK_SECONDS,
-    DownloadQuality, EqualizerMode, LocalMusicSort, OutputPcmMode, SettingsError, SettingsStore,
-    SmbSettings, SongSort, StreamRequest, ThemeMode, WebDavSettings, request_for_download,
+    AppFont, AppSettingsData, AudioOutputPreference, DEFAULT_EQ_BAND_COUNT,
+    DEFAULT_UPGRADE_LENGTH_SLACK_SECONDS, DownloadQuality, EqualizerMode, LocalMusicSort,
+    OutputPcmMode, SettingsError, SettingsStore, SmbSettings, SongSort, StreamRequest, ThemeMode,
+    WebDavSettings, request_for_download,
 };
 pub use tagger::{
     EmbeddedLyrics, FlacHeaderRewrite, FlacTagger, LocalAudioTags, Mp4Tagger, WebmTagger,

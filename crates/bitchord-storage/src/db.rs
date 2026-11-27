@@ -18,13 +18,16 @@ use thiserror::Error;
 
 use crate::downloads::{SavedCollection, SavedSongMetadata};
 
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 const MAX_SEARCH_HISTORY: usize = 20;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 const CACHE_SIZE_KIB: i64 = -16_000;
 
 /// Default disk budget (128 MiB) for LRU pruning of the `artwork_index` table.
 pub const DEFAULT_ARTWORK_CACHE_MAX_BYTES: i64 = 128 * 1024 * 1024;
+
+/// Default TTL (15 minutes) for cached browse pages (`home`, `artist`, `album`, `playlist`).
+pub const DEFAULT_BROWSE_CACHE_TTL_MS: i64 = 15 * 60 * 1_000;
 
 /// Default TTL (4 hours) for cached stream URLs when callers do not derive an
 /// explicit `expire` timestamp from the URL.
@@ -132,6 +135,80 @@ pub struct ArtworkIndexEntry {
     pub byte_size: i64,
     pub last_accessed_ms: i64,
     pub created_at_ms: i64,
+}
+
+fn default_session_repeat_mode() -> String {
+    "off".to_owned()
+}
+
+/// Persistent snapshot of the playback queue & transport state for seamless
+/// auto-save/restore across restarts (`playback_session` single-row table `id = 1`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackSessionState {
+    #[serde(default)]
+    pub queue: Vec<Song>,
+    #[serde(default)]
+    pub original_order: Option<Vec<Song>>,
+    #[serde(default)]
+    pub current_index: Option<usize>,
+    #[serde(default)]
+    pub position_ms: u64,
+    #[serde(default)]
+    pub shuffle: bool,
+    #[serde(default = "default_session_repeat_mode")]
+    pub repeat_mode: String,
+    #[serde(default)]
+    pub autoplay_start_index: Option<usize>,
+    #[serde(default)]
+    pub updated_at_ms: i64,
+}
+
+impl Default for PlaybackSessionState {
+    fn default() -> Self {
+        Self {
+            queue: Vec::new(),
+            original_order: None,
+            current_index: None,
+            position_ms: 0,
+            shuffle: false,
+            repeat_mode: default_session_repeat_mode(),
+            autoplay_start_index: None,
+            updated_at_ms: 0,
+        }
+    }
+}
+
+/// Persistent SQLite cache entry for browsed pages (`home`, `artist`, `album`,
+/// `playlist`) with explicit TTL expiry timestamps in Unix epoch milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedBrowseEntry {
+    pub cache_key: String,
+    pub kind: String,
+    pub payload_json: String,
+    pub updated_at_ms: i64,
+    pub expires_at_ms: i64,
+}
+
+impl CachedBrowseEntry {
+    /// Builds a browse cache entry stamped with the current wall clock and a
+    /// relative `ttl_ms` expiration window.
+    pub fn with_ttl(
+        cache_key: impl Into<String>,
+        kind: impl Into<String>,
+        payload_json: impl Into<String>,
+        ttl_ms: i64,
+    ) -> Self {
+        let now = unix_now_ms();
+        Self {
+            cache_key: cache_key.into(),
+            kind: kind.into(),
+            payload_json: payload_json.into(),
+            updated_at_ms: now,
+            expires_at_ms: now.saturating_add(ttl_ms.max(0)),
+        }
+    }
 }
 
 /// Rich search history entry including optional v4 track/album metadata
@@ -566,6 +643,69 @@ impl LibraryDb {
                     ON songs (liked_at DESC) WHERE is_liked = 1;
                 "#,
             )?;
+            tx.pragma_update(None, "user_version", 4)?;
+            tx.commit()?;
+        }
+        if version < 5 {
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS playback_session (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    queue_json TEXT NOT NULL,
+                    original_order_json TEXT,
+                    current_index INTEGER,
+                    position_ms INTEGER NOT NULL DEFAULT 0,
+                    shuffle INTEGER NOT NULL DEFAULT 0,
+                    repeat_mode TEXT NOT NULL DEFAULT 'off',
+                    autoplay_start_index INTEGER,
+                    updated_at_ms INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS browse_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    expires_at_ms INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_browse_cache_expires_at
+                    ON browse_cache (expires_at_ms);
+
+                CREATE INDEX IF NOT EXISTS idx_local_playlist_tracks_video_id
+                    ON local_playlist_tracks (playlist_id, video_id);
+
+                CREATE VIRTUAL TABLE IF NOT EXISTS songs_fts USING fts5(
+                    video_id UNINDEXED,
+                    title,
+                    artist,
+                    album_name,
+                    content='songs',
+                    content_rowid='rowid',
+                    tokenize='unicode61 remove_diacritics 2'
+                );
+
+                CREATE TRIGGER IF NOT EXISTS songs_fts_ai AFTER INSERT ON songs BEGIN
+                    INSERT INTO songs_fts(rowid, video_id, title, artist, album_name)
+                    VALUES (new.rowid, new.video_id, new.title, new.artist, new.album_name);
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS songs_fts_ad AFTER DELETE ON songs BEGIN
+                    INSERT INTO songs_fts(songs_fts, rowid, video_id, title, artist, album_name)
+                    VALUES ('delete', old.rowid, old.video_id, old.title, old.artist, old.album_name);
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS songs_fts_au
+                AFTER UPDATE OF video_id, title, artist, album_name ON songs BEGIN
+                    INSERT INTO songs_fts(songs_fts, rowid, video_id, title, artist, album_name)
+                    VALUES ('delete', old.rowid, old.video_id, old.title, old.artist, old.album_name);
+                    INSERT INTO songs_fts(rowid, video_id, title, artist, album_name)
+                    VALUES (new.rowid, new.video_id, new.title, new.artist, new.album_name);
+                END;
+
+                INSERT INTO songs_fts(songs_fts) VALUES('rebuild');
+                "#,
+            )?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
         }
@@ -767,6 +907,9 @@ impl LibraryDb {
     }
 
     pub fn search_cached_songs(&self, query: &str, limit: usize) -> Result<Vec<Song>, DbError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let trimmed = query.trim();
         if trimmed.is_empty() {
             let mut stmt = self.conn.prepare(
@@ -781,6 +924,26 @@ impl LibraryDb {
             )?;
             let rows = stmt.query_map(params![limit as i64], row_to_song)?;
             return Ok(rows.collect::<Result<Vec<_>, _>>()?);
+        }
+
+        if let Some(fts_query) = build_fts5_prefix_query(trimmed) {
+            let mut stmt = self.conn.prepare(
+                r#"
+                SELECT s.video_id, s.title, s.artist, s.thumbnail_url, s.duration_text,
+                       s.album_name, s.album_id, s.artist_id,
+                       s.is_explicit, s.is_video, s.local_uri, s.local_path, s.duration_ms
+                FROM songs_fts f
+                JOIN songs s ON s.rowid = f.rowid
+                WHERE songs_fts MATCH ?1
+                ORDER BY bm25(songs_fts, 0.0, 4.0, 2.0, 1.0) ASC, s.updated_at DESC
+                LIMIT ?2
+                "#,
+            )?;
+            let fts_rows = stmt.query_map(params![fts_query, limit as i64], row_to_song)?;
+            let results = fts_rows.collect::<Result<Vec<_>, _>>()?;
+            if !results.is_empty() {
+                return Ok(results);
+            }
         }
 
         let pattern = format!("%{trimmed}%");
@@ -1268,6 +1431,208 @@ impl LibraryDb {
             params![playlist_id],
         )?;
         Ok(())
+    }
+
+    /// Renames an existing local playlist and bumps `updated_at`.
+    /// Returns `false` if `new_name` is blank or no playlist matched `playlist_id`.
+    pub fn rename_playlist(&self, playlist_id: &str, new_name: &str) -> Result<bool, DbError> {
+        let trimmed = new_name.trim();
+        if trimmed.is_empty() {
+            return Ok(false);
+        }
+        let changed = self.conn.execute(
+            "UPDATE local_playlists SET title = ?2, updated_at = ?3 WHERE id = ?1",
+            params![playlist_id, trimmed, unix_now_ms()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Appends `song` to a local playlist, auto-upserting it into `songs` first.
+    /// Avoids duplicate entries for the same `video_id` within `playlist_id` and
+    /// updates `local_playlists.updated_at`. Returns `true` if the track was added,
+    /// or `false` if the playlist does not exist or already contains `song.video_id`.
+    pub fn add_song_to_playlist(&self, playlist_id: &str, song: &Song) -> Result<bool, DbError> {
+        let now = unix_now_ms();
+        let tx = self.conn.unchecked_transaction()?;
+        let playlist_exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM local_playlists WHERE id = ?1",
+                params![playlist_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !playlist_exists {
+            return Ok(false);
+        }
+
+        upsert_song_in_tx(&tx, song, now)?;
+
+        let already_in_playlist: bool = tx
+            .query_row(
+                "SELECT 1 FROM local_playlist_tracks WHERE playlist_id = ?1 AND video_id = ?2 LIMIT 1",
+                params![playlist_id, song.video_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if already_in_playlist {
+            tx.commit()?;
+            return Ok(false);
+        }
+
+        let next_position: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(position) + 1, 0) FROM local_playlist_tracks WHERE playlist_id = ?1",
+            params![playlist_id],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO local_playlist_tracks (playlist_id, position, video_id) VALUES (?1, ?2, ?3)",
+            params![playlist_id, next_position, song.video_id],
+        )?;
+        tx.execute(
+            "UPDATE local_playlists SET updated_at = ?2 WHERE id = ?1",
+            params![playlist_id, now],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Removes `video_id` from `playlist_id`, compacts remaining `position` values
+    /// to a contiguous `0..n` range, and bumps `local_playlists.updated_at`.
+    /// Returns `true` if at least one row was removed.
+    pub fn remove_song_from_playlist(
+        &self,
+        playlist_id: &str,
+        video_id: &str,
+    ) -> Result<bool, DbError> {
+        let now = unix_now_ms();
+        let tx = self.conn.unchecked_transaction()?;
+        let deleted = tx.execute(
+            "DELETE FROM local_playlist_tracks WHERE playlist_id = ?1 AND video_id = ?2",
+            params![playlist_id, video_id],
+        )?;
+        if deleted == 0 {
+            return Ok(false);
+        }
+
+        let remaining: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT video_id FROM local_playlist_tracks WHERE playlist_id = ?1 ORDER BY position ASC",
+            )?;
+            let rows = stmt.query_map(params![playlist_id], |row| row.get(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        tx.execute(
+            "DELETE FROM local_playlist_tracks WHERE playlist_id = ?1",
+            params![playlist_id],
+        )?;
+        {
+            let mut insert_stmt = tx.prepare(
+                "INSERT INTO local_playlist_tracks (playlist_id, position, video_id) VALUES (?1, ?2, ?3)",
+            )?;
+            for (pos, vid) in remaining.iter().enumerate() {
+                insert_stmt.execute(params![playlist_id, pos as i64, vid])?;
+            }
+        }
+        tx.execute(
+            "UPDATE local_playlists SET updated_at = ?2 WHERE id = ?1",
+            params![playlist_id, now],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Moves a track within `playlist_id` from `from_idx` to `to_idx` (0-based),
+    /// rewriting contiguous `0..n` positions and bumping `updated_at`.
+    /// Returns `false` if either index is out of bounds or `from_idx == to_idx`.
+    pub fn reorder_playlist_track(
+        &self,
+        playlist_id: &str,
+        from_idx: usize,
+        to_idx: usize,
+    ) -> Result<bool, DbError> {
+        let now = unix_now_ms();
+        let tx = self.conn.unchecked_transaction()?;
+        let mut tracks: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT video_id FROM local_playlist_tracks WHERE playlist_id = ?1 ORDER BY position ASC",
+            )?;
+            let rows = stmt.query_map(params![playlist_id], |row| row.get(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if from_idx >= tracks.len() || to_idx >= tracks.len() || from_idx == to_idx {
+            return Ok(false);
+        }
+
+        let moved = tracks.remove(from_idx);
+        tracks.insert(to_idx, moved);
+
+        tx.execute(
+            "DELETE FROM local_playlist_tracks WHERE playlist_id = ?1",
+            params![playlist_id],
+        )?;
+        {
+            let mut insert_stmt = tx.prepare(
+                "INSERT INTO local_playlist_tracks (playlist_id, position, video_id) VALUES (?1, ?2, ?3)",
+            )?;
+            for (pos, vid) in tracks.iter().enumerate() {
+                insert_stmt.execute(params![playlist_id, pos as i64, vid])?;
+            }
+        }
+        tx.execute(
+            "UPDATE local_playlists SET updated_at = ?2 WHERE id = ?1",
+            params![playlist_id, now],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Returns all [`Song`] rows in `playlist_id` ordered by `position ASC` via
+    /// a direct join against `songs`.
+    pub fn playlist_songs(&self, playlist_id: &str) -> Result<Vec<Song>, DbError> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT s.video_id, s.title, s.artist, s.thumbnail_url, s.duration_text,
+                   s.album_name, s.album_id, s.artist_id,
+                   s.is_explicit, s.is_video, s.local_uri, s.local_path, s.duration_ms
+            FROM local_playlist_tracks t
+            JOIN songs s ON s.video_id = t.video_id
+            WHERE t.playlist_id = ?1
+            ORDER BY t.position ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![playlist_id], row_to_song)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Lists all local playlists along with their track counts in a single
+    /// `LEFT JOIN` + `GROUP BY` query (avoiding N+1 queries in the Library UI).
+    pub fn list_playlist_summaries(&self) -> Result<Vec<(LocalPlaylist, usize)>, DbError> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT p.id, p.title, p.description, p.thumbnail_url, p.source,
+                   p.created_at, p.updated_at, COUNT(t.video_id) AS track_count
+            FROM local_playlists p
+            LEFT JOIN local_playlist_tracks t ON t.playlist_id = p.id
+            GROUP BY p.id
+            ORDER BY p.updated_at DESC, p.created_at DESC, p.id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let playlist = LocalPlaylist {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                description: row.get(2)?,
+                thumbnail_url: row.get(3)?,
+                source: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+            };
+            let count = row.get::<_, i64>(7)?.max(0) as usize;
+            Ok((playlist, count))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     // ---- Downloads & collections --------------------------------------------
@@ -1785,6 +2150,220 @@ impl LibraryDb {
         Ok(evicted_paths)
     }
 
+    // ---- Playback session persistence (single-row id = 1) -------------------
+
+    /// Persists the current playback queue & transport snapshot to row `id = 1`
+    /// of `playback_session` for automatic restore on next launch.
+    pub fn save_playback_session(&self, state: &PlaybackSessionState) -> Result<(), DbError> {
+        let queue_json = serde_json::to_string(&state.queue)?;
+        let original_order_json = match &state.original_order {
+            Some(order) => Some(serde_json::to_string(order)?),
+            None => None,
+        };
+        let current_index = state.current_index.map(|i| i as i64);
+        let autoplay_start_index = state.autoplay_start_index.map(|i| i as i64);
+        let repeat_mode = {
+            let trimmed = state.repeat_mode.trim();
+            if trimmed.is_empty() { "off" } else { trimmed }
+        };
+        let updated_at_ms = if state.updated_at_ms > 0 {
+            state.updated_at_ms
+        } else {
+            unix_now_ms()
+        };
+        self.conn.execute(
+            r#"
+            INSERT INTO playback_session (
+                id, queue_json, original_order_json, current_index, position_ms,
+                shuffle, repeat_mode, autoplay_start_index, updated_at_ms
+            ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ON CONFLICT(id) DO UPDATE SET
+                queue_json = excluded.queue_json,
+                original_order_json = excluded.original_order_json,
+                current_index = excluded.current_index,
+                position_ms = excluded.position_ms,
+                shuffle = excluded.shuffle,
+                repeat_mode = excluded.repeat_mode,
+                autoplay_start_index = excluded.autoplay_start_index,
+                updated_at_ms = excluded.updated_at_ms
+            "#,
+            params![
+                queue_json,
+                original_order_json,
+                current_index,
+                state.position_ms as i64,
+                i32::from(state.shuffle),
+                repeat_mode,
+                autoplay_start_index,
+                updated_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Loads the saved playback session snapshot if one exists.
+    pub fn load_playback_session(&self) -> Result<Option<PlaybackSessionState>, DbError> {
+        #[allow(clippy::type_complexity)]
+        let raw_row: Option<(
+            String,
+            Option<String>,
+            Option<i64>,
+            i64,
+            i32,
+            String,
+            Option<i64>,
+            i64,
+        )> = self
+            .conn
+            .query_row(
+                r#"
+                SELECT queue_json, original_order_json, current_index, position_ms,
+                       shuffle, repeat_mode, autoplay_start_index, updated_at_ms
+                FROM playback_session
+                WHERE id = 1
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((
+            queue_json,
+            original_order_json,
+            current_index,
+            position_ms,
+            shuffle,
+            repeat_mode,
+            autoplay_start_index,
+            updated_at_ms,
+        )) = raw_row
+        else {
+            return Ok(None);
+        };
+
+        let queue: Vec<Song> = serde_json::from_str(&queue_json)?;
+        let original_order = match original_order_json {
+            Some(raw) => Some(serde_json::from_str(&raw)?),
+            None => None,
+        };
+        Ok(Some(PlaybackSessionState {
+            queue,
+            original_order,
+            current_index: current_index.and_then(|v| usize::try_from(v).ok()),
+            position_ms: position_ms.max(0) as u64,
+            shuffle: shuffle != 0,
+            repeat_mode,
+            autoplay_start_index: autoplay_start_index.and_then(|v| usize::try_from(v).ok()),
+            updated_at_ms,
+        }))
+    }
+
+    /// Clears the saved playback session row (`id = 1`).
+    /// Returns `true` if a session row existed and was deleted.
+    pub fn clear_playback_session(&self) -> Result<bool, DbError> {
+        let deleted = self
+            .conn
+            .execute("DELETE FROM playback_session WHERE id = 1", [])?;
+        Ok(deleted > 0)
+    }
+
+    // ---- Persistent browse page cache (TTL) ---------------------------------
+
+    /// Inserts or updates a cached browse page payload in `browse_cache`.
+    pub fn put_browse_cache(&self, entry: &CachedBrowseEntry) -> Result<(), DbError> {
+        let updated_at_ms = if entry.updated_at_ms > 0 {
+            entry.updated_at_ms
+        } else {
+            unix_now_ms()
+        };
+        self.conn.execute(
+            r#"
+            INSERT INTO browse_cache (
+                cache_key, kind, payload_json, updated_at_ms, expires_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                kind = excluded.kind,
+                payload_json = excluded.payload_json,
+                updated_at_ms = excluded.updated_at_ms,
+                expires_at_ms = excluded.expires_at_ms
+            "#,
+            params![
+                entry.cache_key,
+                entry.kind,
+                entry.payload_json,
+                updated_at_ms,
+                entry.expires_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Returns a non-expired browse cache entry for `cache_key` at the current wall clock.
+    pub fn get_browse_cache(&self, cache_key: &str) -> Result<Option<CachedBrowseEntry>, DbError> {
+        self.get_browse_cache_at(cache_key, unix_now_ms())
+    }
+
+    /// Returns a browse cache entry for `cache_key` if `expires_at_ms > now_ms`.
+    pub fn get_browse_cache_at(
+        &self,
+        cache_key: &str,
+        now_ms: i64,
+    ) -> Result<Option<CachedBrowseEntry>, DbError> {
+        let row = self
+            .conn
+            .query_row(
+                r#"
+                SELECT cache_key, kind, payload_json, updated_at_ms, expires_at_ms
+                FROM browse_cache
+                WHERE cache_key = ?1 AND expires_at_ms > ?2
+                "#,
+                params![cache_key, now_ms],
+                row_to_cached_browse_entry,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Deletes a single entry from `browse_cache` by `cache_key`.
+    /// Returns `true` if a row was deleted.
+    pub fn delete_browse_cache(&self, cache_key: &str) -> Result<bool, DbError> {
+        let deleted = self.conn.execute(
+            "DELETE FROM browse_cache WHERE cache_key = ?1",
+            params![cache_key],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    /// Clears all entries in `browse_cache` (e.g. on account switch or forced refresh).
+    pub fn clear_browse_cache(&self) -> Result<usize, DbError> {
+        Ok(self.conn.execute("DELETE FROM browse_cache", [])?)
+    }
+
+    /// Deletes all expired rows from `browse_cache` at the current wall clock.
+    pub fn prune_expired_browse_cache(&self) -> Result<usize, DbError> {
+        self.prune_expired_browse_cache_at(unix_now_ms())
+    }
+
+    /// Deletes all rows from `browse_cache` with `expires_at_ms <= now_ms`.
+    pub fn prune_expired_browse_cache_at(&self, now_ms: i64) -> Result<usize, DbError> {
+        let deleted = self.conn.execute(
+            "DELETE FROM browse_cache WHERE expires_at_ms <= ?1",
+            params![now_ms],
+        )?;
+        Ok(deleted)
+    }
+
     pub fn stats(&self) -> Result<DbStats, DbError> {
         self.conn
             .query_row(
@@ -1865,6 +2444,45 @@ fn normalize_search_text(raw: &str) -> String {
         .map(str::to_lowercase)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Converts arbitrary user input into a safe SQLite FTS5 prefix query
+/// (`"term1"* "term2"*`) by extracting Unicode alphanumeric tokens and quoting
+/// each term so operators (`OR`, `NOT`, `NEAR`), quotes, hyphens, and symbols
+/// can never trigger FTS5 syntax errors. Returns `None` when no searchable
+/// alphanumeric tokens exist so callers fall back to `LIKE`.
+fn build_fts5_prefix_query(input: &str) -> Option<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    for ch in input.chars() {
+        if ch.is_alphanumeric() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            terms.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        terms.push(current);
+    }
+    if terms.is_empty() {
+        return None;
+    }
+    let query = terms
+        .into_iter()
+        .map(|term| format!("\"{term}\"*"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(query)
+}
+
+fn row_to_cached_browse_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedBrowseEntry> {
+    Ok(CachedBrowseEntry {
+        cache_key: row.get(0)?,
+        kind: row.get(1)?,
+        payload_json: row.get(2)?,
+        updated_at_ms: row.get(3)?,
+        expires_at_ms: row.get(4)?,
+    })
 }
 
 /// Returns `true` when an existing raw query entry (`query_text`) is a duplicate
@@ -2724,8 +3342,8 @@ mod tests {
             .expect("seed v3 schema");
         }
 
-        let db = LibraryDb::open(&db_path).expect("migrate v3 -> v4");
-        assert_eq!(db.schema_version().unwrap(), 4);
+        let db = LibraryDb::open(&db_path).expect("migrate v3 -> v5");
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
 
         // Existing v3 rows survived intact with clean defaults for v4 columns.
         assert!(!db.is_song_liked("v3-track").unwrap());
@@ -2749,11 +3367,13 @@ mod tests {
         assert!(db.get_artwork_entry("art-v4").unwrap().is_some());
         assert!(db.set_video_liked("v3-track", true).unwrap());
         assert!(db.is_song_liked("v3-track").unwrap());
+        // Existing v3 song was also backfilled into FTS5 during v5 migration.
+        assert_eq!(db.search_cached_songs("daft", 10).unwrap().len(), 1);
         drop(db);
 
-        // Re-opening must be idempotent and preserve v4 state.
-        let reopened = LibraryDb::open(&db_path).expect("reopen v4");
-        assert_eq!(reopened.schema_version().unwrap(), 4);
+        // Re-opening must be idempotent and preserve v4/v5 state.
+        let reopened = LibraryDb::open(&db_path).expect("reopen v5");
+        assert_eq!(reopened.schema_version().unwrap(), SCHEMA_VERSION);
         assert!(reopened.is_song_liked("v3-track").unwrap());
         assert!(reopened.get_artwork_entry("art-v4").unwrap().is_some());
         drop(reopened);
@@ -2997,5 +3617,513 @@ mod tests {
         assert!(db.set_song_liked(&dav_song, true).unwrap());
         assert_eq!(db.replace_prefixed_songs("webdav:", &[dav_song]).unwrap(), 1);
         assert!(db.is_song_liked("webdav:1").unwrap());
+    }
+
+    #[test]
+    fn sqlite_v4_to_v5_migration_preserves_data_backfills_fts_and_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!(
+            "bitchord_storage_v4_to_v5_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let db_path = dir.join("library.sqlite");
+
+        // Build an authentic v4 database on disk (no playback_session, no browse_cache, no songs_fts).
+        {
+            let conn = Connection::open(&db_path).expect("open raw v4 sqlite");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE songs (
+                    video_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    artist TEXT NOT NULL,
+                    thumbnail_url TEXT,
+                    duration_text TEXT,
+                    album_name TEXT,
+                    album_id TEXT,
+                    artist_id TEXT,
+                    is_explicit INTEGER,
+                    is_video INTEGER NOT NULL DEFAULT 0,
+                    local_uri TEXT,
+                    local_path TEXT,
+                    updated_at INTEGER NOT NULL,
+                    duration_ms INTEGER,
+                    is_liked INTEGER NOT NULL DEFAULT 0,
+                    liked_at INTEGER
+                );
+                CREATE TABLE local_playlists (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    thumbnail_url TEXT,
+                    source TEXT NOT NULL DEFAULT 'local',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE local_playlist_tracks (
+                    playlist_id TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    video_id TEXT NOT NULL,
+                    PRIMARY KEY (playlist_id, position),
+                    FOREIGN KEY (playlist_id) REFERENCES local_playlists(id) ON DELETE CASCADE
+                );
+                CREATE TABLE search_history (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    subtitle TEXT NOT NULL,
+                    artwork_url TEXT,
+                    entity_type TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    album TEXT,
+                    duration_text TEXT,
+                    duration_ms INTEGER
+                );
+                CREATE TABLE listening_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    video_id TEXT NOT NULL,
+                    played_at INTEGER NOT NULL,
+                    duration_ms INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE downloads (
+                    video_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    artist TEXT NOT NULL,
+                    thumbnail_url TEXT,
+                    duration_text TEXT,
+                    album_name TEXT,
+                    uri TEXT NOT NULL,
+                    download_format TEXT,
+                    date_added_seconds INTEGER
+                );
+                CREATE TABLE downloaded_collections (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    subtitle TEXT NOT NULL DEFAULT '',
+                    thumbnail_url TEXT,
+                    playlist INTEGER NOT NULL DEFAULT 0,
+                    video_ids_json TEXT NOT NULL DEFAULT '[]'
+                );
+                CREATE TABLE track_analysis (
+                    video_id TEXT PRIMARY KEY,
+                    analysis_json TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE stream_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    video_id TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    ext TEXT NOT NULL,
+                    kbps INTEGER NOT NULL,
+                    content_length INTEGER,
+                    duration_ms INTEGER,
+                    loudness_db REAL,
+                    is_live_hls INTEGER NOT NULL DEFAULT 0,
+                    client_name TEXT NOT NULL DEFAULT '',
+                    profile_id TEXT NOT NULL DEFAULT '',
+                    headers_json TEXT NOT NULL DEFAULT '{}',
+                    range_chunk_bytes INTEGER,
+                    expires_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE lyrics_cache (
+                    video_id TEXT PRIMARY KEY,
+                    source TEXT,
+                    lines_json TEXT NOT NULL DEFAULT '[]',
+                    is_synced INTEGER NOT NULL DEFAULT 0,
+                    not_found INTEGER NOT NULL DEFAULT 0,
+                    fetched_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL
+                );
+                CREATE TABLE artwork_index (
+                    cache_key TEXT PRIMARY KEY,
+                    tier INTEGER NOT NULL,
+                    file_path TEXT NOT NULL,
+                    byte_size INTEGER NOT NULL,
+                    last_accessed_ms INTEGER NOT NULL,
+                    created_at_ms INTEGER NOT NULL
+                );
+                INSERT INTO songs (
+                    video_id, title, artist, album_name, duration_text, updated_at,
+                    duration_ms, is_liked, liked_at
+                ) VALUES
+                    ('v4-1', 'Midnight City', 'M83', 'Hurry Up, We''re Dreaming', '4:03', 1000, 243000, 1, 1500),
+                    ('v4-2', 'Resonance', 'HOME', 'Odyssey', '3:32', 2000, 212000, 0, NULL);
+                PRAGMA user_version = 4;
+                "#,
+            )
+            .expect("seed v4 schema");
+        }
+
+        let db = LibraryDb::open(&db_path).expect("migrate v4 -> v5");
+        assert_eq!(db.schema_version().unwrap(), 5);
+
+        // Existing v4 songs & liked flag survived and were backfilled into songs_fts.
+        assert!(db.is_song_liked("v4-1").unwrap());
+        let fts_hits = db.search_cached_songs("midn", 10).unwrap();
+        assert_eq!(fts_hits.len(), 1);
+        assert_eq!(fts_hits[0].video_id, "v4-1");
+        let album_hits = db.search_cached_songs("odyss", 10).unwrap();
+        assert_eq!(album_hits.len(), 1);
+        assert_eq!(album_hits[0].video_id, "v4-2");
+
+        // FTS5 index passes SQLite's built-in integrity check.
+        db.conn
+            .execute("INSERT INTO songs_fts(songs_fts) VALUES('integrity-check')", [])
+            .expect("songs_fts integrity-check after v4->v5 backfill");
+
+        // New v5 tables are operational immediately.
+        db.save_playback_session(&PlaybackSessionState {
+            queue: vec![Song::new("v4-1", "Midnight City", "M83", None)],
+            original_order: None,
+            current_index: Some(0),
+            position_ms: 42_000,
+            shuffle: false,
+            repeat_mode: "all".into(),
+            autoplay_start_index: None,
+            updated_at_ms: 9_000,
+        })
+        .unwrap();
+        db.put_browse_cache(&CachedBrowseEntry {
+            cache_key: "home:default".into(),
+            kind: "home".into(),
+            payload_json: r#"{"shelves":[]}"#.into(),
+            updated_at_ms: 1_000,
+            expires_at_ms: 100_000,
+        })
+        .unwrap();
+        drop(db);
+
+        // Re-opening must be idempotent and keep all v5 state intact.
+        let reopened = LibraryDb::open(&db_path).expect("reopen v5");
+        assert_eq!(reopened.schema_version().unwrap(), 5);
+        assert!(reopened.load_playback_session().unwrap().is_some());
+        assert!(
+            reopened
+                .get_browse_cache_at("home:default", 50_000)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(reopened.search_cached_songs("M83", 10).unwrap().len(), 1);
+        drop(reopened);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn playback_session_save_overwrite_load_and_clear() {
+        let db = LibraryDb::open_in_memory().expect("open in-memory db");
+        assert!(db.load_playback_session().unwrap().is_none());
+        assert!(!db.clear_playback_session().unwrap());
+
+        let mut song_a = Song::new("s1", "Nightcall", "Kavinsky", Some("https://art/1".into()));
+        song_a.duration_text = Some("4:18".into());
+        let song_b = Song::new("s2", "Odd Look", "Kavinsky", None);
+        let song_c = Song::new("s3", "Radio Rec", "Autoplay Artist", None);
+
+        let initial = PlaybackSessionState {
+            queue: vec![song_b.clone(), song_a.clone(), song_c.clone()],
+            original_order: Some(vec![song_a.clone(), song_b.clone()]),
+            current_index: Some(1),
+            position_ms: 95_400,
+            shuffle: true,
+            repeat_mode: "all".into(),
+            autoplay_start_index: Some(2),
+            updated_at_ms: 123_456,
+        };
+        db.save_playback_session(&initial).unwrap();
+
+        let loaded = db
+            .load_playback_session()
+            .unwrap()
+            .expect("session saved");
+        assert_eq!(loaded, initial);
+
+        // Saving again overwrites the single id = 1 row rather than creating a second row.
+        let updated = PlaybackSessionState {
+            queue: vec![song_a.clone()],
+            original_order: None,
+            current_index: Some(0),
+            position_ms: 12_000,
+            shuffle: false,
+            repeat_mode: "one".into(),
+            autoplay_start_index: None,
+            updated_at_ms: 200_000,
+        };
+        db.save_playback_session(&updated).unwrap();
+        let row_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM playback_session", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(row_count, 1);
+        assert_eq!(db.load_playback_session().unwrap(), Some(updated));
+
+        // Clear removes the single row cleanly.
+        assert!(db.clear_playback_session().unwrap());
+        assert!(!db.clear_playback_session().unwrap());
+        assert!(db.load_playback_session().unwrap().is_none());
+    }
+
+    #[test]
+    fn browse_cache_put_get_ttl_expiry_and_pruning() {
+        let db = LibraryDb::open_in_memory().expect("open in-memory db");
+
+        let home = CachedBrowseEntry {
+            cache_key: "home:guest".into(),
+            kind: "home".into(),
+            payload_json: r#"{"shelves":[{"title":"Quick Picks"}]}"#.into(),
+            updated_at_ms: 1_000,
+            expires_at_ms: 10_000,
+        };
+        let album = CachedBrowseEntry {
+            cache_key: "album:MPREb_outrun".into(),
+            kind: "album".into(),
+            payload_json: r#"{"title":"OutRun"}"#.into(),
+            updated_at_ms: 2_000,
+            expires_at_ms: 20_000,
+        };
+        db.put_browse_cache(&home).unwrap();
+        db.put_browse_cache(&album).unwrap();
+
+        assert_eq!(
+            db.get_browse_cache_at("home:guest", 9_999).unwrap(),
+            Some(home.clone())
+        );
+        // Boundary condition: expired when expires_at_ms <= now_ms.
+        assert!(db.get_browse_cache_at("home:guest", 10_000).unwrap().is_none());
+
+        // Upserting the same cache_key refreshes payload and expiry.
+        let refreshed_home = CachedBrowseEntry {
+            payload_json: r#"{"shelves":[{"title":"Refreshed"}]}"#.into(),
+            updated_at_ms: 10_500,
+            expires_at_ms: 15_000,
+            ..home
+        };
+        db.put_browse_cache(&refreshed_home).unwrap();
+        assert_eq!(
+            db.get_browse_cache_at("home:guest", 12_000).unwrap(),
+            Some(refreshed_home)
+        );
+
+        // Prune removes only entries with expires_at_ms <= now_ms.
+        assert_eq!(db.prune_expired_browse_cache_at(15_000).unwrap(), 1);
+        assert!(db.get_browse_cache_at("home:guest", 12_000).unwrap().is_none());
+        assert_eq!(
+            db.get_browse_cache_at("album:MPREb_outrun", 15_000).unwrap(),
+            Some(album)
+        );
+
+        assert!(db.delete_browse_cache("album:MPREb_outrun").unwrap());
+        assert!(!db.delete_browse_cache("album:MPREb_outrun").unwrap());
+
+        // `with_ttl` helper works with live wall clock.
+        let live = CachedBrowseEntry::with_ttl(
+            "artist:UC123",
+            "artist",
+            r#"{"name":"Kavinsky"}"#,
+            DEFAULT_BROWSE_CACHE_TTL_MS,
+        );
+        db.put_browse_cache(&live).unwrap();
+        assert!(db.get_browse_cache("artist:UC123").unwrap().is_some());
+        assert_eq!(db.clear_browse_cache().unwrap(), 1);
+    }
+
+    #[test]
+    fn fts5_search_cached_songs_prefix_triggers_special_chars_and_integrity() {
+        let db = LibraryDb::open_in_memory().expect("open in-memory db");
+
+        let mut s1 = Song::new("fts-1", "Nightcall", "Kavinsky", None);
+        s1.album_name = Some("OutRun".into());
+        let mut s2 = Song::new("fts-2", "Don't Stop Me Now", "Queen", None);
+        s2.album_name = Some("Jazz (Deluxe Edition)".into());
+        let mut s3 = Song::new("fts-3", "Back in Black", "AC/DC", None);
+        s3.album_name = Some("Back in Black".into());
+        let mut s4 = Song::new("fts-4", "Café del Mar", "Energy 52", None);
+        s4.album_name = Some("Trance Classics".into());
+        let mut s5 = Song::new("fts-5", "???", "Symbol Artist", None);
+        s5.album_name = Some("---".into());
+
+        db.upsert_songs_batch(&[s1.clone(), s2, s3, s4, s5])
+            .unwrap();
+
+        // Prefix match on title, artist, album, and cross-column terms.
+        let r1 = db.search_cached_songs("kavin", 10).unwrap();
+        assert_eq!(r1.len(), 1);
+        assert_eq!(r1[0].video_id, "fts-1");
+
+        let cross = db.search_cached_songs("night outr", 10).unwrap();
+        assert_eq!(cross.len(), 1);
+        assert_eq!(cross[0].video_id, "fts-1");
+
+        // Diacritic-insensitive matching via unicode61 remove_diacritics 2.
+        let cafe = db.search_cached_songs("cafe", 10).unwrap();
+        assert_eq!(cafe.len(), 1);
+        assert_eq!(cafe[0].video_id, "fts-4");
+
+        // Special characters, quotes, hyphens, FTS operators (OR/NOT/NEAR), and slashes must never error.
+        let acdc = db.search_cached_songs("AC/DC", 10).unwrap();
+        assert_eq!(acdc.len(), 1);
+        assert_eq!(acdc[0].video_id, "fts-3");
+
+        let apostrophe = db.search_cached_songs("don't stop", 10).unwrap();
+        assert_eq!(apostrophe.len(), 1);
+        assert_eq!(apostrophe[0].video_id, "fts-2");
+
+        let hostile_inputs = [
+            "\"nightcall\"*",
+            "NOT OR NEAR (\"queen\") -jazz : ^",
+            "title:nightcall",
+            "---",
+            "???",
+            "\"\"\"",
+        ];
+        for query in hostile_inputs {
+            let res = db.search_cached_songs(query, 10);
+            assert!(res.is_ok(), "query `{query}` should not fail: {res:?}");
+        }
+        // Symbols-only query falls back cleanly to LIKE and finds "???".
+        let sym = db.search_cached_songs("???", 10).unwrap();
+        assert_eq!(sym.len(), 1);
+        assert_eq!(sym[0].video_id, "fts-5");
+
+        // Mid-word substring falls back to LIKE cleanly when FTS prefix returns empty.
+        let suffix = db.search_cached_songs("vinsky", 10).unwrap();
+        assert_eq!(suffix.len(), 1);
+        assert_eq!(suffix[0].video_id, "fts-1");
+
+        // Trigger sync on UPDATE: updating title removes old token and indexes new token.
+        let mut s1_updated = s1;
+        s1_updated.title = "Pacific Coast Highway".into();
+        db.upsert_song(&s1_updated).unwrap();
+        assert!(db.search_cached_songs("nightcall", 10).unwrap().is_empty());
+        let after_update = db.search_cached_songs("pacific", 10).unwrap();
+        assert_eq!(after_update.len(), 1);
+        assert_eq!(after_update[0].video_id, "fts-1");
+
+        // Trigger sync on DELETE + INSERT via replace_prefixed_songs.
+        let dav1 = Song::new("webdav:a", "Zephyr Song", "Red Hot", None);
+        let dav2 = Song::new("webdav:b", "Solaris Drift", "Synth", None);
+        db.replace_prefixed_songs("webdav:", &[dav1]).unwrap();
+        assert_eq!(db.search_cached_songs("zeph", 10).unwrap().len(), 1);
+        db.replace_prefixed_songs("webdav:", &[dav2]).unwrap();
+        assert!(db.search_cached_songs("zeph", 10).unwrap().is_empty());
+        assert_eq!(db.search_cached_songs("solar", 10).unwrap().len(), 1);
+
+        // Non-FTS column updates (like, duration) leave FTS5 index consistent.
+        assert!(db.set_video_liked("fts-1", true).unwrap());
+        assert!(db.update_song_duration("fts-1", 258_000, None).unwrap());
+        db.conn
+            .execute("INSERT INTO songs_fts(songs_fts) VALUES('integrity-check')", [])
+            .expect("songs_fts integrity-check after CRUD operations");
+    }
+
+    #[test]
+    fn local_playlists_crud_reorder_songs_join_and_summaries() {
+        let db = LibraryDb::open_in_memory().expect("open in-memory db");
+
+        db.upsert_playlist(&LocalPlaylist {
+            id: "pl-drive".into(),
+            title: "Night Drive".into(),
+            description: "Synth favorites".into(),
+            thumbnail_url: None,
+            source: "local".into(),
+            created_at: 100,
+            updated_at: 100,
+        })
+        .unwrap();
+        db.upsert_playlist(&LocalPlaylist {
+            id: "pl-empty".into(),
+            title: "Empty List".into(),
+            description: String::new(),
+            thumbnail_url: None,
+            source: "local".into(),
+            created_at: 200,
+            updated_at: 200,
+        })
+        .unwrap();
+
+        // Rename validates non-empty title and unknown id.
+        assert!(!db.rename_playlist("pl-drive", "   ").unwrap());
+        assert!(!db.rename_playlist("missing-pl", "Valid").unwrap());
+        assert!(db.rename_playlist("pl-drive", "  Late Night Drive  ").unwrap());
+
+        let mut s1 = Song::new("p1", "Track One", "Artist 1", Some("https://art/1".into()));
+        s1.duration_text = Some("3:10".into());
+        let s2 = Song::new("p2", "Track Two", "Artist 2", None);
+        let s3 = Song::new("p3", "Track Three", "Artist 3", None);
+
+        // Adding songs auto-upserts into `songs`, prevents duplicates, and rejects missing playlist.
+        assert!(!db.add_song_to_playlist("missing-pl", &s1).unwrap());
+        assert!(db.add_song_to_playlist("pl-drive", &s1).unwrap());
+        assert!(!db.add_song_to_playlist("pl-drive", &s1).unwrap());
+        assert!(db.add_song_to_playlist("pl-drive", &s2).unwrap());
+        assert!(db.add_song_to_playlist("pl-drive", &s3).unwrap());
+
+        assert!(db.get_song("p1").unwrap().is_some());
+        let joined = db.playlist_songs("pl-drive").unwrap();
+        assert_eq!(
+            joined.iter().map(|s| s.video_id.as_str()).collect::<Vec<_>>(),
+            vec!["p1", "p2", "p3"]
+        );
+        assert_eq!(joined[0].duration_text.as_deref(), Some("3:10"));
+
+        // Reorder: move index 2 ("p3") -> index 0, then move index 0 ("p3") -> index 1.
+        assert!(!db.reorder_playlist_track("pl-drive", 0, 0).unwrap());
+        assert!(!db.reorder_playlist_track("pl-drive", 0, 5).unwrap());
+        assert!(db.reorder_playlist_track("pl-drive", 2, 0).unwrap());
+        assert_eq!(
+            db.playlist_tracks("pl-drive").unwrap(),
+            vec!["p3".to_owned(), "p1".to_owned(), "p2".to_owned()]
+        );
+        assert!(db.reorder_playlist_track("pl-drive", 0, 1).unwrap());
+        assert_eq!(
+            db.playlist_tracks("pl-drive").unwrap(),
+            vec!["p1".to_owned(), "p3".to_owned(), "p2".to_owned()]
+        );
+
+        // Remove middle track ("p3") and verify positions are compacted to 0..n without gaps.
+        assert!(!db.remove_song_from_playlist("pl-drive", "not-in-pl").unwrap());
+        assert!(db.remove_song_from_playlist("pl-drive", "p3").unwrap());
+        let positions: Vec<(i64, String)> = {
+            let mut stmt = db
+                .conn
+                .prepare(
+                    "SELECT position, video_id FROM local_playlist_tracks \
+                     WHERE playlist_id = 'pl-drive' ORDER BY position ASC",
+                )
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            positions,
+            vec![(0, "p1".to_owned()), (1, "p2".to_owned())]
+        );
+
+        let joined_after = db.playlist_songs("pl-drive").unwrap();
+        assert_eq!(
+            joined_after
+                .iter()
+                .map(|s| s.video_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p1", "p2"]
+        );
+
+        // Single-query summaries return both playlists with accurate counts and updated title.
+        let summaries = db.list_playlist_summaries().unwrap();
+        assert_eq!(summaries.len(), 2);
+        let drive_summary = summaries
+            .iter()
+            .find(|(pl, _)| pl.id == "pl-drive")
+            .expect("pl-drive summary");
+        assert_eq!(drive_summary.0.title, "Late Night Drive");
+        assert_eq!(drive_summary.1, 2);
+        let empty_summary = summaries
+            .iter()
+            .find(|(pl, _)| pl.id == "pl-empty")
+            .expect("pl-empty summary");
+        assert_eq!(empty_summary.1, 0);
     }
 }

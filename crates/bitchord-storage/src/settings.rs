@@ -17,6 +17,9 @@ use uuid::Uuid;
 /// Default allowed duration slack when upgrading a stream to another source.
 pub const DEFAULT_UPGRADE_LENGTH_SLACK_SECONDS: u32 = 8;
 
+/// Default number of graphic equalizer bands persisted in `AppSettingsData`.
+pub const DEFAULT_EQ_BAND_COUNT: usize = 10;
+
 /// PCM format requested from the audio output sink.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -215,6 +218,14 @@ fn default_volume() -> f32 {
     1.0
 }
 
+fn default_playback_speed() -> f32 {
+    1.0
+}
+
+fn default_eq_band_gains_db() -> Vec<f32> {
+    vec![0.0; DEFAULT_EQ_BAND_COUNT]
+}
+
 fn default_upgrade_slack() -> u32 {
     DEFAULT_UPGRADE_LENGTH_SLACK_SECONDS
 }
@@ -286,8 +297,22 @@ pub struct AppSettingsData {
     pub replay_gain_enabled: bool,
     #[serde(default)]
     pub equalizer_mode: EqualizerMode,
+    #[serde(default = "default_true")]
+    pub autoplay_enabled: bool,
+    #[serde(default = "default_playback_speed")]
+    pub playback_speed: f32,
+    #[serde(default)]
+    pub skip_silence: bool,
+    #[serde(default)]
+    pub spatial_audio: bool,
+    #[serde(default)]
+    pub eq_enabled: bool,
+    #[serde(default = "default_eq_band_gains_db")]
+    pub eq_band_gains_db: Vec<f32>,
 
     // Appearance & Library
+    #[serde(default)]
+    pub sidebar_collapsed: bool,
     #[serde(default)]
     pub theme_mode: ThemeMode,
     #[serde(default)]
@@ -371,6 +396,13 @@ impl Default for AppSettingsData {
             muted: false,
             replay_gain_enabled: false,
             equalizer_mode: EqualizerMode::Dynamic,
+            autoplay_enabled: true,
+            playback_speed: 1.0,
+            skip_silence: false,
+            spatial_audio: false,
+            eq_enabled: false,
+            eq_band_gains_db: default_eq_band_gains_db(),
+            sidebar_collapsed: false,
             theme_mode: ThemeMode::System,
             player_theme: PlayerTheme::Default,
             app_font: AppFont::Default,
@@ -543,6 +575,54 @@ mod tests {
         assert_eq!(reloaded.listen_together_nickname, "Ada");
         assert_eq!(reloaded.volume, 0.75);
         assert_eq!(reloaded.device_id, settings.device_id);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_settings_json_deserializes_with_phase3_defaults() {
+        let legacy_json = r#"{
+            "audioQualityWifi": "LOSSLESS",
+            "volume": 0.65,
+            "muted": false,
+            "gaplessPlayback": true,
+            "listenTogetherNickname": "Atlas"
+        }"#;
+        let parsed: AppSettingsData =
+            serde_json::from_str(legacy_json).expect("legacy settings JSON must deserialize");
+        assert_eq!(parsed.volume, 0.65);
+        assert_eq!(parsed.listen_together_nickname, "Atlas");
+        assert!(!parsed.sidebar_collapsed);
+        assert!(parsed.autoplay_enabled);
+        assert_eq!(parsed.playback_speed, 1.0);
+        assert!(!parsed.skip_silence);
+        assert!(!parsed.spatial_audio);
+        assert!(!parsed.eq_enabled);
+        assert_eq!(parsed.eq_band_gains_db, vec![0.0; DEFAULT_EQ_BAND_COUNT]);
+
+        // Round-trip non-default phase 3 values.
+        let dir = std::env::temp_dir().join(format!("bitchord-settings-p3-{}", Uuid::new_v4()));
+        let store = SettingsStore::new(dir.join("settings.json"));
+        let mut updated = parsed;
+        updated.sidebar_collapsed = true;
+        updated.autoplay_enabled = false;
+        updated.playback_speed = 1.25;
+        updated.skip_silence = true;
+        updated.spatial_audio = true;
+        updated.eq_enabled = true;
+        updated.eq_band_gains_db = vec![3.0, 2.0, 1.0, 0.0, -1.0, -0.5, 0.5, 1.5, 2.5, 3.5];
+        store.save(&updated).expect("save updated settings");
+
+        let reloaded = store.load().expect("reload updated settings");
+        assert!(reloaded.sidebar_collapsed);
+        assert!(!reloaded.autoplay_enabled);
+        assert_eq!(reloaded.playback_speed, 1.25);
+        assert!(reloaded.skip_silence);
+        assert!(reloaded.spatial_audio);
+        assert!(reloaded.eq_enabled);
+        assert_eq!(
+            reloaded.eq_band_gains_db,
+            vec![3.0, 2.0, 1.0, 0.0, -1.0, -0.5, 0.5, 1.5, 2.5, 3.5]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
