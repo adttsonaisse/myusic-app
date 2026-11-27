@@ -10,9 +10,10 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, watch};
 
 use crate::auth::{MUSIC_ORIGIN, YOUTUBE_ORIGIN, sapisid_from_cookie, sapisid_hash};
+use crate::cipher::CipherSandbox;
 use crate::client::InnertubeClient;
 use crate::error::{PermanentReason, StreamError};
-use crate::player_client::PlayerClient;
+use crate::player_client::{PlayerClient, WEB_USER_AGENT};
 use crate::uploaded::UploadedTracks;
 
 /// Past YouTube's 1 MiB unauthenticated prefix wall (`StreamResolver.kt`).
@@ -213,13 +214,76 @@ impl PoTokenProvider for BgUtilHttpProvider {
 
 // ---- Native InnerTube `/player` Stream Backend ------------------------------
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SignatureCipherParts {
+    pub base_url: String,
+    pub sig: String,
+    pub sp: String,
+}
+
+/// Parses YouTube's URL-encoded `signatureCipher` / `cipher` string into
+/// `(base_url, s, sp)`.
+pub(crate) fn parse_signature_cipher(raw: &str) -> Option<SignatureCipherParts> {
+    let mut base_url: Option<String> = None;
+    let mut sig: Option<String> = None;
+    let mut sp: Option<String> = None;
+    for (k, v) in url::form_urlencoded::parse(raw.as_bytes()) {
+        match k.as_ref() {
+            "url" => base_url = Some(v.into_owned()),
+            "s" => sig = Some(v.into_owned()),
+            "sp" => sp = Some(v.into_owned()),
+            _ => {}
+        }
+    }
+    let base_url = base_url.filter(|s| !s.is_empty())?;
+    let sig = sig.filter(|s| !s.is_empty())?;
+    let sp = sp.filter(|s| !s.is_empty()).unwrap_or_else(|| "sig".to_owned());
+    Some(SignatureCipherParts { base_url, sig, sp })
+}
+
+/// Extracts a self-contained `(s) => ...` JS decipher function from a YouTube
+/// `base.js` player bundle when present.
+pub(crate) fn extract_player_sig_transform(player_js: &str) -> Option<String> {
+    // Match the classic entry function calling `.split("")` and `.join("")` on its input.
+    let fn_re = regex::Regex::new(
+        r#"(?:function\s+[A-Za-z0-9_$]+|(?:var|let|const)\s+[A-Za-z0-9_$]+\s*=\s*function|[A-Za-z0-9_$]+\s*=\s*function)\s*\(([A-Za-z0-9_$]+)\)\s*\{\s*([A-Za-z0-9_$]+)=([A-Za-z0-9_$]+)\.split\(""\);([^}]{1,600})return\s+[A-Za-z0-9_$]+\.join\(""\)\s*\}"#,
+    )
+    .ok()?;
+    let caps = fn_re.captures(player_js)?;
+    let arg = caps.get(1)?.as_str();
+    let body = caps.get(4)?.as_str();
+
+    // Find helper object name referenced inside body (e.g. `ab.cd(a,3)`).
+    let helper_ref_re = regex::Regex::new(r"([A-Za-z0-9_$]+)\.[A-Za-z0-9_$]+\(").ok()?;
+    let helper_decl = if let Some(hcap) = helper_ref_re.captures(body) {
+        let helper_name = hcap.get(1)?.as_str();
+        let escaped = regex::escape(helper_name);
+        let obj_pat = format!(r"var\s+{escaped}\s*=\s*\{{[\s\S]{{1,1200}}?\}};");
+        regex::Regex::new(&obj_pat)
+            .ok()
+            .and_then(|re| re.find(player_js))
+            .map(|m| m.as_str().to_owned())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    Some(format!(
+        "({arg}) => {{ {helper_decl} {arg} = {arg}.split(\"\"); {body} return {arg}.join(\"\"); }}"
+    ))
+}
+
 /// Native-first YouTube stream resolver walking direct InnerTube `/player`
-/// client profiles (`VISIONOS` JS-less direct Opus 251 first for anonymous;
-/// `WEB_REMIX` + `TV_SAMSUNG` + `VISIONOS` when signed in).
+/// client profiles (`VISIONOS` / `IOS` JS-less direct Opus first for low-latency
+/// public playback; `WEB_REMIX` + `TV_SAMSUNG` with QuickJS [`CipherSandbox`]
+/// fallback for signed-in / private uploads / age-restricted tracks).
 pub struct NativeStreamBackend {
     innertube: Arc<InnertubeClient>,
     po_token: Arc<dyn PoTokenProvider>,
+    cipher: Arc<CipherSandbox>,
     player_endpoint: String,
+    player_cache: Arc<Mutex<Option<String>>>,
+    sig_transform_override: Option<String>,
 }
 
 impl NativeStreamBackend {
@@ -234,8 +298,17 @@ impl NativeStreamBackend {
         Self {
             innertube,
             po_token,
+            cipher: Arc::new(CipherSandbox::default()),
             player_endpoint: "https://www.youtube.com/youtubei/v1/player".to_owned(),
+            player_cache: Arc::new(Mutex::new(None)),
+            sig_transform_override: None,
         }
+    }
+
+    /// Attaches a custom [`CipherSandbox`] (e.g. with a persistent player-JS cache dir).
+    pub fn with_cipher_sandbox(mut self, cipher: Arc<CipherSandbox>) -> Self {
+        self.cipher = cipher;
+        self
     }
 
     #[cfg(test)]
@@ -243,16 +316,34 @@ impl NativeStreamBackend {
         Self {
             innertube,
             po_token: Arc::new(NoopPoTokenProvider),
+            cipher: Arc::new(CipherSandbox::default()),
             player_endpoint,
+            player_cache: Arc::new(Mutex::new(None)),
+            sig_transform_override: None,
         }
     }
 
+    #[cfg(test)]
+    fn with_sig_transform_override(mut self, fn_source: impl Into<String>) -> Self {
+        self.sig_transform_override = Some(fn_source.into());
+        self
+    }
+
     fn profiles_for(&self, signed_in: bool, uploaded_hint: bool) -> Vec<PlayerClient> {
-        if signed_in || uploaded_hint {
+        if uploaded_hint {
             vec![
                 PlayerClient::web_remix(Some(&self.innertube.web_remix_version())),
                 PlayerClient::tv_samsung(),
                 PlayerClient::vision_os(None),
+            ]
+        } else if signed_in {
+            // Fast JS-less direct clients first; authenticated profiles follow for
+            // age-restricted / premium / private tracks.
+            vec![
+                PlayerClient::vision_os(None),
+                PlayerClient::ios(),
+                PlayerClient::web_remix(Some(&self.innertube.web_remix_version())),
+                PlayerClient::tv_samsung(),
             ]
         } else {
             vec![
@@ -261,6 +352,93 @@ impl NativeStreamBackend {
                 PlayerClient::web_remix(Some(&self.innertube.web_remix_version())),
             ]
         }
+    }
+
+    async fn resolve_player_sig_transform(&self) -> Result<String, StreamError> {
+        if let Some(ref ov) = self.sig_transform_override {
+            return Ok(ov.clone());
+        }
+        {
+            let guard = self.player_cache.lock().await;
+            if let Some(ref cached) = *guard {
+                return Ok(cached.clone());
+            }
+        }
+
+        // Fetch lightweight `/iframe_api` to discover current player hash and base.js URL.
+        let api_text = self
+            .innertube
+            .http_client()
+            .get(format!("{YOUTUBE_ORIGIN}/iframe_api"))
+            .timeout(Duration::from_secs(6))
+            .header(reqwest::header::USER_AGENT, WEB_USER_AGENT)
+            .send()
+            .await
+            .map_err(|e| StreamError::Transient(format!("iframe_api fetch failed: {e}")))?
+            .text()
+            .await
+            .map_err(|e| StreamError::Transient(format!("iframe_api read failed: {e}")))?;
+
+        let hash_re = regex::Regex::new(r"player\\?/([A-Za-z0-9_-]{6,32})\\?/").ok();
+        let player_hash = hash_re
+            .and_then(|re| re.captures(&api_text))
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_owned())
+            .ok_or_else(|| {
+                StreamError::Transient("unable to locate YouTube player hash".to_owned())
+            })?;
+
+        if let Some(saved_fn) = self.cipher.load_preprocessed_player(&player_hash) {
+            let mut guard = self.player_cache.lock().await;
+            *guard = Some(saved_fn.clone());
+            return Ok(saved_fn);
+        }
+
+        let base_js_url =
+            format!("{YOUTUBE_ORIGIN}/s/player/{player_hash}/player_ias.vflset/en_US/base.js");
+        let player_js = self
+            .innertube
+            .http_client()
+            .get(&base_js_url)
+            .timeout(Duration::from_secs(10))
+            .header(reqwest::header::USER_AGENT, WEB_USER_AGENT)
+            .send()
+            .await
+            .map_err(|e| StreamError::Transient(format!("base.js fetch failed: {e}")))?
+            .text()
+            .await
+            .map_err(|e| StreamError::Transient(format!("base.js read failed: {e}")))?;
+
+        let fn_source = extract_player_sig_transform(&player_js).ok_or_else(|| {
+            StreamError::Transient("unable to extract signature transform from base.js".to_owned())
+        })?;
+        let _ = self
+            .cipher
+            .save_preprocessed_player(&player_hash, &fn_source);
+
+        let mut guard = self.player_cache.lock().await;
+        *guard = Some(fn_source.clone());
+        Ok(fn_source)
+    }
+
+    async fn solve_signature_cipher(
+        &self,
+        parts: &SignatureCipherParts,
+    ) -> Result<String, StreamError> {
+        let fn_source = self.resolve_player_sig_transform().await?;
+        let arg_json = serde_json::to_string(&parts.sig)
+            .map_err(|e| StreamError::Transient(format!("encode cipher arg: {e}")))?;
+        let script = format!("String(({fn_source})({arg_json}))");
+        let decrypted = self.cipher.eval_to_string_async(script).await?;
+        if decrypted.is_empty() {
+            return Err(StreamError::Transient(
+                "QuickJS signature decipher returned empty string".to_owned(),
+            ));
+        }
+        let mut parsed = url::Url::parse(&parts.base_url)
+            .map_err(|e| StreamError::Transient(format!("invalid cipher base url: {e}")))?;
+        parsed.query_pairs_mut().append_pair(&parts.sp, &decrypted);
+        Ok(parsed.into())
     }
 
     async fn resolve_with_client(
@@ -445,12 +623,15 @@ impl NativeStreamBackend {
         let chosen =
             select_best_audio_format(formats, req.max_kbps, req.container).ok_or_else(|| {
                 StreamError::Transient(format!(
-                    "{} offered no direct (unencrypted) audio format",
+                    "{} offered no playable audio format",
                     client.client_name
                 ))
             })?;
 
-        let mut final_url = chosen.url;
+        let mut final_url = match chosen.source {
+            FormatUrlSource::Direct(url) => url,
+            FormatUrlSource::SignatureCipher(parts) => self.solve_signature_cipher(&parts).await?,
+        };
         if let Some(ref pair) = pot
             && !final_url.contains("pot=")
             && let Ok(mut parsed) = url::Url::parse(&final_url)
@@ -512,6 +693,20 @@ impl StreamBackend for NativeStreamBackend {
                 {
                     Ok(stream) => return Ok(stream),
                     Err(StreamError::Permanent(reason)) => {
+                        // When signed in, an anonymous fast profile (VISIONOS/IOS) may hit
+                        // an auth-gated reason that WEB_REMIX/TV_SAMSUNG can satisfy.
+                        let retry_with_auth = signed_in
+                            && !client.supports_cookies
+                            && matches!(
+                                reason,
+                                PermanentReason::AgeRestrictedSignedOut
+                                    | PermanentReason::PremiumRequired
+                                    | PermanentReason::Private
+                            );
+                        if retry_with_auth {
+                            last_err = StreamError::Permanent(reason);
+                            continue;
+                        }
                         return Err(StreamError::Permanent(reason));
                     }
                     Err(err) => last_err = err,
@@ -522,8 +717,13 @@ impl StreamBackend for NativeStreamBackend {
     }
 }
 
+enum FormatUrlSource {
+    Direct(String),
+    SignatureCipher(SignatureCipherParts),
+}
+
 struct SelectedFormat {
-    url: String,
+    source: FormatUrlSource,
     kbps: u32,
     mime_type: String,
     ext: String,
@@ -536,7 +736,7 @@ fn select_best_audio_format(
     max_kbps: u32,
     pref: ContainerPreference,
 ) -> Option<SelectedFormat> {
-    let mut candidates: Vec<(SelectedFormat, bool, bool)> = Vec::new();
+    let mut candidates: Vec<(SelectedFormat, bool, bool, bool)> = Vec::new();
     for fmt in formats {
         let Some(obj) = fmt.as_object() else {
             continue;
@@ -547,8 +747,16 @@ fn select_best_audio_format(
         if !mime.starts_with("audio/") {
             continue;
         }
-        // Only direct URLs without unsolved signatureCipher here.
-        let Some(url) = obj.get("url").and_then(Value::as_str) else {
+        let (source, is_direct) = if let Some(url) = obj.get("url").and_then(Value::as_str) {
+            (FormatUrlSource::Direct(url.to_owned()), true)
+        } else if let Some(raw_cipher) = obj
+            .get("signatureCipher")
+            .or_else(|| obj.get("cipher"))
+            .and_then(Value::as_str)
+            && let Some(parts) = parse_signature_cipher(raw_cipher)
+        {
+            (FormatUrlSource::SignatureCipher(parts), false)
+        } else {
             continue;
         };
         let is_webm_opus = mime.contains("webm") && mime.contains("opus");
@@ -580,7 +788,7 @@ fn select_best_audio_format(
         let within_cap = max_kbps == 0 || kbps <= max_kbps;
         candidates.push((
             SelectedFormat {
-                url: url.to_owned(),
+                source,
                 kbps,
                 mime_type: mime.to_owned(),
                 ext: ext.to_owned(),
@@ -588,6 +796,7 @@ fn select_best_audio_format(
                 approx_duration_ms,
             },
             within_cap,
+            is_direct,
             is_webm_opus,
         ));
     }
@@ -596,20 +805,20 @@ fn select_best_audio_format(
         return None;
     }
 
-    // Prefer formats within max_kbps (highest kbps, Opus > M4A); if every
-    // format exceeds the cap, fall back to the lowest bitrate so playback still works.
-    let has_within_cap = candidates.iter().any(|(_, ok, _)| *ok);
+    // Prefer formats within max_kbps (direct URL > cipher, highest kbps, Opus > M4A);
+    // if every format exceeds the cap, fall back to the lowest bitrate so playback still works.
+    let has_within_cap = candidates.iter().any(|(_, ok, _, _)| *ok);
     if has_within_cap {
         candidates
             .into_iter()
-            .filter(|(_, ok, _)| *ok)
-            .max_by_key(|(f, _, is_opus)| (f.kbps, *is_opus))
-            .map(|(f, _, _)| f)
+            .filter(|(_, ok, _, _)| *ok)
+            .max_by_key(|(f, _, is_direct, is_opus)| (*is_direct, f.kbps, *is_opus))
+            .map(|(f, _, _, _)| f)
     } else {
         candidates
             .into_iter()
-            .min_by_key(|(f, _, _)| f.kbps)
-            .map(|(f, _, _)| f)
+            .min_by_key(|(f, _, is_direct, _)| (!*is_direct, f.kbps))
+            .map(|(f, _, _, _)| f)
     }
 }
 
@@ -995,6 +1204,26 @@ impl RecentCache {
     }
 }
 
+/// Controls whether [`StreamResolver`] performs a blocking 1 MiB range probe
+/// before returning a freshly resolved stream URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProbePolicy {
+    /// Always run a blocking 1 MiB range probe before returning uncached URLs.
+    Always,
+    /// Skip the extra blocking probe round-trip for known-healthy fast profiles
+    /// (`native:VISIONOS`, `native:IOS`) unless that profile recently suffered a
+    /// refusal; still probe fallback/unproven profiles synchronously.
+    #[default]
+    Optimistic,
+    /// Disable network probing completely.
+    Disabled,
+}
+
+fn is_optimistic_healthy_profile(profile_id: &str) -> bool {
+    matches!(profile_id, "native:VISIONOS" | "native:IOS")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProbeOutcome {
     Ok,
@@ -1012,8 +1241,9 @@ pub struct StreamResolver {
     recent: Arc<RwLock<RecentCache>>,
     unplayable: Arc<RwLock<HashMap<String, (PermanentReason, Instant)>>>,
     excluded: Arc<RwLock<HashMap<(String, String), Instant>>>,
+    degraded_profiles: Arc<RwLock<HashMap<String, Instant>>>,
     in_flight: Arc<Mutex<HashMap<String, watch::Receiver<InFlightValue>>>>,
-    probe_enabled: bool,
+    probe_policy: ProbePolicy,
 }
 
 impl StreamResolver {
@@ -1029,22 +1259,46 @@ impl StreamResolver {
             recent: Arc::new(RwLock::new(RecentCache::default())),
             unplayable: Arc::new(RwLock::new(HashMap::new())),
             excluded: Arc::new(RwLock::new(HashMap::new())),
+            degraded_profiles: Arc::new(RwLock::new(HashMap::new())),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
-            probe_enabled: true,
+            probe_policy: ProbePolicy::Optimistic,
         }
     }
 
-    /// Disables network probing (useful only in unit tests with mock URLs).
-    pub fn with_probing(mut self, enabled: bool) -> Self {
-        self.probe_enabled = enabled;
+    /// Configures how aggressively [`StreamResolver`] probes candidate URLs.
+    pub fn with_probe_policy(mut self, policy: ProbePolicy) -> Self {
+        self.probe_policy = policy;
         self
     }
 
+    /// Enables (`Always`) or disables (`Disabled`) network probing.
+    pub fn with_probing(mut self, enabled: bool) -> Self {
+        self.probe_policy = if enabled {
+            ProbePolicy::Always
+        } else {
+            ProbePolicy::Disabled
+        };
+        self
+    }
+
+    /// Canonical cache key shared with persistent storage caches (`stream_cache`).
+    pub fn cache_key_for(req: &ResolveRequest) -> String {
+        format!("{}:{}:{:?}", req.video_id, req.max_kbps, req.container)
+    }
+
+    /// Seeds the in-memory recent cache (e.g. from persistent SQLite `stream_cache`).
+    pub fn seed_cached_stream(&self, req: &ResolveRequest, stream: ResolvedStream) {
+        let key = Self::cache_key_for(req);
+        self.recent
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, stream);
+    }
+
     /// Resolves a playable audio URL for `req`, serving from the 20m cache,
-    /// coalescing concurrent identical lookups, and probing uncached URLs past
-    /// YouTube's 1 MiB auth boundary before returning.
+    /// coalescing concurrent identical lookups, and probing according to [`ProbePolicy`].
     pub async fn resolve(&self, req: ResolveRequest) -> Result<ResolvedStream, StreamError> {
-        let cache_key = format!("{}:{}:{:?}", req.video_id, req.max_kbps, req.container);
+        let cache_key = Self::cache_key_for(&req);
 
         // 1. Check 20-minute latency cache.
         if let Some(hit) = self
@@ -1083,8 +1337,9 @@ impl StreamResolver {
                 let recent = Arc::clone(&self.recent);
                 let unplayable = Arc::clone(&self.unplayable);
                 let excluded = Arc::clone(&self.excluded);
+                let degraded_profiles = Arc::clone(&self.degraded_profiles);
                 let in_flight = Arc::clone(&self.in_flight);
-                let probe_enabled = self.probe_enabled;
+                let probe_policy = self.probe_policy;
                 let key = cache_key.clone();
 
                 tokio::spawn(async move {
@@ -1093,8 +1348,9 @@ impl StreamResolver {
                         backend.as_ref(),
                         &uploads,
                         &excluded,
+                        &degraded_profiles,
                         req,
-                        probe_enabled,
+                        probe_policy,
                     )
                     .await;
                     match &result {
@@ -1135,12 +1391,18 @@ impl StreamResolver {
     }
 
     /// Reports a mid-playback 403/404/410 refusal: evicts cached URLs for
-    /// `video_id` and benches `(video_id, profile_id)` for 10 minutes.
+    /// `video_id`, marks `profile_id` as degraded (re-enabling synchronous probing
+    /// under [`ProbePolicy::Optimistic`]), and benches `(video_id, profile_id)` for 10 minutes.
     pub fn on_playback_refused(&self, video_id: &str, profile_id: &str, url: &str) {
+        let now = Instant::now();
         self.excluded
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert((video_id.to_owned(), profile_id.to_owned()), Instant::now());
+            .insert((video_id.to_owned(), profile_id.to_owned()), now);
+        self.degraded_profiles
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(profile_id.to_owned(), now);
         {
             let mut recent = self.recent.write().unwrap_or_else(|e| e.into_inner());
             let keys: Vec<String> = recent
@@ -1170,6 +1432,10 @@ impl StreamResolver {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.degraded_profiles
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.uploads.clear();
         self.backend.on_session_changed();
     }
@@ -1180,8 +1446,9 @@ async fn resolve_and_probe(
     backend: &dyn StreamBackend,
     uploads: &UploadedTracks,
     excluded: &RwLock<HashMap<(String, String), Instant>>,
+    degraded_profiles: &RwLock<HashMap<String, Instant>>,
     mut req: ResolveRequest,
-    probe_enabled: bool,
+    probe_policy: ProbePolicy,
 ) -> Result<ResolvedStream, StreamError> {
     if uploads.contains(&req.video_id) {
         req.uploaded_hint = true;
@@ -1209,17 +1476,37 @@ async fn resolve_and_probe(
             }
         };
 
-        if !probe_enabled || stream.is_live_hls {
+        if stream.is_live_hls || probe_policy == ProbePolicy::Disabled {
             return Ok(stream);
+        }
+
+        if probe_policy == ProbePolicy::Optimistic
+            && is_optimistic_healthy_profile(&stream.profile_id)
+        {
+            let is_degraded = {
+                let mut guard = degraded_profiles
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner());
+                guard.retain(|_, at| at.elapsed() < EXCLUDE_TTL);
+                guard.contains_key(&stream.profile_id)
+            };
+            if !is_degraded {
+                return Ok(stream);
+            }
         }
 
         match probe_stream_url(http, &stream).await {
             ProbeOutcome::Ok => return Ok(stream),
             ProbeOutcome::Refused(status, detail) => {
-                excluded.write().unwrap_or_else(|e| e.into_inner()).insert(
-                    (req.video_id.clone(), stream.profile_id.clone()),
-                    Instant::now(),
-                );
+                let now = Instant::now();
+                excluded
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert((req.video_id.clone(), stream.profile_id.clone()), now);
+                degraded_profiles
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(stream.profile_id.clone(), now);
                 if !req.skip_profiles.contains(&stream.profile_id) {
                     req.skip_profiles.push(stream.profile_id.clone());
                 }
@@ -1574,6 +1861,142 @@ mod tests {
         assert_eq!(
             parsed.media_headers.get("User-Agent").map(String::as_str),
             Some("TestUA")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_backend_solves_signature_cipher_and_orders_fast_profiles_first() {
+        let base = spawn_media_server(|req| {
+            let body = if req.contains("CIPHER_ID") {
+                json!({
+                    "playabilityStatus": { "status": "OK" },
+                    "streamingData": {
+                        "adaptiveFormats": [{
+                            "mimeType": "audio/webm; codecs=\"opus\"",
+                            "averageBitrate": 160000,
+                            "contentLength": "3200000",
+                            "approxDurationMs": "185000",
+                            "signatureCipher": "s=abcdef&sp=sig&url=https%3A%2F%2Frr1.googlevideo.com%2Fvideoplayback%3Fc%3DWEB_REMIX"
+                        }]
+                    }
+                })
+            } else {
+                json!({
+                    "playabilityStatus": { "status": "OK" },
+                    "streamingData": { "adaptiveFormats": [] }
+                })
+            };
+            (200, "application/json", body.to_string().into_bytes())
+        })
+        .await;
+
+        let innertube = Arc::new(InnertubeClient::with_endpoints(
+            Arc::new(build_shared_http_client()),
+            format!("{base}/youtubei/v1"),
+            base.clone(),
+            base.clone(),
+        ));
+        innertube.set_cookie(Some("SAPISID=test; SID=test".to_owned()));
+
+        let backend = NativeStreamBackend::with_endpoint(innertube, format!("{base}/player"))
+            .with_sig_transform_override("(s) => s.split('').reverse().join('')");
+
+        // Signed-in public track prefers fast VISIONOS/IOS before WEB_REMIX.
+        let public_order: Vec<String> = backend
+            .profiles_for(true, false)
+            .into_iter()
+            .map(|c| c.client_name)
+            .collect();
+        assert_eq!(public_order[0], "VISIONOS");
+        assert_eq!(public_order[1], "IOS");
+
+        // Uploaded track still puts WEB_REMIX first.
+        let upload_order: Vec<String> = backend
+            .profiles_for(true, true)
+            .into_iter()
+            .map(|c| c.client_name)
+            .collect();
+        assert_eq!(upload_order[0], "WEB_REMIX");
+
+        let resolved = backend
+            .resolve_uncached(&ResolveRequest::for_playback("CIPHER_ID", 256))
+            .await
+            .expect("cipher resolved via QuickJS sandbox");
+        assert!(
+            resolved.url.contains("sig=fedcba"),
+            "expected decrypted sig in url, got: {}",
+            resolved.url
+        );
+        assert_eq!(resolved.duration_ms, Some(185_000));
+    }
+
+    #[tokio::test]
+    async fn optimistic_probe_skips_healthy_profile_until_refused() {
+        let probe_hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_srv = Arc::clone(&probe_hits);
+        let base = spawn_media_server(move |_req| {
+            hits_for_srv.fetch_add(1, Ordering::SeqCst);
+            (206, "audio/webm", vec![0xAA; PROBE_READ_BYTES])
+        })
+        .await;
+
+        struct VisionBackend {
+            url: String,
+        }
+        impl StreamBackend for VisionBackend {
+            fn resolve_uncached<'a>(
+                &'a self,
+                req: &'a ResolveRequest,
+            ) -> BoxFuture<'a, Result<ResolvedStream, StreamError>> {
+                Box::pin(async move {
+                    Ok(ResolvedStream {
+                        video_id: req.video_id.clone(),
+                        url: self.url.clone(),
+                        kbps: 160,
+                        mime_type: r#"audio/webm; codecs="opus""#.to_owned(),
+                        ext: "webm".to_owned(),
+                        content_length: Some(2_000_000),
+                        duration_ms: Some(120_000),
+                        loudness_db: None,
+                        is_live_hls: false,
+                        client_name: "VISIONOS".to_owned(),
+                        profile_id: "native:VISIONOS".to_owned(),
+                        media_headers: BTreeMap::new(),
+                        range_chunk_bytes: Some(1024 * 1024),
+                    })
+                })
+            }
+        }
+
+        let resolver = StreamResolver::new(
+            Arc::new(build_shared_http_client()),
+            Arc::new(VisionBackend {
+                url: format!("{base}/stream"),
+            }),
+            Arc::new(UploadedTracks::new()),
+        );
+
+        let s1 = resolver
+            .resolve(ResolveRequest::for_playback("vid_fast_1", 256))
+            .await
+            .expect("optimistic resolve");
+        assert_eq!(s1.profile_id, "native:VISIONOS");
+        assert_eq!(
+            probe_hits.load(Ordering::SeqCst),
+            0,
+            "healthy VISIONOS profile should skip blocking probe under Optimistic policy"
+        );
+
+        // Once a refusal is reported for VISIONOS, subsequent tracks re-enable blocking probe.
+        resolver.on_playback_refused("vid_other", "native:VISIONOS", &s1.url);
+        let _ = resolver
+            .resolve(ResolveRequest::for_playback("vid_fast_2", 256))
+            .await
+            .expect("probed resolve after degradation");
+        assert_eq!(
+            probe_hits.load(Ordering::SeqCst),
+            1,
+            "degraded VISIONOS profile must perform blocking probe"
         );
     }
 }

@@ -258,6 +258,18 @@ impl InnertubeClient {
         }
     }
 
+    /// Pre-warms `visitor_data` asynchronously at startup so the first track
+    /// playback does not pay an extra `/sw.js_data` round-trip.
+    pub async fn prewarm_visitor_data(&self) -> Option<String> {
+        self.ensure_visitor_data(false).await
+    }
+
+    /// Spawns a background task to pre-warm `visitor_data` without blocking startup.
+    pub fn spawn_prewarm_visitor_data(self: &Arc<Self>) -> tokio::task::JoinHandle<Option<String>> {
+        let client = Arc::clone(self);
+        tokio::spawn(async move { client.prewarm_visitor_data().await })
+    }
+
     /// Mints an anonymous visitor ID from `/sw.js_data` if none is cached (or
     /// when `refresh` is `true`). Never overwrites a session-bound visitor ID
     /// unless `refresh` is explicitly requested.

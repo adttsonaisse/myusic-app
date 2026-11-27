@@ -26,10 +26,19 @@ const OWNER_ICONS: &[&str] = &["DELETE", "EDIT"];
 const NOT_EDITABLE: &[&str] = &["LM", "SE", "RD", "OLAK", "MPRE"];
 
 static DURATION_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\d+:\d{2}$")
+    Regex::new(r"^(?:\d+:)?\d+:\d{2}$")
         // INFALLIBLE: static regex pattern.
         .expect("valid DURATION_RE")
 });
+
+fn find_duration_part(parts: &[&str]) -> Option<String> {
+    parts
+        .iter()
+        .rev()
+        .map(|p| p.trim())
+        .find(|p| DURATION_RE.is_match(p))
+        .map(ToOwned::to_owned)
+}
 
 static RUNTIME_PART: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(\d+)\s*(hours?|hr|min|sec)")
@@ -1318,25 +1327,21 @@ impl InnertubeParser {
             .filter(|s| !s.trim().is_empty())
             .collect();
 
-        let duration = parts
-            .last()
-            .copied()
-            .filter(|p| DURATION_RE.is_match(p))
-            .map(ToOwned::to_owned)
-            .or_else(|| {
-                renderer
-                    .get("fixedColumns")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .find_map(|col| {
-                        let txt = runs_text(
-                            col.get("musicResponsiveListItemFixedColumnRenderer")
-                                .and_then(|c| c.get("text")),
-                        );
-                        DURATION_RE.is_match(&txt).then_some(txt)
-                    })
-            });
+        let duration = find_duration_part(&parts).or_else(|| {
+            renderer
+                .get("fixedColumns")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find_map(|col| {
+                    let txt = runs_text(
+                        col.get("musicResponsiveListItemFixedColumnRenderer")
+                            .and_then(|c| c.get("text")),
+                    );
+                    let trimmed = txt.trim();
+                    DURATION_RE.is_match(trimmed).then(|| trimmed.to_owned())
+                })
+        });
 
         let row_type = parts
             .iter()
@@ -1443,11 +1448,7 @@ impl InnertubeParser {
             .split(" • ")
             .filter(|s| !s.trim().is_empty())
             .collect();
-        let duration = parts
-            .last()
-            .copied()
-            .filter(|p| DURATION_RE.is_match(p))
-            .map(ToOwned::to_owned);
+        let duration = find_duration_part(&parts);
         let row_type = parts
             .iter()
             .map(|p| p.to_lowercase())
@@ -2789,5 +2790,54 @@ mod tests {
         let plain: Value =
             serde_json::from_str(&format!(r#"{{ "contents": [ {video} ] }}"#)).expect("json");
         assert!(p.parse_version_pair(&plain, "omv1", true).is_none());
+    }
+
+    #[test]
+    fn parses_hour_long_and_mid_subtitle_durations() {
+        assert!(DURATION_RE.is_match("3:45"));
+        assert!(DURATION_RE.is_match("12:05"));
+        assert!(DURATION_RE.is_match("1:02:30"));
+        assert!(DURATION_RE.is_match("12:34:56"));
+        assert!(!DURATION_RE.is_match("1:2"));
+        assert!(!DURATION_RE.is_match("2024"));
+
+        let p = parser();
+        let payload: Value = serde_json::from_str(
+            r#"{
+                "contents": [{
+                    "musicResponsiveListItemRenderer": {
+                        "playlistItemData": { "videoId": "longmix0001" },
+                        "flexColumns": [
+                            { "musicResponsiveListItemFlexColumnRenderer": {
+                                "text": { "runs": [{ "text": "Late Night Mix" }] }
+                            }},
+                            { "musicResponsiveListItemFlexColumnRenderer": {
+                                "text": { "runs": [{ "text": "Song • DJ Set • 1:15:42 • 12K plays" }] }
+                            }}
+                        ]
+                    }
+                }]
+            }"#,
+        )
+        .expect("json");
+
+        let songs = p.collect_songs_deep(&payload, None);
+        assert_eq!(songs.len(), 1);
+        assert_eq!(songs[0].duration_text.as_deref(), Some("1:15:42"));
+        assert_eq!(songs[0].artist, "DJ Set");
+
+        let card: Value = serde_json::from_str(
+            r#"{
+                "title": { "runs": [{ "text": "Podcast Episode" }] },
+                "subtitle": { "runs": [{ "text": "Host Name • 2:05:09 • 5.4K views" }] },
+                "onTap": { "watchEndpoint": { "videoId": "pod00000001" } }
+            }"#,
+        )
+        .expect("card json");
+        let card_song = p
+            .parse_card_shelf_song(card.as_object().expect("obj"))
+            .expect("card song");
+        assert_eq!(card_song.duration_text.as_deref(), Some("2:05:09"));
+        assert_eq!(card_song.artist, "Host Name");
     }
 }

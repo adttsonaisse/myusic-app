@@ -34,6 +34,7 @@ pub use stream::YtDlpStreamBackend;
 pub use stream::{
     AUTH_BOUNDARY_BYTES, BgUtilHttpProvider, BoxFuture, ContainerPreference, FallbackStreamBackend,
     NativeStreamBackend, NoopPoTokenProvider, PROBE_READ_BYTES, PoTokenPair, PoTokenProvider,
-    ResolveRequest, ResolvedStream, StreamBackend, StreamResolver, classify_permanent_reason,
+    ProbePolicy, ResolveRequest, ResolvedStream, StreamBackend, StreamResolver,
+    classify_permanent_reason,
 };
 pub use uploaded::UploadedTracks;
