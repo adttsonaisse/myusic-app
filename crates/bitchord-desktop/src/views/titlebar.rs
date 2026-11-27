@@ -7,6 +7,7 @@ use gpui::{Context, Focusable, FontWeight, MouseButton, div, px};
 
 use crate::actions::Route;
 use crate::app::BitChordApp;
+use crate::branding;
 use crate::icons;
 
 impl BitChordApp {
@@ -42,6 +43,21 @@ impl BitChordApp {
                         el.on_mouse_down(MouseButton::Left, |_ev, window, _cx| {
                             window.start_window_move();
                         })
+                    })
+                    .when(self.sidebar_collapsed, |el| {
+                        el.child(
+                            div()
+                                .text_size(px(14.0))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(theme.accent)
+                                .child(branding::APP_NAME),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .text_color(theme.text_muted)
+                                .child("·"),
+                        )
                     })
                     .child(
                         div()

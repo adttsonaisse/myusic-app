@@ -3,10 +3,9 @@
 //! auto-scrolling lyrics, debounced search suggestions, backend event
 //! consumption, and view routing.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use bitchord_audio::{
@@ -21,8 +20,8 @@ use bitchord_model::{
 use bitchord_storage::{AudioOutputPreference, SearchHistoryRecord, format_duration_ms};
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, Context, Decorations, Entity, FocusHandle, Focusable, ListAlignment, ListOffset,
-    ListState, ObjectFit, Pixels, Render, Task, Window, div, img, px,
+    App, Context, Decorations, Entity, FocusHandle, Focusable, ObjectFit, Render, Task, Window,
+    div, img, px,
 };
 
 use crate::actions::{
@@ -34,13 +33,16 @@ use crate::artwork::{
     ArtworkCache, ArtworkTier, fetch_and_decode_artwork_with_tier, song_thumbnail_url,
 };
 use crate::backend::{
-    AppBackend, BackendCommand, BackendEvent, DetailPayload, LibrarySnapshot, LyricsPayload,
-    LyricsSyncState, QueueViewSnapshot, SearchSuggestionsPayload, StreamBackendChoice,
+    AppBackend, BackendCommand, BackendEvent, DetailPayload, LibrarySnapshot, LyricsSyncState,
+    QueueViewSnapshot, SearchSuggestionsPayload, StreamBackendChoice,
 };
 use crate::branding;
 use crate::icons;
+use crate::pill_slider::PillSliderState;
 use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme::{ArtworkPalette, BitChordTheme, ThemeMode};
+use crate::views::lyrics_view::{LyricsClock, LyricsView, LyricsViewEvent, LyricsViewState};
+use crate::views::player_bar::resolve_effective_duration_ms;
 
 /// Async fetch state for any remote or local panel (`R-27`).
 #[derive(Debug, Clone)]
@@ -114,10 +116,10 @@ pub struct BitChordApp {
     pub playback_synced_at: Instant,
     pub queue: QueueViewSnapshot,
 
-    // Continuous pill slider bounds & drag seek throttling (`notes.md` #4)
-    pub bar_seek_bounds: Rc<Cell<Bounds<Pixels>>>,
-    pub np_seek_bounds: Rc<Cell<Bounds<Pixels>>>,
-    pub vol_slider_bounds: Rc<Cell<Bounds<Pixels>>>,
+    // Continuous pill slider states & drag seek throttling (`notes.md` #4)
+    pub bar_seek_slider: PillSliderState,
+    pub np_seek_slider: PillSliderState,
+    pub vol_slider: PillSliderState,
     pub last_drag_seek_at: Instant,
 
     // Screen data (explicit Loading / Empty / Error states)
@@ -127,17 +129,12 @@ pub struct BitChordApp {
     pub search_suggestions: SearchSuggestionsPayload,
     pub search_input_text: String,
     pub search_suggestions_open: bool,
+    pub search_suggest_selected_idx: Option<usize>,
     pub search_suggest_generation: u64,
     pub last_search_query: String,
     pub detail: LoadState<DetailPayload>,
-    pub lyrics: LoadState<LyricsPayload>,
-    pub lyrics_list_state: ListState,
+    pub lyrics_view: Entity<LyricsView>,
     pub show_translated_lyrics: bool,
-    pub active_lyric_idx: Option<usize>,
-    pub prev_lyric_idx: Option<usize>,
-    pub lyric_transition_at: Instant,
-    pub lyrics_last_frame_at: Instant,
-    pub lyrics_manual_scroll_until: Option<Instant>,
     pub library: LibrarySnapshot,
     pub liked_video_ids: HashSet<String>,
     pub library_source_filter: LibrarySourceFilter,
@@ -197,7 +194,10 @@ impl BitChordApp {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
 
-        let search_input = cx.new(|cx| TextInput::new("Search songs, artists, albums...", cx));
+        let search_input = cx.new(|cx| {
+            TextInput::new("Search songs, artists, albums...", cx).with_leading_icon(icons::SEARCH)
+        });
+        let lyrics_view = cx.new(LyricsView::new);
         let default_music_dir = backend
             .initial_settings
             .local_music_folders
@@ -273,10 +273,59 @@ impl BitChordApp {
         subscriptions.push(
             cx.subscribe(&search_input, |this, _, event, cx| match event {
                 TextInputEvent::Changed(query) => {
+                    this.search_suggest_selected_idx = None;
                     this.on_search_query_changed(query.clone(), cx);
                 }
                 TextInputEvent::Submitted(query) => {
-                    this.submit_search(query.clone(), cx);
+                    if !this.activate_selected_search_suggestion(cx) {
+                        this.submit_search(query.clone(), cx);
+                    }
+                }
+                TextInputEvent::ArrowDown => {
+                    this.move_search_suggestion_selection(1, cx);
+                }
+                TextInputEvent::ArrowUp => {
+                    this.move_search_suggestion_selection(-1, cx);
+                }
+                TextInputEvent::Escape => {
+                    this.search_suggestions_open = false;
+                    this.search_suggest_selected_idx = None;
+                    cx.notify();
+                }
+                TextInputEvent::Focused => {
+                    if this.search_input_text.trim().len() >= 2
+                        && (!this.search_suggestions.queries.is_empty()
+                            || !this.search_suggestions.items.is_empty())
+                    {
+                        this.search_suggestions_open = true;
+                        cx.notify();
+                    }
+                }
+            }),
+        );
+        subscriptions.push(
+            cx.subscribe(&lyrics_view, |this, _, event, cx| match event {
+                LyricsViewEvent::SeekMs(ms) => {
+                    this.playback.position_ms = *ms;
+                    this.playback_synced_at = Instant::now();
+                    this.sync_lyrics_clock(cx);
+                    this.send(BackendCommand::SeekMs(*ms), cx);
+                    cx.notify();
+                }
+                LyricsViewEvent::ToggleTranslate => {
+                    this.show_translated_lyrics = !this.show_translated_lyrics;
+                    let show = this.show_translated_lyrics;
+                    this.lyrics_view
+                        .update(cx, |lv, cx| lv.set_show_translated(show, cx));
+                    if show {
+                        this.send(
+                            BackendCommand::TranslateLyrics {
+                                target_lang: "en".to_owned(),
+                            },
+                            cx,
+                        );
+                    }
+                    cx.notify();
                 }
             }),
         );
@@ -367,9 +416,9 @@ impl BitChordApp {
             playback,
             playback_synced_at: now,
             queue: QueueViewSnapshot::default(),
-            bar_seek_bounds: Rc::new(Cell::new(Bounds::default())),
-            np_seek_bounds: Rc::new(Cell::new(Bounds::default())),
-            vol_slider_bounds: Rc::new(Cell::new(Bounds::default())),
+            bar_seek_slider: PillSliderState::new(),
+            np_seek_slider: PillSliderState::new(),
+            vol_slider: PillSliderState::new(),
             last_drag_seek_at: now,
             home: LoadState::Loading,
             search_filter: SearchFilter::Songs,
@@ -377,17 +426,12 @@ impl BitChordApp {
             search_suggestions: SearchSuggestionsPayload::default(),
             search_input_text: String::new(),
             search_suggestions_open: false,
+            search_suggest_selected_idx: None,
             search_suggest_generation: 0,
             last_search_query: String::new(),
             detail: LoadState::Idle,
-            lyrics: LoadState::Idle,
-            lyrics_list_state: ListState::new(0, ListAlignment::Top, px(260.0)),
+            lyrics_view,
             show_translated_lyrics: false,
-            active_lyric_idx: None,
-            prev_lyric_idx: None,
-            lyric_transition_at: now,
-            lyrics_last_frame_at: now,
-            lyrics_manual_scroll_until: None,
             library: LibrarySnapshot::default(),
             liked_video_ids: HashSet::new(),
             library_source_filter: LibrarySourceFilter::All,
@@ -444,6 +488,17 @@ impl BitChordApp {
         cx.global::<AppBackend>().send(cmd);
     }
 
+    /// Best known duration (ms) for the active track, falling back to `Song::duration_millis()`
+    /// and matching queue/library entries when the audio decoder reports `0` (`notes.md` §2 #4).
+    pub fn effective_duration_ms(&self) -> u64 {
+        resolve_effective_duration_ms(
+            self.playback.duration_ms,
+            self.playback.current_song.as_ref(),
+            &self.queue.items,
+            &self.library.songs,
+        )
+    }
+
     /// Interpolates current playhead smoothly between backend ticks for 60fps lyrics/scrubber.
     pub fn live_position_ms(&self) -> u64 {
         if self.playback.state != PlaybackState::Playing {
@@ -453,16 +508,25 @@ impl BitChordApp {
             * f64::from(self.playback.speed))
         .round() as u64;
         let est = self.playback.position_ms.saturating_add(elapsed);
-        if self.playback.duration_ms > 0 {
-            est.min(self.playback.duration_ms)
-        } else {
-            est
-        }
+        let dur_ms = self.effective_duration_ms();
+        if dur_ms > 0 { est.min(dur_ms) } else { est }
     }
 
-    /// Seeks immediately on click, or throttled (~90 ms) while dragging a pill scrubber.
+    /// Pushes the latest playback timing snapshot to [`LyricsView`].
+    fn sync_lyrics_clock(&self, cx: &mut Context<Self>) {
+        let clock = LyricsClock {
+            position_ms: self.playback.position_ms,
+            duration_ms: self.effective_duration_ms(),
+            speed: self.playback.speed,
+            playing: self.playback.state == PlaybackState::Playing,
+            synced_at: self.playback_synced_at,
+        };
+        self.lyrics_view.update(cx, |lv, cx| lv.set_clock(clock, cx));
+    }
+
+    /// Seeks immediately on click/release, or throttled (~90 ms) while dragging a pill scrubber.
     pub fn seek_fraction(&mut self, frac: f32, is_drag: bool, cx: &mut Context<Self>) {
-        let dur_ms = self.playback.duration_ms;
+        let dur_ms = self.effective_duration_ms();
         if dur_ms == 0 {
             return;
         }
@@ -471,6 +535,7 @@ impl BitChordApp {
         // Optimistically update local position so the continuous pill follows pointer at 60fps.
         self.playback.position_ms = target_ms;
         self.playback_synced_at = Instant::now();
+        self.sync_lyrics_clock(cx);
         if !is_drag || self.last_drag_seek_at.elapsed() >= Duration::from_millis(90) {
             self.last_drag_seek_at = Instant::now();
             self.send(BackendCommand::SeekMs(target_ms), cx);
@@ -563,6 +628,7 @@ impl BitChordApp {
         }
         self.search_input_text = trimmed.clone();
         self.search_suggestions_open = false;
+        self.search_suggest_selected_idx = None;
         self.search_suggest_generation = self.search_suggest_generation.wrapping_add(1);
         self.search_suggest_task = None;
         self.last_search_query = trimmed.clone();
@@ -611,13 +677,11 @@ impl BitChordApp {
     }
 
     /// Returns whether `video_id` is currently marked as liked/favorited.
-    #[allow(dead_code)]
     pub fn is_song_liked(&self, video_id: &str) -> bool {
         self.liked_video_ids.contains(video_id)
     }
 
     /// Returns whether the currently loaded track is liked/favorited.
-    #[allow(dead_code)]
     pub fn is_current_song_liked(&self) -> bool {
         self.playback
             .current_song
@@ -626,7 +690,6 @@ impl BitChordApp {
     }
 
     /// Optimistically toggles the liked status of `song` in UI state and persists via SQLite.
-    #[allow(dead_code)]
     pub fn toggle_like_song(&mut self, song: Song, cx: &mut Context<Self>) {
         if self.liked_video_ids.contains(&song.video_id) {
             self.liked_video_ids.remove(&song.video_id);
@@ -639,7 +702,6 @@ impl BitChordApp {
     }
 
     /// Toggles liked status for the currently active track (no-op if no track is loaded).
-    #[allow(dead_code)]
     pub fn toggle_like_current_song(&mut self, cx: &mut Context<Self>) {
         if let Some(song) = self.playback.current_song.clone() {
             self.toggle_like_song(song, cx);
@@ -776,73 +838,6 @@ impl BitChordApp {
         }));
     }
 
-    /// Smoothly auto-scrolls the Now Playing lyrics list whenever the active verse advances
-    /// (`notes.md` #3), respecting temporary manual user scrolling.
-    fn sync_lyrics_scroll(&mut self) -> bool {
-        if self.route != Route::NowPlaying {
-            return false;
-        }
-        let LoadState::Ready(ref payload) = self.lyrics else {
-            return false;
-        };
-        if payload.lines.is_empty() {
-            return false;
-        }
-
-        let pos_ms = self.live_position_ms() as i64;
-        let active_idx = payload.lines.iter().rposition(|l| pos_ms >= l.time_ms);
-
-        let now = Instant::now();
-        let dt = now
-            .duration_since(self.lyrics_last_frame_at)
-            .as_secs_f32()
-            .clamp(0.001, 0.05);
-        self.lyrics_last_frame_at = now;
-
-        if active_idx != self.active_lyric_idx {
-            self.prev_lyric_idx = self.active_lyric_idx;
-            self.active_lyric_idx = active_idx;
-            self.lyric_transition_at = now;
-        }
-
-        let mut animating = self.lyric_transition_at.elapsed() < Duration::from_millis(520);
-        let manual_paused = self
-            .lyrics_manual_scroll_until
-            .is_some_and(|until| now < until);
-
-        if !manual_paused && let Some(idx) = active_idx {
-            let vp = self.lyrics_list_state.viewport_bounds();
-            let vp_h = f32::from(vp.size.height);
-            if vp_h > 40.0 {
-                // Keep active verse comfortably positioned ~28% down the lyrics viewport.
-                let target_y = vp.origin.y + px(vp_h * 0.28);
-                if let Some(item_b) = self.lyrics_list_state.bounds_for_item(idx) {
-                    let delta = f32::from(item_b.origin.y - target_y);
-                    if delta.abs() > 0.75 {
-                        // Exponential ease-out: silky ~320 ms glide on verse change!
-                        let alpha = 1.0 - (-9.0 * dt).exp();
-                        let step = if delta.abs() < 1.5 {
-                            delta
-                        } else {
-                            delta * alpha
-                        };
-                        self.lyrics_list_state.scroll_by(px(step));
-                        animating = true;
-                    }
-                } else {
-                    // Active line is off-screen (e.g., seek jump or opened mid-track):
-                    // jump close so next frame glides smoothly into exact 28% focal alignment.
-                    self.lyrics_list_state.scroll_to(ListOffset {
-                        item_ix: idx.saturating_sub(2),
-                        offset_in_item: px(0.0),
-                    });
-                    animating = true;
-                }
-            }
-        }
-        animating
-    }
-
     fn handle_backend_event(&mut self, evt: BackendEvent, cx: &mut Context<Self>) {
         match evt {
             BackendEvent::FullStateSynced(full) => {
@@ -872,29 +867,14 @@ impl BitChordApp {
                 self.playback_synced_at = Instant::now();
                 self.queue = full.queue;
 
-                self.active_lyric_idx = None;
-                self.prev_lyric_idx = None;
-                self.lyrics_manual_scroll_until = None;
-                match full.lyrics {
-                    LyricsSyncState::Idle => {
-                        self.lyrics = LoadState::Idle;
-                        self.lyrics_list_state = ListState::new(0, ListAlignment::Top, px(260.0));
-                    }
-                    LyricsSyncState::Loading => {
-                        self.lyrics = LoadState::Loading;
-                        self.lyrics_list_state = ListState::new(0, ListAlignment::Top, px(260.0));
-                    }
-                    LyricsSyncState::Ready(payload) => {
-                        let count = payload.lines.len();
-                        self.lyrics_list_state =
-                            ListState::new(count, ListAlignment::Top, px(260.0));
-                        self.lyrics = LoadState::Ready(payload);
-                    }
-                    LyricsSyncState::Error(err) => {
-                        self.lyrics = LoadState::Error(err);
-                        self.lyrics_list_state = ListState::new(0, ListAlignment::Top, px(260.0));
-                    }
-                }
+                let lyrics_state = match full.lyrics {
+                    LyricsSyncState::Idle => LyricsViewState::Idle,
+                    LyricsSyncState::Loading => LyricsViewState::Loading,
+                    LyricsSyncState::Ready(payload) => LyricsViewState::Ready(Box::new(payload)),
+                    LyricsSyncState::Error(err) => LyricsViewState::Error(err),
+                };
+                self.lyrics_view
+                    .update(cx, |lv, cx| lv.set_state(lyrics_state, cx));
 
                 if let Some(feed) = full.home {
                     for shelf in &feed.shelves {
@@ -935,6 +915,7 @@ impl BitChordApp {
                 self.automix_mode = full.automix_mode;
                 self.automix_phrase_bars = full.automix_phrase_bars;
                 self.discord_rpc_enabled = full.discord_rpc_enabled;
+                self.sync_lyrics_clock(cx);
 
                 if let Some(ref hero_url) = current_art_url {
                     self.ensure_artwork_loaded_tier(hero_url, ArtworkTier::Hero, cx);
@@ -970,6 +951,7 @@ impl BitChordApp {
                 }
                 self.playback = snap;
                 self.playback_synced_at = Instant::now();
+                self.sync_lyrics_clock(cx);
             }
             BackendEvent::QueueUpdated(q) => {
                 let urls: Vec<String> = q
@@ -979,6 +961,7 @@ impl BitChordApp {
                     .filter_map(song_thumbnail_url)
                     .collect();
                 self.queue = q;
+                self.sync_lyrics_clock(cx);
                 for u in urls {
                     self.ensure_artwork_loaded(&u, cx);
                 }
@@ -1057,6 +1040,7 @@ impl BitChordApp {
                         })
                         .collect();
                     self.search_suggestions = payload;
+                    self.search_suggest_selected_idx = None;
                     for u in urls {
                         self.ensure_artwork_loaded(&u, cx);
                     }
@@ -1067,18 +1051,21 @@ impl BitChordApp {
             }
             BackendEvent::DetailLoaded(res) => match res {
                 Ok(payload) => {
+                    let hero_url = payload
+                        .header
+                        .as_ref()
+                        .and_then(|h| h.thumbnail_url.clone())
+                        .or_else(|| payload.songs.first().and_then(song_thumbnail_url));
                     let mut urls = Vec::new();
-                    if let Some(ref h) = payload.header
-                        && let Some(ref u) = h.thumbnail_url
-                    {
-                        urls.push(u.clone());
-                    }
                     for s in payload.songs.iter().take(24) {
                         if let Some(u) = song_thumbnail_url(s) {
                             urls.push(u);
                         }
                     }
                     self.detail = LoadState::Ready(payload);
+                    if let Some(ref h_url) = hero_url {
+                        self.ensure_artwork_loaded_tier(h_url, ArtworkTier::Hero, cx);
+                    }
                     for u in urls {
                         self.ensure_artwork_loaded(&u, cx);
                     }
@@ -1088,11 +1075,8 @@ impl BitChordApp {
                 }
             },
             BackendEvent::LyricsLoading => {
-                self.lyrics = LoadState::Loading;
-                self.active_lyric_idx = None;
-                self.prev_lyric_idx = None;
-                self.lyrics_manual_scroll_until = None;
-                self.lyrics_list_state = ListState::new(0, ListAlignment::Top, px(260.0));
+                self.lyrics_view
+                    .update(cx, |lv, cx| lv.set_state(LyricsViewState::Loading, cx));
             }
             BackendEvent::LyricsLoaded { video_id, result } => {
                 let current_vid = self
@@ -1103,23 +1087,13 @@ impl BitChordApp {
                 if current_vid.is_some() && current_vid != Some(video_id.as_str()) {
                     return;
                 }
-                match result {
-                    Ok(payload) => {
-                        let count = payload.lines.len();
-                        self.active_lyric_idx = None;
-                        self.prev_lyric_idx = None;
-                        self.lyrics_manual_scroll_until = None;
-                        self.lyrics_list_state =
-                            ListState::new(count, ListAlignment::Top, px(260.0));
-                        self.lyrics = LoadState::Ready(payload);
-                    }
-                    Err(err) => {
-                        self.lyrics = LoadState::Error(err);
-                        self.active_lyric_idx = None;
-                        self.prev_lyric_idx = None;
-                        self.lyrics_list_state = ListState::new(0, ListAlignment::Top, px(260.0));
-                    }
-                }
+                let next_state = match result {
+                    Ok(payload) => LyricsViewState::Ready(Box::new(payload)),
+                    Err(err) => LyricsViewState::Error(err),
+                };
+                self.lyrics_view
+                    .update(cx, |lv, cx| lv.set_state(next_state, cx));
+                self.sync_lyrics_clock(cx);
             }
             BackendEvent::LibraryLoaded(lib) => {
                 let mut urls = Vec::new();
@@ -1351,6 +1325,7 @@ impl BitChordApp {
     fn on_escape_close(&mut self, _: &CloseWindowAction, _w: &mut Window, cx: &mut Context<Self>) {
         if self.search_suggestions_open {
             self.search_suggestions_open = false;
+            self.search_suggest_selected_idx = None;
             cx.notify();
         } else if self.queue_open {
             self.queue_open = false;
@@ -1377,14 +1352,6 @@ impl Render for BitChordApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme();
         let is_csd = matches!(window.window_decorations(), Decorations::Client { .. });
-
-        // Smoothly drive lyrics auto-scroll & verse transitions when Now Playing is visible.
-        let lyrics_animating = self.sync_lyrics_scroll();
-        if self.route == Route::NowPlaying
-            && (self.playback.state == PlaybackState::Playing || lyrics_animating)
-        {
-            window.request_animation_frame();
-        }
 
         let content_area = match &self.route {
             Route::Home => self.render_home(cx).into_any_element(),

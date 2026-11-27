@@ -6,7 +6,7 @@ use gpui::prelude::*;
 use gpui::{Context, FontWeight, div, px, uniform_list};
 
 use crate::app::{BitChordApp, LoadState};
-use crate::artwork::song_thumbnail_url;
+use crate::artwork::{ArtworkTier, song_thumbnail_url};
 use crate::backend::BackendCommand;
 use crate::icons;
 
@@ -65,16 +65,17 @@ impl BitChordApp {
                     .flex()
                     .flex_col()
                     .gap(px(18.0))
-                    // Detail header
+                    // Detail header with crisp 512px Hero cover artwork
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(20.0))
-                            .child(self.render_art_box(
+                            .gap(px(22.0))
+                            .child(self.render_art_box_with_tier(
                                 thumb.as_deref(),
-                                136.0,
-                                12.0,
+                                168.0,
+                                14.0,
+                                ArtworkTier::Hero,
                                 icons::DISC,
                                 theme,
                             ))
@@ -226,10 +227,12 @@ impl BitChordApp {
                                         .map(|(idx, song)| {
                                             let is_current =
                                                 active_vid == Some(song.video_id.as_str());
+                                            let is_liked = this.is_song_liked(&song.video_id);
                                             let play_list = all_songs.clone();
                                             let st = src_title.clone();
                                             let bid_c = bid.clone();
                                             let next_song = song.clone();
+                                            let like_song = song.clone();
                                             let art = song_thumbnail_url(&song);
 
                                             div()
@@ -324,7 +327,8 @@ impl BitChordApp {
                                                     div()
                                                         .flex()
                                                         .items_center()
-                                                        .gap(px(10.0))
+                                                        .gap(px(8.0))
+                                                        .flex_shrink_0()
                                                         .child(
                                                             div()
                                                                 .text_size(px(12.0))
@@ -334,6 +338,41 @@ impl BitChordApp {
                                                                         .clone()
                                                                         .unwrap_or_default(),
                                                                 ),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .id(("detail-like", idx))
+                                                                .w(px(28.0))
+                                                                .h(px(28.0))
+                                                                .rounded(px(7.0))
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_center()
+                                                                .hover(move |st| {
+                                                                    st.bg(t.surface_active)
+                                                                })
+                                                                .on_click(cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        this.toggle_like_song(
+                                                                            like_song.clone(),
+                                                                            cx,
+                                                                        );
+                                                                        cx.stop_propagation();
+                                                                    },
+                                                                ))
+                                                                .child(icons::icon(
+                                                                    if is_liked {
+                                                                        icons::HEART_FILLED
+                                                                    } else {
+                                                                        icons::HEART
+                                                                    },
+                                                                    14.0,
+                                                                    if is_liked {
+                                                                        t.accent
+                                                                    } else {
+                                                                        t.text_muted
+                                                                    },
+                                                                )),
                                                         )
                                                         .child(
                                                             div()
@@ -368,8 +407,8 @@ impl BitChordApp {
                                                                     },
                                                                 ))
                                                                 .child(icons::icon(
-                                                                    icons::PLUS,
-                                                                    12.0,
+                                                                    icons::LIST_PLUS,
+                                                                    12.5,
                                                                     t.text_secondary,
                                                                 ))
                                                                 .child("Next"),

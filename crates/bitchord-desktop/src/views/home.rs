@@ -1,6 +1,6 @@
-//! Home feed screen (`W4-2`) showing live YouTube Music InnerTube shelves
-//! plus recent local library tracks with vector SVG icons, automatic lazy
-//! cover-art loading, and distinct loading, empty, and error states.
+//! Home feed screen (`W4-2`) showing live YouTube Music InnerTube horizontal
+//! scrollable shelves plus recent local library tracks with Lucide SVG icons,
+//! automatic lazy cover-art loading, and distinct loading, empty, and error states.
 
 use bitchord_model::{BrowseType, PlaybackSourceType, Song};
 use gpui::prelude::*;
@@ -10,6 +10,7 @@ use crate::actions::Route;
 use crate::app::{BitChordApp, LoadState};
 use crate::artwork::song_thumbnail_url;
 use crate::backend::BackendCommand;
+use crate::branding;
 use crate::icons;
 
 impl BitChordApp {
@@ -31,6 +32,7 @@ impl BitChordApp {
                     .flex()
                     .items_center()
                     .justify_between()
+                    .gap(px(12.0))
                     .child(
                         div()
                             .flex()
@@ -47,7 +49,10 @@ impl BitChordApp {
                                 div()
                                     .text_size(px(13.0))
                                     .text_color(theme.text_muted)
-                                    .child("YouTube Music feed and local library"),
+                                    .child(format!(
+                                        "{} · YouTube Music shelves and local library",
+                                        branding::APP_NAME
+                                    )),
                             ),
                     )
                     .child(
@@ -55,6 +60,7 @@ impl BitChordApp {
                             .flex()
                             .items_center()
                             .gap(px(8.0))
+                            .flex_shrink_0()
                             .child(
                                 div()
                                     .id("home-refresh")
@@ -100,26 +106,45 @@ impl BitChordApp {
                             ),
                     ),
             )
-            // Recent Local / Cached Tracks strip (only shown when real tracks exist)
+            // Recent Local / Cached Tracks horizontal quick-pick strip (only shown when tracks exist)
             .when(!self.library.songs.is_empty(), |el| {
                 let songs = self.library.songs.clone();
-                let preview: Vec<_> = songs.iter().take(6).cloned().collect();
+                let preview: Vec<_> = songs.iter().take(10).cloned().collect();
                 el.child(
                     div()
+                        .w_full()
+                        .min_w(px(0.0))
                         .flex()
                         .flex_col()
                         .gap(px(10.0))
                         .child(
                             div()
-                                .text_size(px(17.5))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(theme.text_primary)
-                                .child("Recent & Local Library"),
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(17.5))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(theme.text_primary)
+                                        .child("Recent & Local Library"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(theme.text_muted)
+                                        .child(format!("{} tracks", songs.len())),
+                                ),
                         )
                         .child(
                             div()
+                                .id("home-local-rail")
+                                .w_full()
+                                .min_w(px(0.0))
+                                .overflow_x_scroll()
+                                .pb(px(4.0))
                                 .flex()
-                                .flex_wrap()
+                                .flex_row()
                                 .gap(px(10.0))
                                 .children(preview.into_iter().enumerate().map(|(idx, song)| {
                                     let all = songs.clone();
@@ -128,7 +153,8 @@ impl BitChordApp {
                                     let art_url = song_thumbnail_url(&song);
                                     div()
                                         .id(("home-local-card", idx))
-                                        .w(px(286.0))
+                                        .w(px(268.0))
+                                        .flex_shrink_0()
                                         .p(px(10.0))
                                         .rounded(px(12.0))
                                         .bg(theme.surface)
@@ -168,16 +194,14 @@ impl BitChordApp {
                                                         .text_size(px(13.5))
                                                         .font_weight(FontWeight::SEMIBOLD)
                                                         .text_color(theme.text_primary)
-                                                        .overflow_hidden()
-                                                        .whitespace_nowrap()
+                                                        .truncate()
                                                         .child(title),
                                                 )
                                                 .child(
                                                     div()
                                                         .text_size(px(12.0))
                                                         .text_color(theme.text_muted)
-                                                        .overflow_hidden()
-                                                        .whitespace_nowrap()
+                                                        .truncate()
                                                         .child(artist),
                                                 ),
                                         )
@@ -186,7 +210,7 @@ impl BitChordApp {
                         ),
                 )
             })
-            // Remote YouTube Music Home Shelves (Loading / Error / Empty / Populated)
+            // Remote YouTube Music Home Shelves (horizontal scrollable rails)
             .child(match &self.home {
                 LoadState::Idle | LoadState::Loading => div()
                     .p(px(24.0))
@@ -268,6 +292,8 @@ impl BitChordApp {
                     )
                     .into_any_element(),
                 LoadState::Ready(feed) => div()
+                    .w_full()
+                    .min_w(px(0.0))
                     .flex()
                     .flex_col()
                     .gap(px(26.0))
@@ -289,22 +315,42 @@ impl BitChordApp {
                             .collect();
 
                         div()
+                            .w_full()
+                            .min_w(px(0.0))
                             .flex()
                             .flex_col()
                             .gap(px(12.0))
                             .child(
                                 div()
-                                    .text_size(px(18.0))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(theme.text_primary)
-                                    .child(shelf_title.clone()),
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_size(px(18.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(theme.text_primary)
+                                            .child(shelf_title.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .text_color(theme.text_muted)
+                                            .child(format!("{} items", shelf.items.len())),
+                                    ),
                             )
+                            // Single-row horizontal scrolling card rail
                             .child(
                                 div()
+                                    .id(("home-shelf-rail", s_idx))
+                                    .w_full()
+                                    .min_w(px(0.0))
+                                    .overflow_x_scroll()
+                                    .pb(px(6.0))
                                     .flex()
-                                    .flex_wrap()
+                                    .flex_row()
                                     .gap(px(14.0))
-                                    .children(shelf.items.iter().take(10).enumerate().map(
+                                    .children(shelf.items.iter().take(16).enumerate().map(
                                         |(i_idx, item)| {
                                             if let Some(ref vid) = item.video_id {
                                                 let s = Song::new(
@@ -326,7 +372,8 @@ impl BitChordApp {
                                                 let src_title = shelf_title.clone();
                                                 div()
                                                     .id(("home-track", s_idx * 100 + i_idx))
-                                                    .w(px(166.0))
+                                                    .w(px(168.0))
+                                                    .flex_shrink_0()
                                                     .p(px(11.0))
                                                     .rounded(px(12.0))
                                                     .bg(theme.surface)
@@ -347,28 +394,51 @@ impl BitChordApp {
                                                             cx,
                                                         );
                                                     }))
-                                                    .child(self.render_art_box(
-                                                        art.as_deref(),
-                                                        142.0,
-                                                        9.0,
-                                                        icons::MUSIC_NOTE,
-                                                        theme,
-                                                    ))
+                                                    .child(
+                                                        div()
+                                                            .relative()
+                                                            .w(px(144.0))
+                                                            .h(px(144.0))
+                                                            .child(self.render_art_box(
+                                                                art.as_deref(),
+                                                                144.0,
+                                                                9.0,
+                                                                icons::MUSIC_NOTE,
+                                                                theme,
+                                                            ))
+                                                            .child(
+                                                                div()
+                                                                    .absolute()
+                                                                    .right(px(7.0))
+                                                                    .bottom(px(7.0))
+                                                                    .w(px(28.0))
+                                                                    .h(px(28.0))
+                                                                    .rounded_full()
+                                                                    .bg(theme.accent)
+                                                                    .shadow_md()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .justify_center()
+                                                                    .child(icons::icon(
+                                                                        icons::PLAY,
+                                                                        12.0,
+                                                                        theme.on_accent,
+                                                                    )),
+                                                            ),
+                                                    )
                                                     .child(
                                                         div()
                                                             .text_size(px(13.0))
                                                             .font_weight(FontWeight::SEMIBOLD)
                                                             .text_color(theme.text_primary)
-                                                            .overflow_hidden()
-                                                            .whitespace_nowrap()
+                                                            .truncate()
                                                             .child(s.title.clone()),
                                                     )
                                                     .child(
                                                         div()
                                                             .text_size(px(11.5))
                                                             .text_color(theme.text_muted)
-                                                            .overflow_hidden()
-                                                            .whitespace_nowrap()
+                                                            .truncate()
                                                             .child(s.artist.clone()),
                                                     )
                                                     .into_any_element()
@@ -385,7 +455,8 @@ impl BitChordApp {
                                                 };
                                                 div()
                                                     .id(("home-browse", s_idx * 100 + i_idx))
-                                                    .w(px(166.0))
+                                                    .w(px(168.0))
+                                                    .flex_shrink_0()
                                                     .p(px(11.0))
                                                     .rounded(px(12.0))
                                                     .bg(theme.surface)
@@ -409,9 +480,17 @@ impl BitChordApp {
                                                     }))
                                                     .child(self.render_art_box(
                                                         item.thumbnail_url.as_deref(),
-                                                        142.0,
-                                                        9.0,
-                                                        icons::DISC,
+                                                        144.0,
+                                                        if kind == BrowseType::Artist {
+                                                            72.0
+                                                        } else {
+                                                            9.0
+                                                        },
+                                                        if kind == BrowseType::Artist {
+                                                            icons::USERS
+                                                        } else {
+                                                            icons::DISC
+                                                        },
                                                         theme,
                                                     ))
                                                     .child(
@@ -419,16 +498,14 @@ impl BitChordApp {
                                                             .text_size(px(13.0))
                                                             .font_weight(FontWeight::SEMIBOLD)
                                                             .text_color(theme.text_primary)
-                                                            .overflow_hidden()
-                                                            .whitespace_nowrap()
+                                                            .truncate()
                                                             .child(item.title.clone()),
                                                     )
                                                     .child(
                                                         div()
                                                             .text_size(px(11.5))
                                                             .text_color(theme.text_muted)
-                                                            .overflow_hidden()
-                                                            .whitespace_nowrap()
+                                                            .truncate()
                                                             .child(item.subtitle.clone()),
                                                     )
                                                     .into_any_element()

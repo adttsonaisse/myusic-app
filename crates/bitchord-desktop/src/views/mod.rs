@@ -1,6 +1,7 @@
 pub mod detail;
 pub mod home;
 pub mod library;
+pub mod lyrics_view;
 pub mod now_playing;
 pub mod party;
 pub mod player_bar;

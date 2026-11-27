@@ -62,8 +62,11 @@ impl BitChordApp {
                                     .text_size(px(12.5))
                                     .text_color(theme.text_muted)
                                     .child(format!(
-                                        "{} songs · {} playlists · {} plays recorded",
-                                        stats.songs, stats.playlists, stats.listening_history
+                                        "{} songs · {} liked · {} playlists · {} plays recorded",
+                                        stats.songs,
+                                        self.liked_video_ids.len(),
+                                        stats.playlists,
+                                        stats.listening_history
                                     )),
                             ),
                     )
@@ -255,6 +258,7 @@ impl BitChordApp {
                             .filter_map(|idx| all_songs.get(idx).map(|s| (idx, s.clone())))
                             .map(|(idx, song)| {
                                 let is_cur = active_vid == Some(song.video_id.as_str());
+                                let is_liked = this.is_song_liked(&song.video_id);
                                 let source_badge = if song.video_id.starts_with("webdav:") {
                                     "WEBDAV"
                                 } else if song.video_id.starts_with("smb:") {
@@ -266,6 +270,7 @@ impl BitChordApp {
                                 };
                                 let songs_c = all_songs.clone();
                                 let next_s = song.clone();
+                                let like_s = song.clone();
                                 let art = song_thumbnail_url(&song);
 
                                 div()
@@ -351,7 +356,41 @@ impl BitChordApp {
                                         div()
                                             .flex()
                                             .items_center()
-                                            .gap(px(10.0))
+                                            .gap(px(8.0))
+                                            .flex_shrink_0()
+                                            .child(
+                                                div()
+                                                    .id(("lib-like", idx))
+                                                    .w(px(28.0))
+                                                    .h(px(28.0))
+                                                    .rounded(px(7.0))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .hover(move |st| st.bg(t.surface_active))
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            this.toggle_like_song(
+                                                                like_s.clone(),
+                                                                cx,
+                                                            );
+                                                            cx.stop_propagation();
+                                                        },
+                                                    ))
+                                                    .child(icons::icon(
+                                                        if is_liked {
+                                                            icons::HEART_FILLED
+                                                        } else {
+                                                            icons::HEART
+                                                        },
+                                                        14.0,
+                                                        if is_liked {
+                                                            t.accent
+                                                        } else {
+                                                            t.text_muted
+                                                        },
+                                                    )),
+                                            )
                                             .child(
                                                 div()
                                                     .px(px(7.0))
@@ -389,8 +428,8 @@ impl BitChordApp {
                                                         },
                                                     ))
                                                     .child(icons::icon(
-                                                        icons::PLUS,
-                                                        12.0,
+                                                        icons::LIST_PLUS,
+                                                        12.5,
                                                         t.text_secondary,
                                                     ))
                                                     .child("Next"),

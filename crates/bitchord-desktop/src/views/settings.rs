@@ -11,6 +11,7 @@ use gpui::{Context, FontWeight, Window, div, px};
 
 use crate::app::BitChordApp;
 use crate::backend::{AppBackend, BackendCommand, StreamBackendChoice};
+use crate::branding;
 use crate::icons;
 use crate::theme::{ActiveTheme, BitChordTheme};
 
@@ -858,7 +859,7 @@ impl BitChordApp {
                             ),
                     ),
             )
-            // 7. XDG Linux Storage Paths
+            // 7. About Myusic & XDG Linux Storage Paths
             .child(
                 section_card("Linux XDG Directories", icons::FOLDER, theme).child(
                     div()
@@ -867,6 +868,11 @@ impl BitChordApp {
                         .gap(px(4.0))
                         .text_size(px(12.0))
                         .text_color(theme.text_muted)
+                        .child(format!(
+                            "Application: {} ({})",
+                            branding::APP_NAME,
+                            branding::APP_ID
+                        ))
                         .child(format!("Config: {}", paths.config_dir.display()))
                         .child(format!("Database: {}", paths.db_file().display()))
                         .child(format!("Cache: {}", paths.cache_dir.display()))

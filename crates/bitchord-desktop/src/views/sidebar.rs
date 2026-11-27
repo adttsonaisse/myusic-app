@@ -7,6 +7,7 @@ use gpui::{Context, FontWeight, div, px};
 
 use crate::actions::Route;
 use crate::app::BitChordApp;
+use crate::branding;
 use crate::icons;
 use crate::theme::{BitChordTheme, ThemeMode};
 
@@ -76,7 +77,7 @@ impl BitChordApp {
                                             .text_size(px(16.0))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(theme.text_primary)
-                                            .child("Myusic"),
+                                            .child(branding::APP_NAME),
                                     )
                                     .into_any_element()
                             })
