@@ -4,7 +4,7 @@
 //! consumption, and view routing.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -15,10 +15,10 @@ use bitchord_audio::{
 use bitchord_dsp_core::{EqLayout, EqualizerPreset};
 use bitchord_integrations::ListenTogetherState;
 use bitchord_model::{
-    BrowseItem, BrowseType, EntityType, HomeFeed, PlaybackSourceType, SearchFilter,
-    SearchHistoryEntity, SearchResult, Song,
+    BrowseItem, BrowseType, EntityType, HomeFeed, PlaybackSourceType, SearchFilter, SearchResult,
+    Song,
 };
-use bitchord_storage::{AudioOutputPreference, format_duration_ms};
+use bitchord_storage::{AudioOutputPreference, SearchHistoryRecord, format_duration_ms};
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, Context, Decorations, Entity, FocusHandle, Focusable, ListAlignment, ListOffset,
@@ -30,11 +30,14 @@ use crate::actions::{
     SeekForward, ToggleLyrics, ToggleMute, ToggleNowPlaying, ToggleQueue, ToggleTheme, VolumeDown,
     VolumeUp,
 };
-use crate::artwork::{ArtworkCache, fetch_and_decode_artwork, song_thumbnail_url};
+use crate::artwork::{
+    ArtworkCache, ArtworkTier, fetch_and_decode_artwork_with_tier, song_thumbnail_url,
+};
 use crate::backend::{
     AppBackend, BackendCommand, BackendEvent, DetailPayload, LibrarySnapshot, LyricsPayload,
     LyricsSyncState, QueueViewSnapshot, SearchSuggestionsPayload, StreamBackendChoice,
 };
+use crate::branding;
 use crate::icons;
 use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme::{ArtworkPalette, BitChordTheme, ThemeMode};
@@ -124,6 +127,7 @@ pub struct BitChordApp {
     pub search_suggestions: SearchSuggestionsPayload,
     pub search_input_text: String,
     pub search_suggestions_open: bool,
+    pub search_suggest_generation: u64,
     pub last_search_query: String,
     pub detail: LoadState<DetailPayload>,
     pub lyrics: LoadState<LyricsPayload>,
@@ -135,6 +139,7 @@ pub struct BitChordApp {
     pub lyrics_last_frame_at: Instant,
     pub lyrics_manual_scroll_until: Option<Instant>,
     pub library: LibrarySnapshot,
+    pub liked_video_ids: HashSet<String>,
     pub library_source_filter: LibrarySourceFilter,
     pub party: ListenTogetherState,
     pub party_probe_status: Option<String>,
@@ -155,7 +160,7 @@ pub struct BitChordApp {
     // Artwork LRU cache + active Now Playing mesh backdrop
     pub artwork_cache: ArtworkCache,
     pub default_mesh: std::sync::Arc<gpui::RenderImage>,
-    pending_art_urls: RefCell<Vec<String>>,
+    pending_art_urls: RefCell<Vec<(String, ArtworkTier)>>,
 
     // Transient feedback banner
     pub status_notice: Option<String>,
@@ -217,7 +222,7 @@ impl BitChordApp {
         let party_nick_input = cx.new(|cx| {
             TextInput::new("Display nickname", cx).with_initial(
                 if backend.initial_settings.listen_together_nickname.is_empty() {
-                    "Myusic Linux".to_owned()
+                    branding::DEFAULT_PARTY_NICKNAME.to_owned()
                 } else {
                     backend.initial_settings.listen_together_nickname.clone()
                 },
@@ -372,6 +377,7 @@ impl BitChordApp {
             search_suggestions: SearchSuggestionsPayload::default(),
             search_input_text: String::new(),
             search_suggestions_open: false,
+            search_suggest_generation: 0,
             last_search_query: String::new(),
             detail: LoadState::Idle,
             lyrics: LoadState::Idle,
@@ -383,6 +389,7 @@ impl BitChordApp {
             lyrics_last_frame_at: now,
             lyrics_manual_scroll_until: None,
             library: LibrarySnapshot::default(),
+            liked_video_ids: HashSet::new(),
             library_source_filter: LibrarySourceFilter::All,
             party: ListenTogetherState::default(),
             party_probe_status: None,
@@ -507,9 +514,12 @@ impl BitChordApp {
         );
     }
 
-    /// Debounces live YouTube Music query + song typeahead suggestions as the user types.
+    /// Debounces live YouTube Music query + song typeahead suggestions as the user types,
+    /// using a generation guard + backend cancellation so stale responses never overwrite newer input.
     pub fn on_search_query_changed(&mut self, query: String, cx: &mut Context<Self>) {
         self.search_input_text = query.clone();
+        self.search_suggest_generation = self.search_suggest_generation.wrapping_add(1);
+        let generation = self.search_suggest_generation;
         let trimmed = query.trim().to_owned();
         if trimmed.is_empty() {
             self.search_suggest_task = None;
@@ -517,6 +527,7 @@ impl BitChordApp {
             self.search_suggestions_open = false;
             self.search_results = LoadState::Idle;
             self.last_search_query.clear();
+            self.send(BackendCommand::SearchSuggest(String::new()), cx);
             cx.notify();
             return;
         }
@@ -524,6 +535,7 @@ impl BitChordApp {
             self.search_suggest_task = None;
             self.search_suggestions = SearchSuggestionsPayload::default();
             self.search_suggestions_open = false;
+            self.send(BackendCommand::SearchSuggest(String::new()), cx);
             cx.notify();
             return;
         }
@@ -531,10 +543,12 @@ impl BitChordApp {
         let q = trimmed.clone();
         self.search_suggest_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
-                .timer(Duration::from_millis(200))
+                .timer(Duration::from_millis(140))
                 .await;
             let _ = this.update(cx, |app, cx| {
-                if app.search_input_text.trim() == q {
+                if app.search_suggest_generation == generation
+                    && app.search_input_text.trim() == q
+                {
                     app.send(BackendCommand::SearchSuggest(q), cx);
                 }
             });
@@ -549,6 +563,7 @@ impl BitChordApp {
         }
         self.search_input_text = trimmed.clone();
         self.search_suggestions_open = false;
+        self.search_suggest_generation = self.search_suggest_generation.wrapping_add(1);
         self.search_suggest_task = None;
         self.last_search_query = trimmed.clone();
         self.search_results = LoadState::Loading;
@@ -563,23 +578,9 @@ impl BitChordApp {
     }
 
     pub fn record_song_search_selection(&self, song: &Song, cx: &App) {
-        let mut subtitle = song.artist.clone();
-        if let Some(ref dur) = song.duration_text
-            && !dur.is_empty()
-        {
-            subtitle = format!("{} · {dur}", song.artist);
-        }
-        self.send(
-            BackendCommand::RecordSearchSelection(SearchHistoryEntity {
-                id: song.video_id.clone(),
-                title: song.title.clone(),
-                subtitle,
-                artwork_url: song_thumbnail_url(song),
-                entity_type: EntityType::Track,
-                timestamp: 0,
-            }),
-            cx,
-        );
+        let mut record = SearchHistoryRecord::from_song(song, 0);
+        record.artwork_url = song_thumbnail_url(song);
+        self.send(BackendCommand::RecordSearchSelection(record), cx);
     }
 
     pub fn record_browse_search_selection(&self, item: &BrowseItem, cx: &App) {
@@ -590,7 +591,7 @@ impl BitChordApp {
             BrowseType::Other => EntityType::Other,
         };
         self.send(
-            BackendCommand::RecordSearchSelection(SearchHistoryEntity {
+            BackendCommand::RecordSearchSelection(SearchHistoryRecord {
                 id: item.browse_id.clone(),
                 title: item.title.clone(),
                 subtitle: if item.subtitle.is_empty() {
@@ -601,9 +602,48 @@ impl BitChordApp {
                 artwork_url: item.thumbnail_url.clone(),
                 entity_type,
                 timestamp: 0,
+                album: None,
+                duration_text: None,
+                duration_ms: None,
             }),
             cx,
         );
+    }
+
+    /// Returns whether `video_id` is currently marked as liked/favorited.
+    #[allow(dead_code)]
+    pub fn is_song_liked(&self, video_id: &str) -> bool {
+        self.liked_video_ids.contains(video_id)
+    }
+
+    /// Returns whether the currently loaded track is liked/favorited.
+    #[allow(dead_code)]
+    pub fn is_current_song_liked(&self) -> bool {
+        self.playback
+            .current_song
+            .as_ref()
+            .is_some_and(|s| self.liked_video_ids.contains(&s.video_id))
+    }
+
+    /// Optimistically toggles the liked status of `song` in UI state and persists via SQLite.
+    #[allow(dead_code)]
+    pub fn toggle_like_song(&mut self, song: Song, cx: &mut Context<Self>) {
+        if self.liked_video_ids.contains(&song.video_id) {
+            self.liked_video_ids.remove(&song.video_id);
+        } else {
+            self.liked_video_ids.insert(song.video_id.clone());
+        }
+        self.library.liked_video_ids = self.liked_video_ids.clone();
+        self.send(BackendCommand::ToggleLikeSong(Box::new(song)), cx);
+        cx.notify();
+    }
+
+    /// Toggles liked status for the currently active track (no-op if no track is loaded).
+    #[allow(dead_code)]
+    pub fn toggle_like_current_song(&mut self, cx: &mut Context<Self>) {
+        if let Some(song) = self.playback.current_song.clone() {
+            self.toggle_like_song(song, cx);
+        }
     }
 
     pub fn play_songs(
@@ -660,49 +700,69 @@ impl BitChordApp {
         self.send(BackendCommand::ImportSpotifyPlaylist(url_or_id), cx);
     }
 
-    /// Starts an asynchronous artwork download without ever aborting other in-flight tasks.
+    /// Starts an asynchronous Thumbnail-tier (`256px`) artwork fetch without aborting other tasks.
     pub fn ensure_artwork_loaded(&mut self, url: &str, cx: &mut Context<Self>) {
-        let Some(normalized) = self.artwork_cache.begin_fetch(url) else {
+        self.ensure_artwork_loaded_tier(url, ArtworkTier::Thumbnail, cx);
+    }
+
+    /// Starts an asynchronous tier-aware (`256px` Thumbnail or `512px` Hero) artwork fetch,
+    /// backed by SQLite v4 LRU disk cache indexing via [`AppBackend::db_worker`].
+    pub fn ensure_artwork_loaded_tier(
+        &mut self,
+        url: &str,
+        tier: ArtworkTier,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((cache_key, normalized)) = self.artwork_cache.begin_fetch_tier(url, tier) else {
             return;
         };
         let backend = cx.global::<AppBackend>().clone();
         let http = backend.http.clone();
         let cache_dir = backend.paths.cache_dir.clone();
+        let db_worker = backend.db_worker.clone();
         let auth_snapshot = backend.remote_auth.read().ok().map(|g| g.clone());
-        let key_for_task = normalized.clone();
+        let task_key = cache_key.clone();
+        let url_for_state = normalized.clone();
 
         let task = cx.spawn(async move |this, cx| {
-            let url_for_fetch = key_for_task.clone();
+            let url_for_fetch = normalized;
             let res = gpui_ce_tokio::Tokio::spawn(cx, async move {
-                fetch_and_decode_artwork(&http, &cache_dir, &url_for_fetch, auth_snapshot.as_ref())
-                    .await
+                fetch_and_decode_artwork_with_tier(
+                    &http,
+                    &cache_dir,
+                    &url_for_fetch,
+                    tier,
+                    auth_snapshot.as_ref(),
+                    Some(&db_worker),
+                )
+                .await
             })
             .await;
 
             let _ = this.update(cx, |app, cx| {
-                app.art_tasks.remove(&key_for_task);
+                app.art_tasks.remove(&task_key);
                 match res {
                     Ok(Ok(art)) => {
-                        let evicted = app.artwork_cache.insert(key_for_task, art);
+                        let evicted = app.artwork_cache.insert_tier(&url_for_state, tier, art);
                         for old in evicted {
                             cx.drop_image(old.image, None);
                             cx.drop_image(old.mesh, None);
                         }
                     }
                     _ => {
-                        app.artwork_cache.mark_failed(&key_for_task);
+                        app.artwork_cache.mark_failed_tier(&url_for_state, tier);
                     }
                 }
                 cx.notify();
             });
         });
-        self.art_tasks.insert(normalized, task);
+        self.art_tasks.insert(cache_key, task);
     }
 
     fn flush_pending_artwork(&mut self, cx: &mut Context<Self>) {
-        let queued: Vec<String> = self.pending_art_urls.borrow_mut().drain(..).collect();
-        for url in queued {
-            self.ensure_artwork_loaded(&url, cx);
+        let queued: Vec<(String, ArtworkTier)> = self.pending_art_urls.borrow_mut().drain(..).collect();
+        for (url, tier) in queued {
+            self.ensure_artwork_loaded_tier(&url, tier, cx);
         }
     }
 
@@ -799,10 +859,9 @@ impl BitChordApp {
                 self.audio_devices = full.audio_devices;
 
                 let mut prefetch_urls = Vec::new();
-                if let Some(ref song) = full.playback.current_song
-                    && let Some(url) = song_thumbnail_url(song)
-                {
-                    prefetch_urls.push(url);
+                let current_art_url = full.playback.current_song.as_ref().and_then(song_thumbnail_url);
+                if let Some(ref url) = current_art_url {
+                    prefetch_urls.push(url.clone());
                 }
                 for song in full.queue.items.iter().take(24) {
                     if let Some(url) = song_thumbnail_url(song) {
@@ -863,6 +922,7 @@ impl BitChordApp {
                             prefetch_urls.push(u);
                         }
                     }
+                    self.liked_video_ids = lib.liked_video_ids.clone();
                     self.library = lib;
                 }
 
@@ -876,6 +936,9 @@ impl BitChordApp {
                 self.automix_phrase_bars = full.automix_phrase_bars;
                 self.discord_rpc_enabled = full.discord_rpc_enabled;
 
+                if let Some(ref hero_url) = current_art_url {
+                    self.ensure_artwork_loaded_tier(hero_url, ArtworkTier::Hero, cx);
+                }
                 for u in prefetch_urls {
                     self.ensure_artwork_loaded(&u, cx);
                 }
@@ -903,6 +966,7 @@ impl BitChordApp {
                     && let Some(url) = song_thumbnail_url(song)
                 {
                     self.ensure_artwork_loaded(&url, cx);
+                    self.ensure_artwork_loaded_tier(&url, ArtworkTier::Hero, cx);
                 }
                 self.playback = snap;
                 self.playback_synced_at = Instant::now();
@@ -976,10 +1040,11 @@ impl BitChordApp {
             }
             BackendEvent::SearchSuggestionsLoaded(payload) => {
                 if payload.query.is_empty()
-                    || self
-                        .search_input_text
-                        .trim()
-                        .eq_ignore_ascii_case(&payload.query)
+                    || (self.search_suggestions_open
+                        && self
+                            .search_input_text
+                            .trim()
+                            .eq_ignore_ascii_case(&payload.query))
                 {
                     let urls: Vec<String> = payload
                         .items
@@ -1068,6 +1133,7 @@ impl BitChordApp {
                         urls.push(u);
                     }
                 }
+                self.liked_video_ids = lib.liked_video_ids.clone();
                 self.library = lib;
                 for u in urls {
                     self.ensure_artwork_loaded(&u, cx);
@@ -1083,6 +1149,10 @@ impl BitChordApp {
                 for u in urls {
                     self.ensure_artwork_loaded(&u, cx);
                 }
+            }
+            BackendEvent::LikedSongsUpdated(liked_ids) => {
+                self.liked_video_ids = liked_ids.clone();
+                self.library.liked_video_ids = liked_ids;
             }
             BackendEvent::LibraryTrackRecorded { song, stats } => {
                 let art_url = song_thumbnail_url(&song);
@@ -1131,13 +1201,13 @@ impl BitChordApp {
             .current_song
             .as_ref()
             .and_then(song_thumbnail_url)
-            .and_then(|u| self.artwork_cache.get(&u))
+            .and_then(|u| self.artwork_cache.get_best_for_tier(&u, ArtworkTier::Hero))
             .map(|a| a.mesh.clone())
             .unwrap_or_else(|| self.default_mesh.clone())
     }
 
     /// Renders an album/track cover thumbnail (with automatic on-demand lazy loading
-    /// for any visible URL not yet in cache) and crisp vector SVG fallback.
+    /// using `256px` Thumbnail or `512px` Hero tier based on `size_px`) and crisp SVG fallback.
     pub fn render_art_box(
         &self,
         url: Option<&str>,
@@ -1146,8 +1216,28 @@ impl BitChordApp {
         fallback_icon: &'static [u8],
         theme: BitChordTheme,
     ) -> impl IntoElement {
+        let tier = ArtworkTier::for_display_size(size_px);
+        self.render_art_box_with_tier(url, size_px, radius_px, tier, fallback_icon, theme)
+    }
+
+    /// Renders cover artwork with an explicit [`ArtworkTier`], displaying any already-cached
+    /// alternate tier immediately while upgrading to the requested tier in the background.
+    pub fn render_art_box_with_tier(
+        &self,
+        url: Option<&str>,
+        size_px: f32,
+        radius_px: f32,
+        tier: ArtworkTier,
+        fallback_icon: &'static [u8],
+        theme: BitChordTheme,
+    ) -> impl IntoElement {
         if let Some(u) = url {
-            if let Some(art) = self.artwork_cache.get(u) {
+            if !self.artwork_cache.is_settled_tier(u, tier) {
+                self.pending_art_urls
+                    .borrow_mut()
+                    .push((u.to_owned(), tier));
+            }
+            if let Some(art) = self.artwork_cache.get_best_for_tier(u, tier) {
                 return div()
                     .w(px(size_px))
                     .h(px(size_px))
@@ -1161,9 +1251,6 @@ impl BitChordApp {
                             .h(px(size_px))
                             .object_fit(ObjectFit::Cover),
                     );
-            }
-            if !self.artwork_cache.is_settled(u) {
-                self.pending_art_urls.borrow_mut().push(u.to_owned());
             }
         }
 

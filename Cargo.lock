@@ -998,6 +998,7 @@ dependencies = [
  "gpui_ce_platform",
  "gpui_ce_tokio",
  "image",
+ "lofty",
  "reqwest 0.13.5",
  "serde",
  "serde_json",

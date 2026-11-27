@@ -35,6 +35,7 @@ gpui-tray.workspace = true
 gpui_ce_platform.workspace = true
 gpui_ce_tokio.workspace = true
 image.workspace = true
+lofty.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

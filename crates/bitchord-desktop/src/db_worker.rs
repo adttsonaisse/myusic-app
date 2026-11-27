@@ -1,37 +1,73 @@
 //! Dedicated persistent SQLite worker actor for `bitchord-desktop`.
 //!
 //! Opens [`LibraryDb`] once on a dedicated background thread (`bitchord-db`),
-//! prunes expired stream/lyrics caches at startup, serves all read/write
-//! operations off the 35ms backend control loop and UI thread, and performs a
-//! passive WAL checkpoint on clean shutdown.
+//! prunes expired stream/lyrics caches and enforces the v4 artwork disk LRU
+//! budget at startup, serves all read/write operations off the 35ms backend
+//! control loop and UI thread, and performs a passive WAL checkpoint on clean
+//! shutdown.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::thread;
 
 use async_channel::{Sender, unbounded};
 use bitchord_automix::TrackAnalysis;
 use bitchord_lyrics::{LyricLine, LyricsSource};
-use bitchord_model::{SearchHistoryEntity, Song};
+use bitchord_model::Song;
 use bitchord_storage::{
-    CachedLyrics, CachedStream, DbStats, LibraryDb, LocalPlaylist, SavedSongMetadata, SongMetadata,
+    ArtworkIndexEntry, CachedLyrics, CachedStream, DEFAULT_ARTWORK_CACHE_MAX_BYTES, DbStats,
+    LibraryDb, LocalPlaylist, SavedSongMetadata, SearchHistoryRecord, SongMetadata,
 };
 
 use crate::backend::LibrarySnapshot;
+
+/// Run an automatic artwork LRU disk prune after this many cache insertions (or
+/// immediately if a single entry exceeds 1 MiB).
+const ARTWORK_PRUNE_INTERVAL: u32 = 16;
+const LARGE_ARTWORK_BYTES: i64 = 1024 * 1024;
 
 enum DbOp {
     FetchLibrarySnapshot {
         reply: Sender<LibrarySnapshot>,
     },
     RecordSearchHistory {
-        entity: SearchHistoryEntity,
-        reply: Sender<Vec<SearchHistoryEntity>>,
+        entry: Box<SearchHistoryRecord>,
+        reply: Sender<Vec<SearchHistoryRecord>>,
     },
     RemoveSearchHistory {
         id: String,
-        reply: Sender<Vec<SearchHistoryEntity>>,
+        reply: Sender<Vec<SearchHistoryRecord>>,
     },
     ClearSearchHistory {
-        reply: Sender<Vec<SearchHistoryEntity>>,
+        reply: Sender<Vec<SearchHistoryRecord>>,
+    },
+    ToggleSongLiked {
+        song: Box<Song>,
+        reply: Sender<(bool, HashSet<String>)>,
+    },
+    SetSongLiked {
+        song: Box<Song>,
+        liked: bool,
+        reply: Sender<(bool, HashSet<String>)>,
+    },
+    ListLikedVideoIds {
+        reply: Sender<HashSet<String>>,
+    },
+    ListLikedSongs {
+        reply: Sender<Vec<Song>>,
+    },
+    UpsertArtworkEntry {
+        entry: ArtworkIndexEntry,
+    },
+    TouchArtworkEntry {
+        cache_key: String,
+    },
+    DeleteArtworkEntry {
+        cache_key: String,
+    },
+    PruneArtworkLru {
+        max_bytes: i64,
+        reply: Option<Sender<Vec<String>>>,
     },
     RecordTrackPlay {
         song: Box<Song>,
@@ -122,7 +158,10 @@ impl DbWorker {
                 if let Some(ref conn) = db {
                     let _ = conn.prune_expired_stream_cache();
                     let _ = conn.prune_expired_lyrics_cache();
+                    prune_and_unlink_artwork(conn, DEFAULT_ARTWORK_CACHE_MAX_BYTES);
                 }
+
+                let mut artwork_writes_since_prune: u32 = 0;
 
                 while let Ok(op) = rx.recv_blocking() {
                     match op {
@@ -130,10 +169,10 @@ impl DbWorker {
                             let snap = db.as_ref().map(read_library_snapshot).unwrap_or_default();
                             let _ = reply.send_blocking(snap);
                         }
-                        DbOp::RecordSearchHistory { entity, reply } => {
+                        DbOp::RecordSearchHistory { entry, reply } => {
                             let list = if let Some(ref conn) = db {
-                                let _ = conn.record_search_history(&entity);
-                                conn.list_search_history().unwrap_or_default()
+                                let _ = conn.record_search_history_entry(&entry);
+                                conn.list_search_history_entries().unwrap_or_default()
                             } else {
                                 Vec::new()
                             };
@@ -142,7 +181,7 @@ impl DbWorker {
                         DbOp::RemoveSearchHistory { id, reply } => {
                             let list = if let Some(ref conn) = db {
                                 let _ = conn.remove_search_history(&id);
-                                conn.list_search_history().unwrap_or_default()
+                                conn.list_search_history_entries().unwrap_or_default()
                             } else {
                                 Vec::new()
                             };
@@ -151,11 +190,89 @@ impl DbWorker {
                         DbOp::ClearSearchHistory { reply } => {
                             let list = if let Some(ref conn) = db {
                                 let _ = conn.clear_search_history();
-                                conn.list_search_history().unwrap_or_default()
+                                conn.list_search_history_entries().unwrap_or_default()
                             } else {
                                 Vec::new()
                             };
                             let _ = reply.send_blocking(list);
+                        }
+                        DbOp::ToggleSongLiked { song, reply } => {
+                            let res = if let Some(ref conn) = db {
+                                let liked = conn.toggle_song_liked(&song).unwrap_or(false);
+                                let ids = conn
+                                    .list_liked_video_ids()
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .collect();
+                                (liked, ids)
+                            } else {
+                                (false, HashSet::new())
+                            };
+                            let _ = reply.send_blocking(res);
+                        }
+                        DbOp::SetSongLiked { song, liked, reply } => {
+                            let res = if let Some(ref conn) = db {
+                                let now_liked =
+                                    conn.set_song_liked(&song, liked).unwrap_or(false);
+                                let ids = conn
+                                    .list_liked_video_ids()
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .collect();
+                                (now_liked, ids)
+                            } else {
+                                (false, HashSet::new())
+                            };
+                            let _ = reply.send_blocking(res);
+                        }
+                        DbOp::ListLikedVideoIds { reply } => {
+                            let ids = db
+                                .as_ref()
+                                .and_then(|conn| conn.list_liked_video_ids().ok())
+                                .unwrap_or_default()
+                                .into_iter()
+                                .collect();
+                            let _ = reply.send_blocking(ids);
+                        }
+                        DbOp::ListLikedSongs { reply } => {
+                            let songs = db
+                                .as_ref()
+                                .and_then(|conn| conn.list_liked_songs().ok())
+                                .unwrap_or_default();
+                            let _ = reply.send_blocking(songs);
+                        }
+                        DbOp::UpsertArtworkEntry { entry } => {
+                            if let Some(ref conn) = db {
+                                let byte_size = entry.byte_size;
+                                let _ = conn.upsert_artwork_entry(&entry);
+                                artwork_writes_since_prune =
+                                    artwork_writes_since_prune.saturating_add(1);
+                                if artwork_writes_since_prune >= ARTWORK_PRUNE_INTERVAL
+                                    || byte_size >= LARGE_ARTWORK_BYTES
+                                {
+                                    artwork_writes_since_prune = 0;
+                                    prune_and_unlink_artwork(conn, DEFAULT_ARTWORK_CACHE_MAX_BYTES);
+                                }
+                            }
+                        }
+                        DbOp::TouchArtworkEntry { cache_key } => {
+                            if let Some(ref conn) = db {
+                                let _ = conn.touch_artwork_entry(&cache_key);
+                            }
+                        }
+                        DbOp::DeleteArtworkEntry { cache_key } => {
+                            if let Some(ref conn) = db {
+                                let _ = conn.delete_artwork_entry(&cache_key);
+                            }
+                        }
+                        DbOp::PruneArtworkLru { max_bytes, reply } => {
+                            let evicted = db
+                                .as_ref()
+                                .map(|conn| prune_and_unlink_artwork(conn, max_bytes))
+                                .unwrap_or_default();
+                            if let Some(reply) = reply {
+                                let _ = reply.send_blocking(evicted);
+                            }
                         }
                         DbOp::RecordTrackPlay {
                             song,
@@ -317,12 +434,15 @@ impl DbWorker {
 
     pub async fn record_search_history(
         &self,
-        entity: SearchHistoryEntity,
-    ) -> Vec<SearchHistoryEntity> {
+        entry: SearchHistoryRecord,
+    ) -> Vec<SearchHistoryRecord> {
         let (reply, rx) = async_channel::bounded(1);
         if self
             .tx
-            .send(DbOp::RecordSearchHistory { entity, reply })
+            .send(DbOp::RecordSearchHistory {
+                entry: Box::new(entry),
+                reply,
+            })
             .await
             .is_err()
         {
@@ -331,7 +451,7 @@ impl DbWorker {
         rx.recv().await.unwrap_or_default()
     }
 
-    pub async fn remove_search_history(&self, id: String) -> Vec<SearchHistoryEntity> {
+    pub async fn remove_search_history(&self, id: String) -> Vec<SearchHistoryRecord> {
         let (reply, rx) = async_channel::bounded(1);
         if self
             .tx
@@ -344,11 +464,92 @@ impl DbWorker {
         rx.recv().await.unwrap_or_default()
     }
 
-    pub async fn clear_search_history(&self) -> Vec<SearchHistoryEntity> {
+    pub async fn clear_search_history(&self) -> Vec<SearchHistoryRecord> {
         let (reply, rx) = async_channel::bounded(1);
         if self
             .tx
             .send(DbOp::ClearSearchHistory { reply })
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        rx.recv().await.unwrap_or_default()
+    }
+
+    pub async fn toggle_song_liked(&self, song: Song) -> (bool, HashSet<String>) {
+        let (reply, rx) = async_channel::bounded(1);
+        if self
+            .tx
+            .send(DbOp::ToggleSongLiked {
+                song: Box::new(song),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return (false, HashSet::new());
+        }
+        rx.recv().await.unwrap_or_default()
+    }
+
+    #[allow(dead_code)]
+    pub async fn set_song_liked(&self, song: Song, liked: bool) -> (bool, HashSet<String>) {
+        let (reply, rx) = async_channel::bounded(1);
+        if self
+            .tx
+            .send(DbOp::SetSongLiked {
+                song: Box::new(song),
+                liked,
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return (false, HashSet::new());
+        }
+        rx.recv().await.unwrap_or_default()
+    }
+
+    #[allow(dead_code)]
+    pub async fn list_liked_video_ids(&self) -> HashSet<String> {
+        let (reply, rx) = async_channel::bounded(1);
+        if self.tx.send(DbOp::ListLikedVideoIds { reply }).await.is_err() {
+            return HashSet::new();
+        }
+        rx.recv().await.unwrap_or_default()
+    }
+
+    #[allow(dead_code)]
+    pub async fn list_liked_songs(&self) -> Vec<Song> {
+        let (reply, rx) = async_channel::bounded(1);
+        if self.tx.send(DbOp::ListLikedSongs { reply }).await.is_err() {
+            return Vec::new();
+        }
+        rx.recv().await.unwrap_or_default()
+    }
+
+    pub fn upsert_artwork_entry(&self, entry: ArtworkIndexEntry) {
+        let _ = self.tx.try_send(DbOp::UpsertArtworkEntry { entry });
+    }
+
+    pub fn touch_artwork_entry(&self, cache_key: String) {
+        let _ = self.tx.try_send(DbOp::TouchArtworkEntry { cache_key });
+    }
+
+    pub fn delete_artwork_entry(&self, cache_key: String) {
+        let _ = self.tx.try_send(DbOp::DeleteArtworkEntry { cache_key });
+    }
+
+    #[allow(dead_code)]
+    pub async fn prune_artwork_lru(&self, max_bytes: i64) -> Vec<String> {
+        let (reply, rx) = async_channel::bounded(1);
+        if self
+            .tx
+            .send(DbOp::PruneArtworkLru {
+                max_bytes,
+                reply: Some(reply),
+            })
             .await
             .is_err()
         {
@@ -549,12 +750,25 @@ impl DbWorker {
     }
 }
 
+fn prune_and_unlink_artwork(db: &LibraryDb, max_bytes: i64) -> Vec<String> {
+    let evicted = db.prune_artwork_lru(max_bytes).unwrap_or_default();
+    for path in &evicted {
+        let _ = std::fs::remove_file(path);
+    }
+    evicted
+}
+
 fn read_library_snapshot(db: &LibraryDb) -> LibrarySnapshot {
     LibrarySnapshot {
         stats: db.stats().unwrap_or_default(),
         songs: db.search_cached_songs("", 200).unwrap_or_default(),
         downloads: db.list_downloads().unwrap_or_default(),
         playlists: db.list_playlists().unwrap_or_default(),
-        search_history: db.list_search_history().unwrap_or_default(),
+        search_history: db.list_search_history_entries().unwrap_or_default(),
+        liked_video_ids: db
+            .list_liked_video_ids()
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
     }
 }

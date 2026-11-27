@@ -7,6 +7,7 @@ mod actions;
 mod app;
 mod artwork;
 mod backend;
+mod branding;
 mod db_worker;
 mod icons;
 mod pill_slider;
@@ -78,17 +79,17 @@ fn main() {
             if let Ok(icon) = build_tray_icon()
                 && let Ok(tray) = Tray::builder()
                     .icon(icon)
-                    .title("Myusic")
-                    .tooltip("Myusic")
+                    .title(branding::TRAY_TITLE)
+                    .tooltip(branding::TRAY_TOOLTIP)
                     .menu(|_cx| {
                         vec![
-                            MenuItem::action("Show Myusic", ShowWindow),
+                            MenuItem::action(branding::TRAY_SHOW_LABEL, ShowWindow),
                             MenuItem::separator(),
                             MenuItem::action("Play / Pause", PlayPause),
                             MenuItem::action("Next Track", NextTrack),
                             MenuItem::action("Previous Track", PrevTrack),
                             MenuItem::separator(),
-                            MenuItem::action("Quit Myusic", QuitApp),
+                            MenuItem::action(branding::TRAY_QUIT_LABEL, QuitApp),
                         ]
                     })
                     .build(cx)
@@ -120,10 +121,10 @@ fn open_or_focus_main_window(cx: &mut App) {
             height: px(560.0),
         }),
         titlebar: Some(TitlebarOptions {
-            title: Some("Myusic".into()),
+            title: Some(branding::APP_NAME.into()),
             ..TitlebarOptions::default()
         }),
-        app_id: Some("com.music.myusic".to_owned()),
+        app_id: Some(branding::APP_ID.to_owned()),
         ..WindowOptions::default()
     };
 

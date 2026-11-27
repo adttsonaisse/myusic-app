@@ -6,6 +6,7 @@
 //! Lives in GPUI's `App` global state so closing the window to the system tray
 //! keeps playback, gapless preload, Listen Together, scrobbling, and MPRIS2 alive.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -30,6 +31,7 @@ use bitchord_innertube::{
 };
 #[cfg(feature = "ytdlp-bridge")]
 use bitchord_innertube::{FallbackStreamBackend, YtDlpStreamBackend};
+use bitchord_integrations::discord::DiscordAssets;
 use bitchord_integrations::{
     Connection, DiscordActivity, DiscordIpcClient, ListenTogetherClient, ListenTogetherState,
     SpotifyImporter, discord_audio_quality_line,
@@ -40,8 +42,8 @@ use bitchord_lyrics::{
     TranslationResult,
 };
 use bitchord_model::{
-    BrowseType, EntityType, HomeFeed, PlaybackSourceType, SearchFilter, SearchHistoryEntity,
-    SearchResult, Song, duration_millis,
+    BrowseType, EntityType, HomeFeed, PlaybackSourceType, SearchFilter, SearchResult, Song,
+    duration_millis,
 };
 use bitchord_netstorage::{
     SmbClient, SmbConfig, WebDavClient, WebDavConfig, remote_song::extension_lower,
@@ -50,14 +52,15 @@ use bitchord_queue::QueueSource;
 use bitchord_storage::{
     AppPaths, AppSettingsData, AudioOutputPreference, CachedStream, DEFAULT_LYRICS_CACHE_TTL_MS,
     DEFAULT_LYRICS_NOT_FOUND_TTL_MS, DEFAULT_STREAM_CACHE_TTL_MS, DbStats, KeyringSecretStore,
-    LocalPlaylist, SavedSongMetadata, SecretKey, SecretStore, SettingsStore, SmbSettings,
-    WebDavSettings, format_duration_ms, read_local_audio_tags,
+    LocalPlaylist, SavedSongMetadata, SearchHistoryRecord, SecretKey, SecretStore, SettingsStore,
+    SmbSettings, WebDavSettings, format_duration_ms, read_local_audio_tags,
 };
 use gpui::Global;
 use reqwest::Client;
 use tokio::runtime::Handle;
 
 use crate::artwork::{RemoteArtworkAuth, song_thumbnail_url};
+use crate::branding;
 use crate::db_worker::DbWorker;
 use crate::queue_state::{PlayNextOutcome, QueueController, QueueRemoveOutcome};
 
@@ -99,7 +102,8 @@ pub struct LibrarySnapshot {
     pub songs: Vec<Song>,
     pub downloads: Vec<SavedSongMetadata>,
     pub playlists: Vec<LocalPlaylist>,
-    pub search_history: Vec<SearchHistoryEntity>,
+    pub search_history: Vec<SearchHistoryRecord>,
+    pub liked_video_ids: HashSet<String>,
 }
 
 /// Detail screen payload for an album, playlist, or artist browseId.
@@ -174,9 +178,10 @@ pub enum BackendCommand {
         filter: SearchFilter,
     },
     SearchSuggest(String),
-    RecordSearchSelection(SearchHistoryEntity),
+    RecordSearchSelection(SearchHistoryRecord),
     RemoveSearchHistory(String),
     ClearSearchHistory,
+    ToggleLikeSong(Box<Song>),
     LoadDetail {
         browse_id: String,
         kind: BrowseType,
@@ -302,7 +307,8 @@ pub enum BackendEvent {
         result: Result<LyricsPayload, String>,
     },
     LibraryLoaded(LibrarySnapshot),
-    SearchHistoryUpdated(Vec<SearchHistoryEntity>),
+    SearchHistoryUpdated(Vec<SearchHistoryRecord>),
+    LikedSongsUpdated(HashSet<String>),
     LibraryTrackRecorded {
         song: Box<Song>,
         stats: DbStats,
@@ -358,6 +364,7 @@ pub struct AppBackend {
     pub evt_rx: Receiver<BackendEvent>,
     pub http: Client,
     pub paths: AppPaths,
+    pub db_worker: DbWorker,
     pub initial_settings: AppSettingsData,
     pub onnx_automix_status: OnnxAutomixStatus,
     pub remote_auth: Arc<RwLock<RemoteArtworkAuth>>,
@@ -369,6 +376,8 @@ impl AppBackend {
     /// Launches the background audio + network + storage + MPRIS2 runtime on Tokio.
     pub fn start(rt: Handle) -> Self {
         let paths = AppPaths::resolve();
+        // Dedicated persistent SQLite worker shared across backend & artwork LRU disk cache.
+        let db_worker = DbWorker::start(paths.db_file());
         let settings_store = SettingsStore::new(paths.settings_file());
         let initial_settings = settings_store.load().unwrap_or_default();
         let onnx_automix_status = OnnxModelPaths::discover(&paths.models_dir()).status();
@@ -394,6 +403,7 @@ impl AppBackend {
 
         let worker_http = http.clone();
         let worker_paths = paths.clone();
+        let worker_db = db_worker.clone();
         let worker_settings = initial_settings.clone();
         let worker_rt = rt.clone();
         let worker_remote_auth = Arc::clone(&remote_auth);
@@ -405,6 +415,7 @@ impl AppBackend {
                     worker_rt,
                     worker_http,
                     worker_paths,
+                    worker_db,
                     worker_settings,
                     worker_remote_auth,
                     cmd_rx,
@@ -418,6 +429,7 @@ impl AppBackend {
             evt_rx,
             http,
             paths,
+            db_worker,
             initial_settings,
             onnx_automix_status,
             remote_auth,
@@ -724,6 +736,36 @@ impl PlaybackLoopState {
 }
 
 #[derive(Debug, Default)]
+struct SearchSuggestGate {
+    generation: Arc<AtomicU64>,
+    active_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SearchSuggestGate {
+    /// Cancels any previous in-flight search suggestion request and advances the generation.
+    fn cancel(&mut self) -> u64 {
+        if let Some(handle) = self.active_task.take() {
+            handle.abort();
+        }
+        self.generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Starts a new search suggestion generation, aborting any previous request.
+    fn begin(&mut self) -> (u64, Arc<AtomicU64>) {
+        let generation = self.cancel();
+        (generation, Arc::clone(&self.generation))
+    }
+
+    fn set_active(&mut self, handle: tokio::task::JoinHandle<()>) {
+        self.active_task = Some(handle);
+    }
+
+    fn is_current(counter: &AtomicU64, expected: u64) -> bool {
+        counter.load(Ordering::Acquire) == expected
+    }
+}
+
+#[derive(Debug, Default)]
 struct HomeFetchState {
     in_flight: bool,
     cached: Option<HomeFeed>,
@@ -872,7 +914,8 @@ enum InternalMsg {
     },
     HomeFetchFinished(Option<HomeFeed>),
     LibraryCached(LibrarySnapshot),
-    SearchHistoryCached(Vec<SearchHistoryEntity>),
+    SearchHistoryCached(Vec<SearchHistoryRecord>),
+    LikedSongsCached(HashSet<String>),
     LibraryTrackUpdated {
         song: Box<Song>,
         stats: DbStats,
@@ -942,18 +985,17 @@ fn save_settings_async(rt: &Handle, settings_path: &Path, settings: &AppSettings
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_backend_thread(
     rt: Handle,
     http: Client,
     paths: AppPaths,
+    db_worker: DbWorker,
     mut settings: AppSettingsData,
     remote_auth: Arc<RwLock<RemoteArtworkAuth>>,
     cmd_rx: Receiver<BackendCommand>,
     events: EventHub,
 ) {
-    // Dedicated persistent SQLite worker (single connection, WAL, auto-pruned caches).
-    let db_worker = DbWorker::start(paths.db_file());
-
     let desired_mode =
         to_engine_output_mode(settings.audio_output_mode, &settings.alsa_exclusive_device);
     let (mut engine, pipewire_active, audio_msg) =
@@ -1088,6 +1130,7 @@ fn run_backend_thread(
     let current_lyrics: Arc<Mutex<Option<LyricsPayload>>> = Arc::new(Mutex::new(None));
     let mut lyrics_sync_state = LyricsSyncState::Idle;
     let mut home_fetch = HomeFetchState::default();
+    let mut suggest_gate = SearchSuggestGate::default();
     let mut cached_library: Option<LibrarySnapshot> = None;
 
     let mut eq_enabled = false;
@@ -1493,6 +1536,11 @@ fn run_backend_thread(
                         lib.search_history = history;
                     }
                 }
+                InternalMsg::LikedSongsCached(liked_ids) => {
+                    if let Some(ref mut lib) = cached_library {
+                        lib.liked_video_ids = liked_ids;
+                    }
+                }
                 InternalMsg::LibraryTrackUpdated { song, stats } => {
                     if let Some(ref mut lib) = cached_library {
                         lib.stats = stats;
@@ -1577,6 +1625,7 @@ fn run_backend_thread(
                     if trimmed.is_empty() {
                         continue;
                     }
+                    suggest_gate.cancel();
                     events.emit(BackendEvent::SearchLoading {
                         query: trimmed.clone(),
                     });
@@ -1592,28 +1641,8 @@ fn run_backend_thread(
                             .map_err(|e| e.to_string());
 
                         if let Ok(ref rows) = res {
-                            let (art_url, subtitle) = match rows.first() {
-                                Some(SearchResult::TopTrack { song })
-                                | Some(SearchResult::Track { song }) => (
-                                    song_thumbnail_url(song),
-                                    format!("Search · Top: {} - {}", song.title, song.artist),
-                                ),
-                                Some(SearchResult::Browse { item }) => (
-                                    item.thumbnail_url.clone(),
-                                    format!("Search · {}", item.title),
-                                ),
-                                None => (None, "Search query".to_owned()),
-                            };
-                            let history = db_c
-                                .record_search_history(SearchHistoryEntity {
-                                    id: format!("q:{trimmed}"),
-                                    title: trimmed.clone(),
-                                    subtitle,
-                                    artwork_url: art_url,
-                                    entity_type: EntityType::Other,
-                                    timestamp: unix_now_ms(),
-                                })
-                                .await;
+                            let record = build_query_history_record(&trimmed, rows, unix_now_ms());
+                            let history = db_c.record_search_history(record).await;
                             let _ = itx
                                 .send(InternalMsg::SearchHistoryCached(history.clone()))
                                 .await;
@@ -1629,37 +1658,42 @@ fn run_backend_thread(
                 BackendCommand::SearchSuggest(query) => {
                     let trimmed = query.trim().to_owned();
                     if trimmed.len() < 2 {
+                        suggest_gate.cancel();
                         events.emit(BackendEvent::SearchSuggestionsLoaded(
                             SearchSuggestionsPayload::default(),
                         ));
                         continue;
                     }
+                    let (suggest_gen, suggest_gen_ref) = suggest_gate.begin();
                     let repo = Arc::clone(&yt_repo);
                     let events_c = events.clone();
-                    rt.spawn(async move {
-                        let (queries_res, typeahead_res) = tokio::join!(
-                            repo.search_suggestions(&trimmed),
-                            repo.search_typeahead(&trimmed)
-                        );
-                        let queries = queries_res.unwrap_or_default();
-                        let mut items = typeahead_res.map(|p| p.rows).unwrap_or_default();
+                    let handle = rt.spawn(async move {
+                        let structured = repo
+                            .search_suggestions_structured(&trimmed)
+                            .await
+                            .unwrap_or_default();
+                        if !SearchSuggestGate::is_current(&suggest_gen_ref, suggest_gen) {
+                            return;
+                        }
+                        let mut items = structured.items;
                         items.truncate(6);
                         events_c.emit(BackendEvent::SearchSuggestionsLoaded(
                             SearchSuggestionsPayload {
                                 query: trimmed,
-                                queries,
+                                queries: structured.queries,
                                 items,
                             },
                         ));
                     });
+                    suggest_gate.set_active(handle);
                 }
-                BackendCommand::RecordSearchSelection(mut entity) => {
-                    entity.timestamp = unix_now_ms();
+                BackendCommand::RecordSearchSelection(mut record) => {
+                    record.timestamp = unix_now_ms();
                     let db_c = db_worker.clone();
                     let itx = internal_tx.clone();
                     let events_c = events.clone();
                     rt.spawn(async move {
-                        let history = db_c.record_search_history(entity).await;
+                        let history = db_c.record_search_history(record).await;
                         let _ = itx
                             .send(InternalMsg::SearchHistoryCached(history.clone()))
                             .await;
@@ -1688,6 +1722,18 @@ fn run_backend_thread(
                             .send(InternalMsg::SearchHistoryCached(history.clone()))
                             .await;
                         events_c.emit(BackendEvent::SearchHistoryUpdated(history));
+                    });
+                }
+                BackendCommand::ToggleLikeSong(song) => {
+                    let db_c = db_worker.clone();
+                    let itx = internal_tx.clone();
+                    let events_c = events.clone();
+                    rt.spawn(async move {
+                        let (_liked, liked_ids) = db_c.toggle_song_liked(*song).await;
+                        let _ = itx
+                            .send(InternalMsg::LikedSongsCached(liked_ids.clone()))
+                            .await;
+                        events_c.emit(BackendEvent::LikedSongsUpdated(liked_ids));
                     });
                 }
                 BackendCommand::LoadDetail {
@@ -2852,7 +2898,7 @@ fn run_backend_thread(
                         user_id: settings.device_id.clone(),
                         device_id: settings.device_id.clone(),
                         display_name: if nickname.trim().is_empty() {
-                            "Myusic Linux".to_owned()
+                            branding::DEFAULT_PARTY_NICKNAME.to_owned()
                         } else {
                             nickname.trim().to_owned()
                         },
@@ -2919,7 +2965,7 @@ fn run_backend_thread(
                         user_id: settings.device_id.clone(),
                         device_id: settings.device_id.clone(),
                         display_name: if nickname.trim().is_empty() {
-                            "Myusic Linux".to_owned()
+                            branding::DEFAULT_PARTY_NICKNAME.to_owned()
                         } else {
                             nickname.trim().to_owned()
                         },
@@ -4197,7 +4243,11 @@ fn record_track_started_async(
             Some(q) => format!("{} · {q}", song.artist),
             None => song.artist.clone(),
         };
-        let activity = DiscordActivity::listening(song.title.clone(), state_text);
+        let mut activity = DiscordActivity::listening(song.title.clone(), state_text);
+        activity.assets = Some(DiscordAssets {
+            large_text: Some(branding::DISCORD_APP_LABEL.to_owned()),
+            ..DiscordAssets::default()
+        });
         rt.spawn(async move {
             if let Ok(mut client) = DiscordIpcClient::connect_default().await {
                 let _ = client.set_activity(&activity).await;
@@ -4465,6 +4515,61 @@ fn scan_local_folder_songs(folder: &Path) -> Result<Vec<Song>, String> {
         }
     }
     Ok(songs)
+}
+
+fn build_query_history_record(
+    query: &str,
+    rows: &[SearchResult],
+    timestamp: i64,
+) -> SearchHistoryRecord {
+    match rows.first() {
+        Some(SearchResult::TopTrack { song }) | Some(SearchResult::Track { song }) => {
+            let dur_ms = {
+                let ms = song.duration_millis();
+                (ms > 0).then_some(ms)
+            };
+            let dur_text = song
+                .duration_text
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .or_else(|| dur_ms.map(format_duration_ms));
+            SearchHistoryRecord {
+                id: format!("q:{query}"),
+                title: query.to_owned(),
+                subtitle: format!("Search · Top: {} - {}", song.title, song.artist),
+                artwork_url: song_thumbnail_url(song),
+                entity_type: EntityType::Other,
+                timestamp,
+                album: song.album_name.clone(),
+                duration_text: dur_text,
+                duration_ms: dur_ms,
+            }
+        }
+        Some(SearchResult::Browse { item }) => SearchHistoryRecord {
+            id: format!("q:{query}"),
+            title: query.to_owned(),
+            subtitle: format!("Search · {}", item.title),
+            artwork_url: item.thumbnail_url.clone(),
+            entity_type: EntityType::Other,
+            timestamp,
+            album: None,
+            duration_text: None,
+            duration_ms: None,
+        },
+        None => SearchHistoryRecord {
+            id: format!("q:{query}"),
+            title: query.to_owned(),
+            subtitle: "Search query".to_owned(),
+            artwork_url: None,
+            entity_type: EntityType::Other,
+            timestamp,
+            album: None,
+            duration_text: None,
+            duration_ms: None,
+        },
+    }
 }
 
 fn emit_queue(queue: &QueueController, events: &EventHub) {
@@ -5028,5 +5133,107 @@ mod tests {
             .expect("last published pos target");
         assert_eq!(from_last_pos.resume_ms, 88_000);
         assert!(!from_last_pos.bypass_cache);
+    }
+
+    #[test]
+    fn search_suggest_gate_cancels_previous_and_drops_stale_generation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test tokio runtime");
+
+        rt.block_on(async {
+            let mut gate = SearchSuggestGate::default();
+            let (gen1, counter1) = gate.begin();
+            let (tx1, rx1) = tokio::sync::oneshot::channel::<()>();
+            let h1 = tokio::spawn(async move {
+                let _ = rx1.await;
+            });
+            gate.set_active(h1);
+            assert!(SearchSuggestGate::is_current(&counter1, gen1));
+
+            // New keystroke starts gen2 -> cancels gen1 task and invalidates gen1 guard.
+            let (gen2, counter2) = gate.begin();
+            assert_ne!(gen1, gen2);
+            assert!(!SearchSuggestGate::is_current(&counter1, gen1));
+            assert!(SearchSuggestGate::is_current(&counter2, gen2));
+            // Give aborted task a tick to drop rx1.
+            tokio::task::yield_now().await;
+            assert!(tx1.is_closed());
+
+            // Explicit cancel (e.g. search submitted or input cleared) invalidates gen2 too.
+            gate.cancel();
+            assert!(!SearchSuggestGate::is_current(&counter2, gen2));
+        });
+    }
+
+    #[test]
+    fn db_worker_rich_search_history_v4_dedup_and_liked_songs_round_trip() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test tokio runtime");
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "myusic_db_v4_test_{}_{}",
+            std::process::id(),
+            unix_now_ms()
+        ));
+        let db = DbWorker::start(tmp_dir.join("library.db"));
+
+        rt.block_on(async {
+            let mut song = Song::new(
+                "MV_3Dpw-BRY",
+                "Nightcall",
+                "Kavinsky",
+                Some("https://i.ytimg.com/vi/MV_3Dpw-BRY/hqdefault.jpg".to_owned()),
+            );
+            song.album_name = Some("OutRun".to_owned());
+            song.duration_text = Some("4:18".to_owned());
+
+            // 1. Record raw query search, then record clicking the matching song -> query dedups!
+            let query_rec = build_query_history_record(
+                "nightcall",
+                &[SearchResult::TopTrack { song: song.clone() }],
+                1_000,
+            );
+            assert_eq!(query_rec.album.as_deref(), Some("OutRun"));
+            assert_eq!(query_rec.duration_text.as_deref(), Some("4:18"));
+            assert_eq!(query_rec.duration_ms, Some(258_000));
+
+            let after_query = db.record_search_history(query_rec).await;
+            assert_eq!(after_query.len(), 1);
+
+            let mut song_rec = SearchHistoryRecord::from_song(&song, 2_000);
+            song_rec.artwork_url = song_thumbnail_url(&song);
+            let after_track = db.record_search_history(song_rec).await;
+            assert_eq!(
+                after_track.len(),
+                1,
+                "duplicate query row should be evicted when selecting matching song"
+            );
+            assert_eq!(after_track[0].id, "MV_3Dpw-BRY");
+            assert_eq!(after_track[0].album.as_deref(), Some("OutRun"));
+            assert_eq!(after_track[0].duration_text.as_deref(), Some("4:18"));
+            assert_eq!(after_track[0].duration_ms, Some(258_000));
+
+            // 2. Toggle like on a song not yet in `songs` table -> auto-upserts & marks liked.
+            let (is_liked, liked_ids) = db.toggle_song_liked(song.clone()).await;
+            assert!(is_liked);
+            assert!(liked_ids.contains("MV_3Dpw-BRY"));
+
+            let snap = db.fetch_library_snapshot().await;
+            assert!(snap.liked_video_ids.contains("MV_3Dpw-BRY"));
+            assert_eq!(snap.search_history.len(), 1);
+            assert_eq!(snap.search_history[0].album.as_deref(), Some("OutRun"));
+
+            // 3. Toggle again -> unliked.
+            let (is_liked2, liked_ids2) = db.toggle_song_liked(song).await;
+            assert!(!is_liked2);
+            assert!(!liked_ids2.contains("MV_3Dpw-BRY"));
+        });
+
+        db.shutdown_blocking();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
