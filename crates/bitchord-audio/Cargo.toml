@@ -23,8 +23,9 @@ bitchord-integrations.workspace = true
 bitchord-jam.workspace = true
 bitchord-model.workspace = true
 libspa.workspace = true
+lofty.workspace = true
 mpris-server.workspace = true
-pipewire.workspace = true
+pipewire = { workspace = true, features = ["v0_3_49"] }
 reqwest.workspace = true
 rtrb.workspace = true
 rubato.workspace = true

@@ -10,6 +10,8 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use bitchord_integrations::{NerdStatsSnapshot, TelemetryProvenance};
+use lofty::prelude::AudioFile;
+use lofty::probe::Probe as LoftyProbe;
 use symphonia::core::codecs::CodecParameters;
 use symphonia::core::codecs::audio::well_known::{
     CODEC_ID_AAC, CODEC_ID_ALAC, CODEC_ID_FLAC, CODEC_ID_MP1, CODEC_ID_MP2, CODEC_ID_MP3,
@@ -31,6 +33,7 @@ use symphonia::core::units::{Time, TimeBase, Timestamp};
 use symphonia_adapter_libopus::OpusDecoder;
 use thiserror::Error;
 
+use crate::chunked_source::StreamCancelToken;
 use crate::dsd::DsdStreamDecoder;
 
 /// Global codec registry extending Symphonia's built-in codecs with `libopus`.
@@ -116,6 +119,7 @@ pub struct AudioDecoder {
     backend: DecoderBackend,
     info: DecodedStreamInfo,
     byte_len: Option<u64>,
+    cancel_token: Option<StreamCancelToken>,
 }
 
 /// Adapts any seekable `Read + Seek + Send + Sync` byte source (such as
@@ -154,14 +158,21 @@ impl<R: Read + Seek + Send + Sync + 'static> MediaSource for SeekableReadSource<
 }
 
 impl AudioDecoder {
-    /// Opens a local audio file on disk.
+    /// Opens a local audio file on disk, falling back to `lofty` container
+    /// metadata when the demuxer does not expose a duration (e.g. VBR MP3 without Xing).
     pub fn open_path(path: &Path) -> Result<Self, DecoderError> {
         let file = File::open(path)?;
         let mut hint = Hint::new();
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             hint.with_extension(ext);
         }
-        Self::open_source(Box::new(file), hint)
+        let mut dec = Self::open_source(Box::new(file), hint)?;
+        if dec.info.duration_ms.is_none_or(|d| d == 0)
+            && let Some(lofty_ms) = probe_local_duration_ms(path)
+        {
+            dec.apply_fallback_duration_ms(Some(lofty_ms));
+        }
+        Ok(dec)
     }
 
     /// Opens any seekable `Read + Seek + Send + Sync` reader (e.g. an SMB2/3 range stream).
@@ -200,6 +211,7 @@ impl AudioDecoder {
                         backend: DecoderBackend::Dsd(Box::new(dsd)),
                         info,
                         byte_len,
+                        cancel_token: None,
                     });
                 }
             } else {
@@ -283,11 +295,30 @@ impl AudioDecoder {
             },
             info,
             byte_len,
+            cancel_token: None,
         })
     }
 
     pub fn info(&self) -> &DecodedStreamInfo {
         &self.info
+    }
+
+    /// Attaches an HTTP [`StreamCancelToken`] so stopping the decode worker
+    /// immediately unblocks any stalled network range read.
+    pub fn attach_cancel_token(&mut self, token: StreamCancelToken) {
+        self.cancel_token = Some(token);
+    }
+
+    /// Returns the attached HTTP [`StreamCancelToken`], if this decoder reads from network.
+    pub fn cancel_token(&self) -> Option<StreamCancelToken> {
+        self.cancel_token.clone()
+    }
+
+    /// Cancels the underlying network range source (if any).
+    pub fn cancel(&self) {
+        if let Some(ref token) = self.cancel_token {
+            token.cancel();
+        }
     }
 
     /// Populates `duration_ms` (and derived `estimated_bitrate_kbps`) from an
@@ -306,6 +337,27 @@ impl AudioDecoder {
             && bytes > 0
         {
             self.info.estimated_bitrate_kbps = Some(((bytes * 8) / dur) as u32);
+        }
+    }
+
+    /// Estimates `duration_ms` from `byte_len` and nominal `bitrate_kbps` as a last-resort
+    /// fallback when neither the container nor stream metadata provides a duration.
+    pub fn estimate_duration_from_bitrate_kbps(&mut self, bitrate_kbps: u32) {
+        if bitrate_kbps == 0 {
+            return;
+        }
+        if self.info.estimated_bitrate_kbps.is_none() {
+            self.info.estimated_bitrate_kbps = Some(bitrate_kbps);
+        }
+        if self.info.duration_ms.is_none_or(|d| d == 0)
+            && let Some(bytes) = self.byte_len
+            && bytes > 0
+        {
+            // bytes * 8 bits / (kbps bits/ms) = duration in ms
+            let est_ms = bytes.saturating_mul(8) / u64::from(bitrate_kbps);
+            if est_ms > 0 {
+                self.info.duration_ms = Some(est_ms);
+            }
         }
     }
 
@@ -453,6 +505,12 @@ fn mix_to_stereo(src: &[f32], frames: usize, src_channels: usize) -> Vec<f32> {
 
 fn time_to_ms(t: Time) -> u64 {
     t.as_millis().max(0) as u64
+}
+
+fn probe_local_duration_ms(path: &Path) -> Option<u64> {
+    let tagged = LoftyProbe::open(path).ok()?.read().ok()?;
+    let ms = tagged.properties().duration().as_millis() as u64;
+    (ms > 0).then_some(ms)
 }
 
 fn codec_id_to_mime(codec: AudioCodecId) -> &'static str {
@@ -608,5 +666,21 @@ mod tests {
             after_seek += pkt.frames;
         }
         assert!((after_seek as isize - 11_025).abs() < 1_024);
+    }
+
+    #[test]
+    fn estimates_duration_from_content_length_and_bitrate_when_missing() {
+        let wav = build_test_wav_pcm16(48_000, 440.0, 200);
+        let byte_len = wav.len() as u64;
+        let mut hint = Hint::new();
+        hint.with_extension("wav");
+        let mut dec =
+            AudioDecoder::open_source(Box::new(Cursor::new(wav)), hint).expect("open wav");
+        // Simulate a stream whose container omitted duration.
+        dec.info.duration_ms = None;
+        dec.info.estimated_bitrate_kbps = None;
+        dec.estimate_duration_from_bitrate_kbps(128);
+        assert_eq!(dec.info().duration_ms, Some((byte_len * 8) / 128));
+        assert_eq!(dec.info().estimated_bitrate_kbps, Some(128));
     }
 }

@@ -8,9 +8,8 @@
 //! - Per-deck `DspChain` (`Spatial -> Equalizer -> TransitionFilter -> Loudness`)
 //!   is pre-allocated off-thread before entering the audio thread.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc as std_mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::thread::{self, JoinHandle};
 
 use libspa::param::audio::{AudioFormat, AudioInfoRaw, MAX_CHANNELS};
@@ -40,6 +39,43 @@ const UNDERRUN_RAMP_FRAMES: usize = 16;
 pub const CMD_RING_CAPACITY: usize = 256;
 /// Fixed per-chunk frame limit inside the RT callback so scratch buffers never resize.
 const MAX_RT_CHUNK_FRAMES: usize = 4_096;
+/// Default low-watermark re-buffering threshold (350 ms) after a mid-track underrun
+/// so playback pauses briefly to accumulate audio instead of stuttering every 20 ms.
+pub const DEFAULT_REBUFFER_MS: usize = 350;
+
+/// Observable health of the live audio output backend (PipeWire or ALSA).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OutputStreamHealth {
+    #[default]
+    Connecting,
+    Streaming,
+    Paused,
+    Disconnected,
+    Error,
+}
+
+impl OutputStreamHealth {
+    const fn to_u8(self) -> u8 {
+        match self {
+            Self::Connecting => 0,
+            Self::Streaming => 1,
+            Self::Paused => 2,
+            Self::Disconnected => 3,
+            Self::Error => 4,
+        }
+    }
+
+    const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Streaming,
+            2 => Self::Paused,
+            3 => Self::Disconnected,
+            4 => Self::Error,
+            _ => Self::Connecting,
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum OutputError {
@@ -121,9 +157,19 @@ pub struct RtMetrics {
     played_frames_b: AtomicU64,
     flush_ack_a: AtomicU64,
     flush_ack_b: AtomicU64,
+    min_flush_epoch_a: AtomicU64,
+    min_flush_epoch_b: AtomicU64,
+    stale_drain_a: AtomicUsize,
+    stale_drain_b: AtomicUsize,
+    deck_eof_a: AtomicBool,
+    deck_eof_b: AtomicBool,
     underrun_count: AtomicU64,
     peak_level_bits: AtomicU32,
     paused: AtomicBool,
+    rebuffering: AtomicBool,
+    stream_health: AtomicU8,
+    needs_reconnect: AtomicBool,
+    stream_error: Mutex<Option<String>>,
 }
 
 impl RtMetrics {
@@ -141,6 +187,51 @@ impl RtMetrics {
         }
     }
 
+    pub fn set_deck_eof(&self, deck: DeckId, eof: bool) {
+        match deck {
+            DeckId::A => self.deck_eof_a.store(eof, Ordering::Release),
+            DeckId::B => self.deck_eof_b.store(eof, Ordering::Release),
+        }
+    }
+
+    pub fn deck_eof(&self, deck: DeckId) -> bool {
+        match deck {
+            DeckId::A => self.deck_eof_a.load(Ordering::Acquire),
+            DeckId::B => self.deck_eof_b.load(Ordering::Acquire),
+        }
+    }
+
+    /// Marks `min_epoch` as the earliest flush epoch still allowed to drain the
+    /// entire ring for `deck`. Any older flush that arrives late after a timeout
+    /// will only trim `stale_samples` old samples from the front, preserving newly
+    /// pushed audio from the incoming track.
+    pub(crate) fn arm_stale_flush_guard(&self, deck: DeckId, min_epoch: u64, stale_samples: usize) {
+        match deck {
+            DeckId::A => {
+                self.stale_drain_a.store(stale_samples, Ordering::Release);
+                self.min_flush_epoch_a.store(min_epoch, Ordering::Release);
+            }
+            DeckId::B => {
+                self.stale_drain_b.store(stale_samples, Ordering::Release);
+                self.min_flush_epoch_b.store(min_epoch, Ordering::Release);
+            }
+        }
+    }
+
+    fn min_flush_epoch(&self, deck: DeckId) -> u64 {
+        match deck {
+            DeckId::A => self.min_flush_epoch_a.load(Ordering::Acquire),
+            DeckId::B => self.min_flush_epoch_b.load(Ordering::Acquire),
+        }
+    }
+
+    fn take_stale_drain(&self, deck: DeckId) -> usize {
+        match deck {
+            DeckId::A => self.stale_drain_a.swap(0, Ordering::AcqRel),
+            DeckId::B => self.stale_drain_b.swap(0, Ordering::AcqRel),
+        }
+    }
+
     pub fn underruns(&self) -> u64 {
         self.underrun_count.load(Ordering::Relaxed)
     }
@@ -151,6 +242,47 @@ impl RtMetrics {
 
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Acquire)
+    }
+
+    pub fn is_rebuffering(&self) -> bool {
+        self.rebuffering.load(Ordering::Acquire)
+    }
+
+    pub fn stream_health(&self) -> OutputStreamHealth {
+        OutputStreamHealth::from_u8(self.stream_health.load(Ordering::Acquire))
+    }
+
+    pub fn needs_reconnect(&self) -> bool {
+        self.needs_reconnect.load(Ordering::Acquire)
+    }
+
+    pub fn stream_error(&self) -> Option<String> {
+        self.stream_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn set_stream_health(&self, health: OutputStreamHealth) {
+        self.stream_health.store(health.to_u8(), Ordering::Release);
+    }
+
+    pub(crate) fn mark_disconnected(&self, reason: Option<String>, is_error: bool) {
+        let health = if is_error {
+            OutputStreamHealth::Error
+        } else {
+            OutputStreamHealth::Disconnected
+        };
+        self.stream_health.store(health.to_u8(), Ordering::Release);
+        self.needs_reconnect.store(true, Ordering::Release);
+        if let Some(msg) = reason {
+            *self.stream_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
+        }
+    }
+
+    pub(crate) fn clear_reconnect_flag(&self) {
+        self.needs_reconnect.store(false, Ordering::Release);
+        *self.stream_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     fn add_played_frames(&self, deck: DeckId, frames: u64) {
@@ -210,6 +342,9 @@ pub struct RtMixerState {
     paused: bool,
     underrun_a: bool,
     underrun_b: bool,
+    rebuffer_a: bool,
+    rebuffer_b: bool,
+    rebuffer_threshold_samples: usize,
     metrics: Arc<RtMetrics>,
 }
 
@@ -220,6 +355,7 @@ impl RtMixerState {
         let (cmd_tx, cmd_rx) = RingBuffer::<RtCommand>::new(CMD_RING_CAPACITY);
         let metrics = Arc::new(RtMetrics {
             paused: AtomicBool::new(true),
+            stream_health: AtomicU8::new(OutputStreamHealth::Streaming.to_u8()),
             ..RtMetrics::default()
         });
 
@@ -227,6 +363,9 @@ impl RtMixerState {
         dsp_a.configure(sample_rate, OUTPUT_CHANNELS);
         let mut dsp_b = DspChain::new();
         dsp_b.configure(sample_rate, OUTPUT_CHANNELS);
+
+        let rebuffer_threshold_samples =
+            ((sample_rate as usize * DEFAULT_REBUFFER_MS) / 1_000) * OUTPUT_CHANNELS;
 
         let scratch_samples = MAX_RT_CHUNK_FRAMES * OUTPUT_CHANNELS;
         let state = Self {
@@ -245,6 +384,9 @@ impl RtMixerState {
             paused: true,
             underrun_a: false,
             underrun_b: false,
+            rebuffer_a: false,
+            rebuffer_b: false,
+            rebuffer_threshold_samples,
             metrics: Arc::clone(&metrics),
         };
 
@@ -256,6 +398,14 @@ impl RtMixerState {
             sample_rate,
         };
         (state, producers)
+    }
+
+    pub(crate) fn metrics(&self) -> &Arc<RtMetrics> {
+        &self.metrics
+    }
+
+    pub(crate) fn mark_fatal_output_error(&self, reason: String) {
+        self.metrics.mark_disconnected(Some(reason), true);
     }
 
     fn drain_commands(&mut self) {
@@ -316,19 +466,39 @@ impl RtMixerState {
                     DeckId::B => self.dsp_b.on_stream_boundary(),
                 },
                 RtCommand::FlushDeck { deck, epoch } => {
+                    let min_epoch = self.metrics.min_flush_epoch(deck);
+                    let is_stale = epoch < min_epoch;
+                    let stale_limit = if is_stale {
+                        self.metrics.take_stale_drain(deck)
+                    } else {
+                        usize::MAX
+                    };
                     match deck {
                         DeckId::A => {
-                            drain_ring(&mut self.rx_a);
+                            if is_stale {
+                                drain_ring_at_most(&mut self.rx_a, stale_limit);
+                            } else {
+                                drain_ring(&mut self.rx_a);
+                            }
                             self.dsp_a.flush();
                             self.underrun_a = false;
+                            self.rebuffer_a = false;
                         }
                         DeckId::B => {
-                            drain_ring(&mut self.rx_b);
+                            if is_stale {
+                                drain_ring_at_most(&mut self.rx_b, stale_limit);
+                            } else {
+                                drain_ring(&mut self.rx_b);
+                            }
                             self.dsp_b.flush();
                             self.underrun_b = false;
+                            self.rebuffer_b = false;
                         }
                     }
-                    self.metrics.reset_played_frames(deck);
+                    if !is_stale {
+                        self.metrics.reset_played_frames(deck);
+                    }
+                    self.metrics.rebuffering.store(false, Ordering::Release);
                     self.metrics.set_flush_ack(deck, epoch);
                 }
                 RtCommand::ResetPlayedFrames(deck) => {
@@ -352,6 +522,7 @@ impl RtMixerState {
 
         if self.paused {
             out[..total_samples].fill(0.0);
+            self.metrics.rebuffering.store(false, Ordering::Release);
             self.metrics
                 .peak_level_bits
                 .store(0.0_f32.to_bits(), Ordering::Relaxed);
@@ -362,6 +533,9 @@ impl RtMixerState {
         let master = if self.muted { 0.0 } else { self.volume };
         let use_a = self.gain_a > 1e-6;
         let use_b = self.gain_b > 1e-6;
+        let eof_a = self.metrics.deck_eof(DeckId::A);
+        let eof_b = self.metrics.deck_eof(DeckId::B);
+        let mut any_rebuffering = false;
 
         let mut offset_frames = 0usize;
         while offset_frames < total_frames {
@@ -371,44 +545,72 @@ impl RtMixerState {
                 [offset_frames * OUTPUT_CHANNELS..(offset_frames + chunk_frames) * OUTPUT_CHANNELS];
 
             if use_a {
-                let got = pop_samples(&mut self.rx_a, &mut self.buf_a[..chunk_samples]);
-                if self.underrun_a && got > 0 {
-                    apply_fade_in(&mut self.buf_a[..got]);
-                    self.underrun_a = false;
-                }
-                if got < chunk_samples {
-                    if got > 0 {
-                        apply_fade_out(&mut self.buf_a[..got]);
+                if self.rebuffer_a {
+                    if self.rx_a.slots() >= self.rebuffer_threshold_samples || eof_a {
+                        self.rebuffer_a = false;
+                    } else {
+                        self.buf_a[..chunk_samples].fill(0.0);
+                        any_rebuffering = true;
                     }
-                    self.buf_a[got..chunk_samples].fill(0.0);
-                    self.underrun_a = true;
-                    self.metrics.underrun_count.fetch_add(1, Ordering::Relaxed);
                 }
-                if got > 0 {
-                    self.metrics
-                        .add_played_frames(DeckId::A, (got / OUTPUT_CHANNELS) as u64);
+                if !self.rebuffer_a {
+                    let got = pop_samples(&mut self.rx_a, &mut self.buf_a[..chunk_samples]);
+                    if self.underrun_a && got > 0 {
+                        apply_fade_in(&mut self.buf_a[..got]);
+                        self.underrun_a = false;
+                    }
+                    if got < chunk_samples {
+                        if got > 0 {
+                            apply_fade_out(&mut self.buf_a[..got]);
+                        }
+                        self.buf_a[got..chunk_samples].fill(0.0);
+                        self.underrun_a = true;
+                        self.metrics.underrun_count.fetch_add(1, Ordering::Relaxed);
+                        if !eof_a && self.rebuffer_threshold_samples > 0 {
+                            self.rebuffer_a = true;
+                            any_rebuffering = true;
+                        }
+                    }
+                    if got > 0 {
+                        self.metrics
+                            .add_played_frames(DeckId::A, (got / OUTPUT_CHANNELS) as u64);
+                    }
                 }
                 self.dsp_a
                     .process_interleaved(&mut self.buf_a[..chunk_samples]);
             }
 
             if use_b {
-                let got = pop_samples(&mut self.rx_b, &mut self.buf_b[..chunk_samples]);
-                if self.underrun_b && got > 0 {
-                    apply_fade_in(&mut self.buf_b[..got]);
-                    self.underrun_b = false;
-                }
-                if got < chunk_samples {
-                    if got > 0 {
-                        apply_fade_out(&mut self.buf_b[..got]);
+                if self.rebuffer_b {
+                    if self.rx_b.slots() >= self.rebuffer_threshold_samples || eof_b {
+                        self.rebuffer_b = false;
+                    } else {
+                        self.buf_b[..chunk_samples].fill(0.0);
+                        any_rebuffering = true;
                     }
-                    self.buf_b[got..chunk_samples].fill(0.0);
-                    self.underrun_b = true;
-                    self.metrics.underrun_count.fetch_add(1, Ordering::Relaxed);
                 }
-                if got > 0 {
-                    self.metrics
-                        .add_played_frames(DeckId::B, (got / OUTPUT_CHANNELS) as u64);
+                if !self.rebuffer_b {
+                    let got = pop_samples(&mut self.rx_b, &mut self.buf_b[..chunk_samples]);
+                    if self.underrun_b && got > 0 {
+                        apply_fade_in(&mut self.buf_b[..got]);
+                        self.underrun_b = false;
+                    }
+                    if got < chunk_samples {
+                        if got > 0 {
+                            apply_fade_out(&mut self.buf_b[..got]);
+                        }
+                        self.buf_b[got..chunk_samples].fill(0.0);
+                        self.underrun_b = true;
+                        self.metrics.underrun_count.fetch_add(1, Ordering::Relaxed);
+                        if !eof_b && self.rebuffer_threshold_samples > 0 {
+                            self.rebuffer_b = true;
+                            any_rebuffering = true;
+                        }
+                    }
+                    if got > 0 {
+                        self.metrics
+                            .add_played_frames(DeckId::B, (got / OUTPUT_CHANNELS) as u64);
+                    }
                 }
                 self.dsp_b
                     .process_interleaved(&mut self.buf_b[..chunk_samples]);
@@ -434,6 +636,9 @@ impl RtMixerState {
             offset_frames += chunk_frames;
         }
 
+        self.metrics
+            .rebuffering
+            .store(any_rebuffering, Ordering::Release);
         self.metrics
             .peak_level_bits
             .store(peak.to_bits(), Ordering::Relaxed);
@@ -501,6 +706,16 @@ fn drain_ring(rx: &mut Consumer<f32>) {
     let slots = rx.slots();
     if slots > 0
         && let Ok(chunk) = rx.read_chunk(slots)
+    {
+        chunk.commit_all();
+    }
+}
+
+#[inline]
+fn drain_ring_at_most(rx: &mut Consumer<f32>, max_samples: usize) {
+    let to_drain = rx.slots().min(max_samples);
+    if to_drain > 0
+        && let Ok(chunk) = rx.read_chunk(to_drain)
     {
         chunk.commit_all();
     }
@@ -639,12 +854,34 @@ fn run_pipewire_loop(
         }
     });
 
+    let metrics_for_core = Arc::clone(rt_state.metrics());
+    let mainloop_for_core = mainloop.clone();
+    let _core_listener = core
+        .add_listener_local()
+        .error(move |id, _seq, res, message| {
+            // id == 0 is the PipeWire core object itself (e.g. pipewire daemon restart).
+            if id == 0 {
+                metrics_for_core.mark_disconnected(
+                    Some(format!("PipeWire core error ({res}): {message}")),
+                    true,
+                );
+                mainloop_for_core.quit();
+            }
+        })
+        .register();
+
+    // Target ~42.7 ms quantum (2048/48000, scaled proportionally at higher rates) so
+    // Bluetooth TWS (A2DP SBC/AAC/LDAC) and laptop speakers never xrun on tiny quanta.
+    let latency_frames = ((u64::from(sample_rate) * 2_048) / 48_000).clamp(1_024, 8_192);
+    let latency_frac = format!("{latency_frames}/{sample_rate}");
+
     let mut props = properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_ROLE => "Music",
         *pw::keys::MEDIA_CATEGORY => "Playback",
         *pw::keys::APP_NAME => "Myusic",
         *pw::keys::AUDIO_CHANNELS => "2",
+        *pw::keys::NODE_LATENCY => latency_frac,
     };
     if force_rate {
         let rate_frac = format!("1/{sample_rate}");
@@ -652,6 +889,10 @@ fn run_pipewire_loop(
         props.insert("node.rate", rate_frac);
         props.insert("node.force-rate", rate_str);
     }
+
+    rt_state
+        .metrics()
+        .set_stream_health(OutputStreamHealth::Connecting);
 
     let stream = match pw::stream::StreamBox::new(&core, "bitchord-playback", props) {
         Ok(s) => s,
@@ -663,10 +904,41 @@ fn run_pipewire_loop(
 
     let _listener = match stream
         .add_local_listener_with_user_data(rt_state)
+        .state_changed(|_stream, state, old, new| match new {
+            pw::stream::StreamState::Streaming => {
+                state.metrics().set_stream_health(OutputStreamHealth::Streaming);
+                state.metrics().clear_reconnect_flag();
+            }
+            pw::stream::StreamState::Paused => {
+                state.metrics().set_stream_health(OutputStreamHealth::Paused);
+            }
+            pw::stream::StreamState::Connecting => {
+                state.metrics().set_stream_health(OutputStreamHealth::Connecting);
+            }
+            pw::stream::StreamState::Unconnected => {
+                if matches!(
+                    old,
+                    pw::stream::StreamState::Streaming | pw::stream::StreamState::Paused
+                ) {
+                    state.metrics().mark_disconnected(
+                        Some("PipeWire output stream disconnected".to_owned()),
+                        false,
+                    );
+                } else {
+                    state
+                        .metrics()
+                        .set_stream_health(OutputStreamHealth::Disconnected);
+                }
+            }
+            pw::stream::StreamState::Error(msg) => {
+                state.metrics().mark_disconnected(Some(msg), true);
+            }
+        })
         .process(|stream, state| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
+            let requested_frames = buffer.requested() as usize;
             let stride = std::mem::size_of::<f32>() * OUTPUT_CHANNELS;
             let datas = buffer.datas_mut();
             if datas.is_empty() {
@@ -674,7 +946,14 @@ fn run_pipewire_loop(
             }
             let data = &mut datas[0];
             let n_frames = if let Some(slice) = data.data() {
-                state.render_f32le_bytes(slice)
+                let max_frames = slice.len() / stride;
+                let target_frames = if requested_frames > 0 {
+                    requested_frames.min(max_frames)
+                } else {
+                    max_frames
+                };
+                let target_bytes = target_frames * stride;
+                state.render_f32le_bytes(&mut slice[..target_bytes])
             } else {
                 0
             };
@@ -883,5 +1162,71 @@ mod tests {
         let _ = sink.render_frames(16);
         assert_eq!(prod.metrics.played_frames(DeckId::A), 0);
         assert_eq!(prod.metrics.flush_ack(DeckId::A), 7);
+    }
+
+    #[test]
+    fn low_watermark_rebuffer_holds_until_threshold_and_releases_cleanly_at_eof() {
+        let (mut sink, mut prod) = NullAudioSink::new(OUTPUT_SAMPLE_RATE);
+        prod.commands.push(RtCommand::SetPaused(false)).unwrap();
+
+        // Trigger a mid-track underrun (deck_eof == false).
+        let _ = sink.render_frames(128);
+        assert!(prod.metrics.is_rebuffering());
+
+        // Pushing fewer samples than DEFAULT_REBUFFER_MS (~350ms = 16_800 frames)
+        // must keep the mixer rebuffering (outputting silence without consuming them).
+        for _ in 0..256 {
+            prod.deck_a.push(0.5).unwrap();
+            prod.deck_a.push(0.5).unwrap();
+        }
+        let silent = sink.render_frames(128);
+        assert!(silent.iter().all(|&s| s == 0.0));
+        assert!(prod.metrics.is_rebuffering());
+        assert_eq!(prod.metrics.played_frames(DeckId::A), 0);
+
+        // Once EOF is signaled, rebuffering releases immediately to drain the tail.
+        prod.metrics.set_deck_eof(DeckId::A, true);
+        let tail = sink.render_frames(256);
+        assert!(!prod.metrics.is_rebuffering());
+        assert_eq!(prod.metrics.played_frames(DeckId::A), 256);
+        assert!(tail.iter().any(|&s| s.abs() > 0.1));
+    }
+
+    #[test]
+    fn stale_flush_after_timeout_only_trims_old_samples_and_preserves_new_track() {
+        let (mut sink, mut prod) = NullAudioSink::new(OUTPUT_SAMPLE_RATE);
+
+        // Old track left 4 stereo frames (8 samples) of -0.5 in the ring.
+        for _ in 0..8 {
+            prod.deck_a.push(-0.5).unwrap();
+        }
+        // Engine queues FlushDeck epoch 1, times out, arms guard (min_epoch=2, stale=8).
+        prod.commands
+            .push(RtCommand::FlushDeck {
+                deck: DeckId::A,
+                epoch: 1,
+            })
+            .unwrap();
+        prod.metrics.arm_stale_flush_guard(DeckId::A, 2, 8);
+
+        // New track immediately starts pushing 128 frames of +0.75 before RT wakes up.
+        for _ in 0..256 {
+            prod.deck_a.push(0.75).unwrap();
+        }
+
+        // Now RT wakes up, unpauses, drains commands, and renders.
+        prod.metrics.set_deck_eof(DeckId::A, true);
+        prod.commands.push(RtCommand::SetPaused(false)).unwrap();
+        let out = sink.render_frames(128);
+
+        // Old -0.5 samples were trimmed; all 128 frames of new +0.75 survived intact!
+        assert_eq!(prod.metrics.flush_ack(DeckId::A), 1);
+        assert_eq!(prod.metrics.played_frames(DeckId::A), 128);
+        assert!(
+            out[0] > 0.5 && out[100] > 0.5,
+            "new track opening samples must survive stale flush: out[0]={}, out[100]={}",
+            out[0],
+            out[100]
+        );
     }
 }

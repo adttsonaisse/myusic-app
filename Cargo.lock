@@ -931,6 +931,7 @@ dependencies = [
  "bitchord-jam",
  "bitchord-model",
  "libspa",
+ "lofty",
  "mpris-server",
  "pipewire",
  "reqwest 0.13.5",

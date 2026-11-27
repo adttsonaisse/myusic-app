@@ -1244,11 +1244,20 @@ fn parse_dff_prop(payload: &[u8]) -> Result<(u32, usize, bool), DecoderError> {
     let mut rate = 0u32;
     let mut channels = 0usize;
     let mut is_dst = false;
-    while pos + 12 <= payload.len() {
+    while let Some(header_end) = pos.checked_add(12) {
+        if header_end > payload.len() {
+            break;
+        }
         let id = &payload[pos..pos + 4];
-        let size = u64::from_be_bytes(payload[pos + 4..pos + 12].try_into().unwrap()) as usize;
-        pos += 12;
-        if pos + size > payload.len() {
+        let size_u64 = u64::from_be_bytes(payload[pos + 4..header_end].try_into().unwrap());
+        let Ok(size) = usize::try_from(size_u64) else {
+            break;
+        };
+        pos = header_end;
+        let Some(chunk_end) = pos.checked_add(size) else {
+            break;
+        };
+        if chunk_end > payload.len() {
             break;
         }
         match id {
@@ -1268,7 +1277,10 @@ fn parse_dff_prop(payload: &[u8]) -> Result<(u32, usize, bool), DecoderError> {
             }
             _ => {}
         }
-        pos += size + (size & 1);
+        let Some(next_pos) = chunk_end.checked_add(size & 1) else {
+            break;
+        };
+        pos = next_pos;
     }
     Ok((rate, channels, is_dst))
 }
@@ -1501,5 +1513,33 @@ mod tests {
         assert_eq!(out[1] as u32, 0x0522_4400);
         assert_eq!(out[2] as u32, 0xFAAA_CC00);
         assert_eq!(out[3] as u32, 0xFABB_DD00);
+    }
+
+    #[test]
+    fn parse_dff_prop_handles_corrupt_huge_chunk_size_without_overflow_panic() {
+        // Build a malicious PROP payload whose sub-chunk declares u64::MAX bytes.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"SND ");
+        payload.extend_from_slice(b"FS  ");
+        payload.extend_from_slice(&4u64.to_be_bytes());
+        payload.extend_from_slice(&2_822_400u32.to_be_bytes());
+        payload.extend_from_slice(b"JUNK");
+        payload.extend_from_slice(&u64::MAX.to_be_bytes());
+        payload.extend_from_slice(&[0u8; 8]);
+
+        let (rate, channels, is_dst) =
+            parse_dff_prop(&payload).expect("huge chunk size must not panic");
+        assert_eq!(rate, 2_822_400);
+        assert_eq!(channels, 0);
+        assert!(!is_dst);
+
+        // Also test near-usize::MAX size that would overflow `pos + size` or `size + (size & 1)`.
+        let mut payload2 = Vec::new();
+        payload2.extend_from_slice(b"SND ");
+        payload2.extend_from_slice(b"JUNK");
+        payload2.extend_from_slice(&((usize::MAX - 2) as u64).to_be_bytes());
+        let (rate2, _, _) =
+            parse_dff_prop(&payload2).expect("near-usize::MAX must not overflow");
+        assert_eq!(rate2, 0);
     }
 }

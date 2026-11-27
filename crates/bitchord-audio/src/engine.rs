@@ -23,13 +23,13 @@ use thiserror::Error;
 use tokio::runtime::Handle;
 
 use crate::alsa_output::AlsaExclusiveSink;
-use crate::chunked_source::{ChunkedRangeSource, RefusalCallback};
+use crate::chunked_source::{ChunkedRangeSource, RefusalCallback, StreamCancelToken};
 use crate::crossfade::{CrossfadePhase, CrossfadeState, DeckId};
 use crate::decoder::{AudioDecoder, DecodedPacket, DecodedStreamInfo, DecoderError};
 use crate::dsp::{EqTuningSnapshot, loudness_db_to_linear_gain};
 use crate::output::{
     AudioBackend, AudioOutputMode, NullAudioSink, OUTPUT_CHANNELS, OUTPUT_SAMPLE_RATE, OutputError,
-    PipeWireSink, RtCommand, RtMetrics, SinkProducers,
+    OutputStreamHealth, PipeWireSink, RING_CAPACITY_SAMPLES, RtCommand, RtMetrics, SinkProducers,
 };
 use crate::resampler::{AudioResampler, ResamplerError};
 use crate::skip_silence::SkipSilenceProcessor;
@@ -102,6 +102,12 @@ pub struct PlaybackSnapshot {
     pub bit_perfect_active: bool,
     /// Active or armed Smart Automix / LoopMix transition summary (if planned).
     pub automix_plan_summary: Option<String>,
+    /// Live health of the audio output backend (PipeWire / ALSA).
+    pub output_health: OutputStreamHealth,
+    /// `true` when PipeWire/ALSA reported a disconnect or fatal error requiring recovery.
+    pub needs_output_reconnect: bool,
+    /// Latest output backend disconnect / fallback diagnostic message, if any.
+    pub output_error: Option<String>,
 }
 
 /// Summary produced by headless [`AudioEngine::drain_to_eof_null`] runs (`--no-output`).
@@ -143,6 +149,7 @@ pub enum AudioSourceSpec {
 
 struct WorkerShared {
     cancel: AtomicBool,
+    cancel_token: Mutex<Option<StreamCancelToken>>,
     seek_target_ms: AtomicI64,
     seek_epoch: AtomicU64,
     seek_gate: AtomicBool,
@@ -153,6 +160,30 @@ struct WorkerShared {
     skipped_silence_ms: AtomicU64,
     pushed_frames: AtomicU64,
     error_msg: Mutex<Option<String>>,
+}
+
+impl WorkerShared {
+    fn set_cancel_token(&self, token: Option<StreamCancelToken>) {
+        if let Some(ref tok) = token
+            && self.cancel.load(Ordering::Acquire)
+        {
+            tok.cancel();
+        }
+        *self.cancel_token.lock().unwrap_or_else(|e| e.into_inner()) = token;
+    }
+
+    fn trigger_cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+        self.seek_gate.store(false, Ordering::Release);
+        let token = self
+            .cancel_token
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(tok) = token {
+            tok.cancel();
+        }
+    }
 }
 
 struct DeckWorker {
@@ -187,8 +218,7 @@ impl DeckSlot {
 
     fn stop_worker(&mut self) {
         if let Some(worker) = self.worker.take() {
-            worker.shared.cancel.store(true, Ordering::Release);
-            worker.shared.seek_gate.store(false, Ordering::Release);
+            worker.shared.trigger_cancel();
             if let Ok(producer) = worker.join.join() {
                 self.producer = Some(producer);
             }
@@ -265,6 +295,7 @@ pub struct AudioEngine {
     eq_snapshot: EqTuningSnapshot,
     output_mode: AudioOutputMode,
     next_flush_epoch: u64,
+    last_output_notice: Option<String>,
 }
 
 impl AudioEngine {
@@ -326,11 +357,49 @@ impl AudioEngine {
             eq_snapshot: EqTuningSnapshot::off(),
             output_mode,
             next_flush_epoch: 0,
+            last_output_notice: None,
         }
     }
 
     pub fn output_mode(&self) -> &AudioOutputMode {
         &self.output_mode
+    }
+
+    pub fn output_health(&self) -> OutputStreamHealth {
+        self.metrics.stream_health()
+    }
+
+    pub fn needs_output_reconnect(&self) -> bool {
+        self.metrics.needs_reconnect()
+    }
+
+    pub fn output_error(&self) -> Option<String> {
+        self.metrics
+            .stream_error()
+            .or_else(|| self.last_output_notice.clone())
+    }
+
+    /// Re-initializes the active output backend after a PipeWire restart / TWS
+    /// disconnect or falls back from a disconnected ALSA USB DAC to PipeWire Auto.
+    /// Returns `Ok(true)` when a backend swap occurred.
+    pub fn recover_output_backend(&mut self) -> Result<bool, EngineError> {
+        if matches!(self.backend, AudioBackend::Null(_)) {
+            return Ok(false);
+        }
+        let reason = self.metrics.stream_error();
+        let target_mode = match &self.output_mode {
+            AudioOutputMode::AlsaExclusive { .. } => AudioOutputMode::PipeWireAuto,
+            other => other.clone(),
+        };
+        let target_rate = match &target_mode {
+            AudioOutputMode::PipeWireAuto => OUTPUT_SAMPLE_RATE,
+            _ => self.backend.sample_rate().clamp(8_000, 384_000),
+        };
+        self.stop();
+        let (backend, producers) = spawn_backend_for_mode(&target_mode, target_rate, None)?;
+        self.install_backend(backend, producers, target_mode);
+        self.last_output_notice = reason;
+        Ok(true)
     }
 
     /// Switches live audio output backend (PipeWire Auto / PipeWire Force-Rate / ALSA Exclusive)
@@ -480,15 +549,26 @@ impl AudioEngine {
     }
 
     /// Sends a monotonically tagged `FlushDeck` and waits until the RT audio thread
-    /// acknowledges completing that exact epoch, guaranteeing that newly pushed
-    /// opening samples of the next track (or post-seek audio) can NEVER be wiped
-    /// by a delayed flush sitting in the command ring.
+    /// acknowledges completing that exact epoch. If the RT thread is suspended/idle
+    /// (e.g. Bluetooth TWS waking up >250 ms), arms a stale-flush guard on [`RtMetrics`]
+    /// so the delayed flush can only trim old samples and NEVER wipes the incoming track.
     fn flush_deck_sync(&mut self, deck_id: DeckId) {
+        let stale_samples = self
+            .deck(deck_id)
+            .producer
+            .as_ref()
+            .map_or(0, |p| RING_CAPACITY_SAMPLES.saturating_sub(p.slots()));
         let target_epoch = self.send_flush_async(deck_id);
         self.sync_null_commands();
         let deadline = Instant::now() + FLUSH_ACK_TIMEOUT;
         while self.metrics.flush_ack(deck_id) < target_epoch {
             if Instant::now() >= deadline {
+                // RT thread did not wake in time; advance min_flush_epoch so when the
+                // delayed FlushDeck runs later, it only trims `stale_samples` from the
+                // old track and leaves any newly pushed audio untouched.
+                self.next_flush_epoch = self.next_flush_epoch.saturating_add(1);
+                self.metrics
+                    .arm_stale_flush_guard(deck_id, self.next_flush_epoch, stale_samples);
                 break;
             }
             thread::sleep(Duration::from_millis(1));
@@ -738,6 +818,7 @@ impl AudioEngine {
         // Stop any existing worker on this deck and wait until the RT thread has
         // actually flushed its ring buffer so sample 0 of the new track is never dropped.
         self.deck_mut(deck_id).stop_worker();
+        self.metrics.set_deck_eof(deck_id, false);
         self.flush_deck_sync(deck_id);
 
         let output_rate = self.output_sample_rate();
@@ -749,8 +830,13 @@ impl AudioEngine {
             .take()
             .ok_or(EngineError::WorkerUnavailable)?;
 
+        let initial_cancel_token = match &spec {
+            AudioSourceSpec::PreparedDecoder { decoder, .. } => decoder.cancel_token(),
+            _ => None,
+        };
         let shared = Arc::new(WorkerShared {
             cancel: AtomicBool::new(false),
+            cancel_token: Mutex::new(initial_cancel_token),
             seek_target_ms: AtomicI64::new(-1),
             seek_epoch: AtomicU64::new(0),
             seek_gate: AtomicBool::new(false),
@@ -770,10 +856,19 @@ impl AudioEngine {
             DeckId::B => "bitchord-decode-b",
         };
         let worker_shared = Arc::clone(&shared);
+        let worker_metrics = Arc::clone(&self.metrics);
         let join = thread::Builder::new()
             .name(thread_name.to_owned())
             .spawn(move || {
-                run_decode_worker(spec, output_rate, producer, worker_shared, ready_tx)
+                run_decode_worker(
+                    spec,
+                    deck_id,
+                    output_rate,
+                    producer,
+                    worker_shared,
+                    worker_metrics,
+                    ready_tx,
+                )
             })?;
 
         let info = match ready_rx.recv() {
@@ -822,9 +917,108 @@ impl AudioEngine {
         if !self.deck(active).is_loaded() {
             return;
         }
+        if self.state == PlaybackState::Error {
+            // Attempt clean recovery from the last known position so pressing Play
+            // after a transient network glitch resumes instead of bouncing back to Error.
+            let _ = self.retry_after_error();
+        }
         self.send_rt(RtCommand::SetPaused(false));
         self.sync_null_commands();
         self.state = PlaybackState::Playing;
+    }
+
+    /// Clears the active deck's error state and seeks its decode worker back to
+    /// the last known playback position so streaming/decoding can resume cleanly.
+    pub fn retry_after_error(&mut self) -> Result<u64, EngineError> {
+        let active = self.crossfade.active_deck;
+        if !self.deck(active).is_loaded() {
+            return Ok(0);
+        }
+        let resume_ms = self.position_ms();
+        if let Some(ref w) = self.deck(active).worker {
+            *w.shared.error_msg.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            w.shared.eof_reached.store(false, Ordering::Release);
+        }
+        self.metrics.set_deck_eof(active, false);
+        let landed = self.seek_deck_ms(active, resume_ms)?;
+        if self.state == PlaybackState::Error {
+            self.state = PlaybackState::Paused;
+        }
+        Ok(landed)
+    }
+
+    /// Returns `true` if the standby deck already holds a preloaded track matching `video_id`.
+    pub fn has_standby_for(&self, video_id: &str) -> bool {
+        let standby = self.crossfade.active_deck.other();
+        self.deck(standby).is_loaded()
+            && self
+                .deck(standby)
+                .song
+                .as_ref()
+                .is_some_and(|s| s.video_id == video_id)
+    }
+
+    /// Returns the song currently preloaded on the standby deck, if any.
+    pub fn standby_song(&self) -> Option<&Song> {
+        let standby = self.crossfade.active_deck.other();
+        if self.deck(standby).is_loaded() {
+            self.deck(standby).song.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// Stops and clears any preloaded standby deck (call whenever queue order,
+    /// shuffle, or repeat mode changes so stale preloads never fire on gapless EOF).
+    pub fn clear_standby(&mut self) {
+        let standby = self.crossfade.active_deck.other();
+        self.planned_transition = None;
+        if self.crossfade.is_transitioning() {
+            self.crossfade.phase = CrossfadePhase::Idle;
+            self.active_transition = None;
+            self.send_rt(RtCommand::OpenTransition(DeckId::A));
+            self.send_rt(RtCommand::OpenTransition(DeckId::B));
+            self.send_active_solo_gains();
+        }
+        self.deck_mut(standby).stop_worker();
+        self.metrics.set_deck_eof(standby, false);
+        self.send_flush_async(standby);
+        self.send_rt(RtCommand::SetNextLoudnessGain {
+            deck: self.crossfade.active_deck,
+            gain: None,
+        });
+        self.sync_null_commands();
+    }
+
+    /// Instantly promotes the preloaded standby deck to active playback (e.g. on
+    /// manual Next Track) without tearing down and re-resolving the stream.
+    /// Returns `false` if no standby track is loaded.
+    pub fn activate_standby_now(&mut self) -> bool {
+        let old_active = self.crossfade.active_deck;
+        let standby = old_active.other();
+        if !self.deck(standby).is_loaded() {
+            return false;
+        }
+        self.crossfade.phase = CrossfadePhase::Idle;
+        self.crossfade.handed_off = false;
+        self.planned_transition = None;
+        self.active_transition = None;
+        self.crossfade.active_deck = standby;
+
+        self.send_rt(RtCommand::OpenTransition(DeckId::A));
+        self.send_rt(RtCommand::OpenTransition(DeckId::B));
+        self.send_rt(RtCommand::StreamBoundary(standby));
+        self.send_active_solo_gains();
+
+        self.deck_mut(old_active).stop_worker();
+        self.metrics.set_deck_eof(old_active, false);
+        self.send_flush_async(old_active);
+        self.deck(standby)
+            .apply_dynamic_params(self.speed, self.skip_silence);
+        self.send_rt(RtCommand::SetPaused(false));
+        self.sync_null_commands();
+        self.state = PlaybackState::Playing;
+        true
     }
 
     pub fn pause(&mut self) {
@@ -1021,11 +1215,35 @@ impl AudioEngine {
             .unwrap_or(0)
     }
 
-    /// Advances crossfade transitions, gapless handoffs, and the sleep timer by `delta_ms`.
+    /// Advances crossfade transitions, gapless handoffs, output health fallback,
+    /// rebuffering state, and the sleep timer by `delta_ms`.
     pub fn tick(&mut self, delta_ms: u64) {
+        // 0. If an ALSA exclusive USB DAC was unplugged, fall back cleanly to PipeWire
+        //    instead of spinning in a silent progress loop.
+        if matches!(self.backend, AudioBackend::AlsaExclusive(_))
+            && self.metrics.needs_reconnect()
+        {
+            let notice = self
+                .metrics
+                .stream_error()
+                .unwrap_or_else(|| "ALSA device disconnected; switched to PipeWire".to_owned());
+            if let Ok((pw_sink, pw_prod)) = PipeWireSink::spawn(OUTPUT_SAMPLE_RATE) {
+                self.install_backend(
+                    AudioBackend::PipeWire(pw_sink),
+                    pw_prod,
+                    AudioOutputMode::PipeWireAuto,
+                );
+            } else {
+                self.stop();
+            }
+            self.last_output_notice = Some(notice);
+            self.state = PlaybackState::Paused;
+            return;
+        }
+
         // 1. Poll monotonic sleep timer deadline.
         if self.sleep_timer.poll_expired(Instant::now()) {
-            if self.state == PlaybackState::Playing {
+            if self.state == PlaybackState::Playing || self.state == PlaybackState::Buffering {
                 self.crossfade_outgoing = self.crossfade.active_deck;
                 self.crossfade.begin_sleep_fade(SLEEP_FADE_MS);
             } else {
@@ -1033,8 +1251,16 @@ impl AudioEngine {
             }
         }
 
-        if self.state != PlaybackState::Playing {
+        if self.state != PlaybackState::Playing && self.state != PlaybackState::Buffering {
             return;
+        }
+
+        // Reflect low-watermark rebuffering transitions cleanly in PlaybackState.
+        let is_rebuffering = self.metrics.is_rebuffering();
+        if is_rebuffering && self.state == PlaybackState::Playing {
+            self.state = PlaybackState::Buffering;
+        } else if !is_rebuffering && self.state == PlaybackState::Buffering {
+            self.state = PlaybackState::Playing;
         }
 
         let active = self.crossfade.active_deck;
@@ -1195,6 +1421,9 @@ impl AudioEngine {
             output_sample_rate_hz: self.backend.sample_rate(),
             bit_perfect_active: self.is_bit_perfect_active(slot),
             automix_plan_summary: self.transition_plan().map(|p| p.summary.clone()),
+            output_health: self.output_health(),
+            needs_output_reconnect: self.needs_output_reconnect(),
+            output_error: self.output_error(),
         }
     }
 
@@ -1251,7 +1480,9 @@ impl AudioEngine {
         let mut total_samples = 0u64;
         let mut wait_spins = 0usize;
 
-        while rendered_frames < max_frames && self.state == PlaybackState::Playing {
+        while rendered_frames < max_frames
+            && matches!(self.state, PlaybackState::Playing | PlaybackState::Buffering)
+        {
             let active = self.crossfade.active_deck;
             let pushed = self.deck(active).pushed_frames();
             let played = self.metrics.played_frames(active);
@@ -1345,24 +1576,46 @@ pub fn open_http_decoder(
     stream: &ResolvedStream,
     on_refused: Option<RefusalCallback>,
 ) -> Result<AudioDecoder, EngineError> {
+    open_http_decoder_with_cancel(http, rt, stream, on_refused, StreamCancelToken::new())
+}
+
+/// Opens a [`ChunkedRangeSource`]-backed [`AudioDecoder`] attached to a caller-provided
+/// [`StreamCancelToken`] so stalled HTTP fetches can be aborted immediately.
+pub fn open_http_decoder_with_cancel(
+    http: Client,
+    rt: Handle,
+    stream: &ResolvedStream,
+    on_refused: Option<RefusalCallback>,
+    cancel: StreamCancelToken,
+) -> Result<AudioDecoder, EngineError> {
     let mut hint = Hint::new();
     if !stream.ext.is_empty() {
         hint.with_extension(&stream.ext);
     } else if let Some(ext) = mime_to_extension(&stream.mime_type) {
         hint.with_extension(ext);
     }
-    let source = ChunkedRangeSource::from_resolved(http, rt, stream, on_refused)?;
+    let source = ChunkedRangeSource::from_resolved_with_cancel(http, rt, stream, on_refused, cancel)?;
+    let cancel_token = source.cancel_token();
     let mut decoder = AudioDecoder::open_source(Box::new(source), hint)?;
+    decoder.attach_cancel_token(cancel_token);
     let fallback_dur = stream
         .duration_ms
         .filter(|&d| d > 0)
         .or_else(|| PlayerClient::duration_ms_from_url(&stream.url));
     decoder.apply_fallback_duration_ms(fallback_dur);
+    decoder.estimate_duration_from_bitrate_kbps(stream.kbps);
     Ok(decoder)
 }
 
 fn open_decoder_for_spec(
     spec: AudioSourceSpec,
+) -> Result<(AudioDecoder, VecDeque<DecodedPacket>), EngineError> {
+    open_decoder_for_spec_with_cancel(spec, None)
+}
+
+fn open_decoder_for_spec_with_cancel(
+    spec: AudioSourceSpec,
+    shared: Option<&WorkerShared>,
 ) -> Result<(AudioDecoder, VecDeque<DecodedPacket>), EngineError> {
     match spec {
         AudioSourceSpec::LocalFile(path) => Ok((AudioDecoder::open_path(&path)?, VecDeque::new())),
@@ -1381,14 +1634,25 @@ fn open_decoder_for_spec(
             rt,
             stream,
             on_refused,
-        } => Ok((
-            open_http_decoder(http, rt, &stream, on_refused)?,
-            VecDeque::new(),
-        )),
+        } => {
+            let cancel = StreamCancelToken::new();
+            if let Some(sh) = shared {
+                sh.set_cancel_token(Some(cancel.clone()));
+            }
+            Ok((
+                open_http_decoder_with_cancel(http, rt, &stream, on_refused, cancel)?,
+                VecDeque::new(),
+            ))
+        }
         AudioSourceSpec::PreparedDecoder {
             decoder,
             prebuffered,
-        } => Ok((*decoder, VecDeque::from(prebuffered))),
+        } => {
+            if let Some(sh) = shared {
+                sh.set_cancel_token(decoder.cancel_token());
+            }
+            Ok((*decoder, VecDeque::from(prebuffered)))
+        }
     }
 }
 
@@ -1417,18 +1681,24 @@ fn mime_to_extension(mime: &str) -> Option<&'static str> {
 
 fn run_decode_worker(
     spec: AudioSourceSpec,
+    deck_id: DeckId,
     output_rate: u32,
     mut producer: Producer<f32>,
     shared: Arc<WorkerShared>,
+    metrics: Arc<RtMetrics>,
     ready_tx: std_mpsc::SyncSender<Result<DecodedStreamInfo, EngineError>>,
 ) -> Producer<f32> {
-    let (mut decoder, mut prebuffered) = match open_decoder_for_spec(spec) {
+    let (mut decoder, mut prebuffered) = match open_decoder_for_spec_with_cancel(spec, Some(&shared))
+    {
         Ok(pair) => pair,
         Err(err) => {
             let _ = ready_tx.send(Err(err));
             return producer;
         }
     };
+    if let Some(tok) = decoder.cancel_token() {
+        shared.set_cancel_token(Some(tok));
+    }
 
     let info = decoder.info().clone();
     let mut resampler = match AudioResampler::new(info.sample_rate_hz, output_rate, OUTPUT_CHANNELS)
@@ -1468,10 +1738,12 @@ fn run_decode_worker(
                     skip_proc.reset();
                     stretcher.reset();
                     resampler.reset();
+                    *shared.error_msg.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     shared.base_position_ms.store(actual_ms, Ordering::Release);
                     shared.skipped_silence_ms.store(0, Ordering::Relaxed);
                     shared.pushed_frames.store(0, Ordering::Release);
                     shared.eof_reached.store(false, Ordering::Release);
+                    metrics.set_deck_eof(deck_id, false);
                     eof_flushed = false;
                 }
                 Err(err) => {
@@ -1519,6 +1791,7 @@ fn run_decode_worker(
                     *shared.error_msg.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some(err.to_string());
                     shared.eof_reached.store(true, Ordering::Release);
+                    metrics.set_deck_eof(deck_id, true);
                     eof_flushed = true;
                     continue;
                 }
@@ -1534,11 +1807,13 @@ fn run_decode_worker(
                     push_samples_interruptible(&mut producer, &out_buf, &shared);
                 }
                 shared.eof_reached.store(true, Ordering::Release);
+                metrics.set_deck_eof(deck_id, true);
                 eof_flushed = true;
             }
             Err(err) => {
                 *shared.error_msg.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.to_string());
                 shared.eof_reached.store(true, Ordering::Release);
+                metrics.set_deck_eof(deck_id, true);
                 eof_flushed = true;
             }
         }
@@ -1790,5 +2065,152 @@ mod tests {
         assert_eq!(report.song.as_ref().map(|s| s.video_id.as_str()), Some("b"));
         assert!(engine.snapshot().automix_plan_summary.is_none());
         assert!(report.rendered_duration_ms >= 2_500 && report.rendered_duration_ms <= 4_200);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn engine_stop_unblocks_stalled_http_chunk_under_200ms() {
+        use std::collections::BTreeMap;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Serve a valid 4-second WAV (~768 KiB = 6 chunks): answer chunk 0 (header)
+        // and trailing chunks (so Symphonia's WAV probe metadata scan succeeds instantly),
+        // then stall forever on chunk 1 (`bytes=131072-`) right as playback decodes into it.
+        let wav = build_test_wav_pcm16(48_000, 440.0, 4_000);
+        assert!(wav.len() > 300_000);
+        let wav_arc = Arc::new(wav);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let data_srv = Arc::clone(&wav_arc);
+
+        let _server = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let data = Arc::clone(&data_srv);
+                tokio::spawn(async move {
+                    let mut req_bytes = Vec::with_capacity(512);
+                    let mut tmp = [0u8; 512];
+                    while !req_bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => req_bytes.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&req_bytes).to_ascii_lowercase();
+                    let range_line = req
+                        .lines()
+                        .find(|l| l.starts_with("range:"))
+                        .unwrap_or("range: bytes=0-131071");
+                    let bounds = range_line.split('=').nth(1).unwrap_or("0-131071").trim();
+                    let (s_str, e_str) = bounds.split_once('-').unwrap_or(("0", "131071"));
+                    let start: usize = s_str.parse().unwrap_or(0);
+                    if start == 131_072 {
+                        // Stall chunk 1 indefinitely to simulate a dropped Wi-Fi connection.
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        drop(sock);
+                        return;
+                    }
+                    let end: usize = e_str
+                        .parse::<usize>()
+                        .unwrap_or(data.len() - 1)
+                        .min(data.len() - 1);
+                    let slice = &data[start..=end];
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        data.len(),
+                        slice.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(slice).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        let stream = ResolvedStream {
+            video_id: "stalled_track".to_owned(),
+            url: format!("http://127.0.0.1:{}/track.wav", addr.port()),
+            kbps: 1536,
+            mime_type: "audio/wav".to_owned(),
+            ext: "wav".to_owned(),
+            content_length: Some(wav_arc.len() as u64),
+            duration_ms: Some(4_000),
+            loudness_db: None,
+            is_live_hls: false,
+            client_name: "TEST".to_owned(),
+            profile_id: "test:stall".to_owned(),
+            media_headers: BTreeMap::new(),
+            range_chunk_bytes: Some(131_072),
+        };
+        let rt = Handle::current();
+        let elapsed = tokio::task::spawn_blocking(move || {
+            let mut engine = AudioEngine::with_null_sink();
+            let song = Song::new("stalled_track", "Stalled", "Artist", None);
+            engine
+                .load_stream(Client::new(), rt, stream, song, None)
+                .expect("load stalled stream");
+            // Wait briefly so the decode worker consumes chunk 0 and blocks on stalled chunk 1.
+            thread::sleep(Duration::from_millis(80));
+            let t0 = Instant::now();
+            engine.stop();
+            t0.elapsed()
+        })
+        .await
+        .expect("join blocking");
+
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "engine.stop() on stalled HTTP stream must finish <200ms, took {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn play_recovers_cleanly_from_playback_error_and_standby_helpers_work() {
+        let wav_a = build_test_wav_pcm16(48_000, 440.0, 400);
+        let wav_b = build_test_wav_pcm16(48_000, 660.0, 400);
+
+        let mut engine = AudioEngine::with_null_sink();
+        engine
+            .load_bytes(
+                wav_a,
+                Some("wav".to_owned()),
+                Song::new("a", "Track A", "Artist", None),
+                None,
+            )
+            .expect("load A");
+        engine
+            .preload_next_bytes(
+                wav_b,
+                Some("wav".to_owned()),
+                Song::new("b", "Track B", "Artist", None),
+                None,
+            )
+            .expect("preload B");
+
+        assert!(engine.has_standby_for("b"));
+        assert!(!engine.has_standby_for("c"));
+
+        // Simulate a transient decode error landing in PlaybackState::Error.
+        if let Some(ref w) = engine.deck(DeckId::A).worker {
+            *w.shared.error_msg.lock().unwrap() = Some("transient network glitch".to_owned());
+            w.shared.eof_reached.store(true, Ordering::Release);
+        }
+        engine.state = PlaybackState::Error;
+
+        // Calling play() must clear error state and resume cleanly rather than snapping back to Error.
+        engine.play();
+        assert_eq!(engine.snapshot().state, PlaybackState::Playing);
+        assert!(engine.snapshot().last_error.is_none());
+
+        // Instant manual switch to preloaded standby deck.
+        assert!(engine.activate_standby_now());
+        assert_eq!(engine.active_deck(), DeckId::B);
+        assert_eq!(
+            engine.snapshot().current_song.as_ref().map(|s| s.video_id.as_str()),
+            Some("b")
+        );
+        engine.clear_standby();
+        assert!(engine.standby_song().is_none());
     }
 }

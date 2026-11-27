@@ -452,6 +452,8 @@ fn run_alsa_loop(
     let mut i16_buf = vec![0_i16; sample_count];
     let mut s24_buf = vec![0_u8; sample_count * 3];
 
+    let mut consecutive_fatal_errors = 0u32;
+
     while !stop.load(Ordering::Acquire) {
         rt_state.render_interleaved_f32(&mut f32_buf);
 
@@ -471,15 +473,43 @@ fn run_alsa_loop(
             }
         };
 
-        if let Err(err) = write_res
-            && pcm.try_recover(err, true).is_err()
-        {
-            // Hardware unplugged or fatally stalled; avoid hot spinning.
-            thread::sleep(Duration::from_millis(20));
+        match write_res {
+            Ok(_) => {
+                consecutive_fatal_errors = 0;
+            }
+            Err(err) => {
+                let raw_errno = err.errno();
+                if is_fatal_alsa_errno(raw_errno) {
+                    rt_state.mark_fatal_output_error(format!(
+                        "ALSA device {device} disconnected (errno {raw_errno}): {err}"
+                    ));
+                    break;
+                }
+                if let Err(rec_err) = pcm.try_recover(err, true) {
+                    let rec_errno = rec_err.errno();
+                    consecutive_fatal_errors = consecutive_fatal_errors.saturating_add(1);
+                    if is_fatal_alsa_errno(rec_errno) || consecutive_fatal_errors >= 5 {
+                        rt_state.mark_fatal_output_error(format!(
+                            "ALSA device {device} failed to recover (errno {rec_errno}): {rec_err}"
+                        ));
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                } else {
+                    consecutive_fatal_errors = 0;
+                }
+            }
         }
     }
 
     let _ = pcm.drop();
+}
+
+/// Returns `true` for unrecoverable Linux ALSA hardware disconnect / fatal device errnos
+/// (`ENODEV`, `ENXIO`, `EIO`, `EBADFD`, `ESHUTDOWN`).
+pub(crate) const fn is_fatal_alsa_errno(errno: i32) -> bool {
+    let code = errno.abs();
+    matches!(code, 5 | 6 | 19 | 77 | 108)
 }
 
 /// Bit-exact `f32` (`[-1.0, 1.0]`) to signed 32-bit PCM (`S32_LE`) conversion.
@@ -600,5 +630,17 @@ mod tests {
         for (i, &expected) in samples_i24.iter().enumerate() {
             assert_eq!(out_s32[i] >> 8, expected);
         }
+    }
+
+    #[test]
+    fn recognizes_unplugged_usb_dac_fatal_errnos() {
+        // ENODEV (19), EIO (5), ESHUTDOWN (108), both positive and negative.
+        assert!(is_fatal_alsa_errno(19));
+        assert!(is_fatal_alsa_errno(-19));
+        assert!(is_fatal_alsa_errno(5));
+        assert!(is_fatal_alsa_errno(108));
+        // EPIPE (32 = xrun) and ESTRPIPE (86 = suspend) are recoverable, not fatal.
+        assert!(!is_fatal_alsa_errno(32));
+        assert!(!is_fatal_alsa_errno(86));
     }
 }

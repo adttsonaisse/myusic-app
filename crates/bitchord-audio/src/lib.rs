@@ -27,7 +27,7 @@ pub use alsa_output::{
 
 pub use chunked_source::{
     ChunkedRangeSource, DEFAULT_CHUNK_BYTES, MAX_CACHE_BYTES, MAX_EMPTY_RANGES,
-    PREFETCH_CHUNKS_AHEAD, RefusalCallback,
+    MAX_TRANSIENT_RETRIES, PREFETCH_CHUNKS_AHEAD, RefusalCallback, StreamCancelToken,
 };
 pub use crossfade::{
     BAIL_STEP_MS, CrossfadeGains, CrossfadePhase, CrossfadeState, DeckId, HANDOFF_AT,
@@ -49,7 +49,7 @@ pub use dsp::{
 };
 pub use engine::{
     AudioEngine, AudioSourceSpec, EngineError, HeadlessPlaybackReport, PlaybackSnapshot,
-    PlaybackState, open_http_decoder,
+    PlaybackState, open_http_decoder, open_http_decoder_with_cancel,
 };
 pub use mpris::{
     BitChordMprisPlayer, DESKTOP_ENTRY, IDENTITY, LoopStatus, MPRIS_BUS_SUFFIX, MprisCommand,
@@ -57,9 +57,9 @@ pub use mpris::{
     encode_mpris_track_id,
 };
 pub use output::{
-    AudioBackend, AudioOutputMode, CMD_RING_CAPACITY, NullAudioSink, OUTPUT_CHANNELS,
-    OUTPUT_SAMPLE_RATE, OutputError, PipeWireSink, RING_CAPACITY_SAMPLES, RtCommand, RtMetrics,
-    RtMixerState, SinkProducers,
+    AudioBackend, AudioOutputMode, CMD_RING_CAPACITY, DEFAULT_REBUFFER_MS, NullAudioSink,
+    OUTPUT_CHANNELS, OUTPUT_SAMPLE_RATE, OutputError, OutputStreamHealth, PipeWireSink,
+    RING_CAPACITY_SAMPLES, RtCommand, RtMetrics, RtMixerState, SinkProducers,
 };
 pub use party_sync::{LocalPlaybackView, PartySyncCoordinator, ReconcileAction};
 pub use resampler::{AudioResampler, ResamplerError};

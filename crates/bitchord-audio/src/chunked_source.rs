@@ -20,27 +20,102 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 
 use bitchord_innertube::{PlayerClient, ResolvedStream};
 use reqwest::Client;
 use symphonia::core::io::MediaSource;
 use tokio::runtime::Handle;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 /// Default bounded range request size (128 KiB — fast TTFB + small EOF cue seeks).
 pub const DEFAULT_CHUNK_BYTES: u64 = 131_072;
 /// Number of upcoming sequential chunks prefetched asynchronously ahead of read cursor.
-pub const PREFETCH_CHUNKS_AHEAD: u64 = 2;
+pub const PREFETCH_CHUNKS_AHEAD: u64 = 4;
 /// Maximum consecutive empty/truncated range attempts before signaling EOF.
 pub const MAX_EMPTY_RANGES: usize = 3;
+/// Maximum transient HTTP/network retries per chunk before propagating error.
+pub const MAX_TRANSIENT_RETRIES: usize = 3;
 /// Maximum in-memory cached chunk bytes per active stream (32 MiB).
 pub const MAX_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const RETRY_BASE_BACKOFF_MS: u64 = 150;
 
 /// Refusal callback invoked when an HTTP range fetch receives 403/404/410.
 pub type RefusalCallback = Arc<dyn Fn(&str, u16) + Send + Sync>;
+
+/// Shared cancellation token that immediately aborts in-flight HTTP range
+/// requests and wakes any blocked [`ChunkedRangeSource::read`] caller so
+/// track switches/stops never hang waiting on a stalled socket.
+#[derive(Clone, Default)]
+pub struct StreamCancelToken {
+    cancelled: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+    slots: Arc<Mutex<Vec<Weak<ChunkSlot>>>>,
+}
+
+impl std::fmt::Debug for StreamCancelToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamCancelToken")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+impl StreamCancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Cancels all active HTTP range fetches and immediately wakes any thread
+    /// blocked inside `ChunkedRangeSource::read()` or initialization.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+        let live_slots: Vec<Arc<ChunkSlot>> = {
+            let mut guard = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+            let mut live = Vec::with_capacity(guard.len());
+            guard.retain(|weak| {
+                if let Some(arc) = weak.upgrade() {
+                    live.push(arc);
+                    true
+                } else {
+                    false
+                }
+            });
+            live
+        };
+        for slot in live_slots {
+            slot.finish_cancelled();
+        }
+    }
+
+    fn register_slot(&self, slot: &Arc<ChunkSlot>) {
+        let mut guard = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        guard.retain(|w| w.strong_count() > 0);
+        guard.push(Arc::downgrade(slot));
+        if self.is_cancelled() {
+            slot.finish_cancelled();
+        }
+    }
+
+    async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let notified = self.notify.notified();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+}
 
 struct ChunkBuffer {
     bytes: Vec<u8>,
@@ -74,6 +149,19 @@ impl ChunkSlot {
         guard.error = Some((kind, msg));
         guard.header_ready = true;
         guard.done = true;
+        self.ready.notify_all();
+    }
+
+    fn finish_cancelled(&self) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !guard.done {
+            guard.error = Some((
+                io::ErrorKind::ConnectionAborted,
+                "HTTP range stream cancelled".to_owned(),
+            ));
+            guard.header_ready = true;
+            guard.done = true;
+        }
         self.ready.notify_all();
     }
 
@@ -116,7 +204,7 @@ pub struct ChunkedRangeSource {
     chunks: BTreeMap<u64, ActiveChunk>,
     cache_order: VecDeque<u64>,
     on_refused: Option<RefusalCallback>,
-    cancel: Arc<AtomicBool>,
+    cancel: StreamCancelToken,
 }
 
 impl ChunkedRangeSource {
@@ -126,6 +214,17 @@ impl ChunkedRangeSource {
         rt: Handle,
         stream: &ResolvedStream,
         on_refused: Option<RefusalCallback>,
+    ) -> Result<Self, io::Error> {
+        Self::from_resolved_with_cancel(http, rt, stream, on_refused, StreamCancelToken::new())
+    }
+
+    /// Builds a `ChunkedRangeSource` with a caller-owned [`StreamCancelToken`].
+    pub fn from_resolved_with_cancel(
+        http: Client,
+        rt: Handle,
+        stream: &ResolvedStream,
+        on_refused: Option<RefusalCallback>,
+        cancel: StreamCancelToken,
     ) -> Result<Self, io::Error> {
         let headers: Vec<(String, String)> = stream
             .media_headers
@@ -141,7 +240,7 @@ impl ChunkedRangeSource {
             .unwrap_or(DEFAULT_CHUNK_BYTES);
         let chunk_bytes = DEFAULT_CHUNK_BYTES.min(client_cap).max(65_536);
 
-        Self::new(
+        Self::new_with_cancel(
             http,
             rt,
             stream.url.clone(),
@@ -149,6 +248,7 @@ impl ChunkedRangeSource {
             total_len,
             chunk_bytes,
             on_refused,
+            cancel,
         )
     }
 
@@ -164,6 +264,30 @@ impl ChunkedRangeSource {
         chunk_bytes: u64,
         on_refused: Option<RefusalCallback>,
     ) -> Result<Self, io::Error> {
+        Self::new_with_cancel(
+            http,
+            rt,
+            url,
+            headers,
+            total_len,
+            chunk_bytes,
+            on_refused,
+            StreamCancelToken::new(),
+        )
+    }
+
+    /// Creates a `ChunkedRangeSource` attached to an external [`StreamCancelToken`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_cancel(
+        http: Client,
+        rt: Handle,
+        url: String,
+        headers: Vec<(String, String)>,
+        total_len: Option<u64>,
+        chunk_bytes: u64,
+        on_refused: Option<RefusalCallback>,
+        cancel: StreamCancelToken,
+    ) -> Result<Self, io::Error> {
         let chunk_bytes = chunk_bytes.max(4_096);
         let mut src = Self {
             http,
@@ -176,7 +300,7 @@ impl ChunkedRangeSource {
             chunks: BTreeMap::new(),
             cache_order: VecDeque::new(),
             on_refused,
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel,
         };
 
         if src.total_len.is_none() {
@@ -184,8 +308,14 @@ impl ChunkedRangeSource {
             // to learn total_len from Content-Range / Content-Length.
             if let Some(slot) = src.ensure_chunk_started(0) {
                 let mut guard = slot.state.lock().unwrap_or_else(|e| e.into_inner());
-                while !guard.header_ready && !guard.done {
+                while !guard.header_ready && !guard.done && !src.cancel.is_cancelled() {
                     guard = slot.ready.wait(guard).unwrap_or_else(|e| e.into_inner());
+                }
+                if src.cancel.is_cancelled() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "HTTP range stream cancelled",
+                    ));
                 }
                 if let Some((kind, ref msg)) = guard.error {
                     return Err(io::Error::new(kind, msg.clone()));
@@ -193,8 +323,14 @@ impl ChunkedRangeSource {
                 if let Some(discovered) = guard.discovered_total {
                     src.total_len = Some(discovered);
                 } else {
-                    while !guard.done {
+                    while !guard.done && !src.cancel.is_cancelled() {
                         guard = slot.ready.wait(guard).unwrap_or_else(|e| e.into_inner());
+                    }
+                    if src.cancel.is_cancelled() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "HTTP range stream cancelled",
+                        ));
                     }
                     if let Some((kind, ref msg)) = guard.error {
                         return Err(io::Error::new(kind, msg.clone()));
@@ -204,6 +340,11 @@ impl ChunkedRangeSource {
             }
         }
         Ok(src)
+    }
+
+    /// Returns a cloneable [`StreamCancelToken`] bound to this HTTP range source.
+    pub fn cancel_token(&self) -> StreamCancelToken {
+        self.cancel.clone()
     }
 
     fn ensure_chunk_started(&mut self, chunk_idx: u64) -> Option<Arc<ChunkSlot>> {
@@ -218,12 +359,13 @@ impl ChunkedRangeSource {
         };
 
         let slot = Arc::new(ChunkSlot::new(max_len as usize));
+        self.cancel.register_slot(&slot);
         let slot_task = Arc::clone(&slot);
         let http = self.http.clone();
         let url = self.url.clone();
         let headers = Arc::clone(&self.headers);
         let on_refused = self.on_refused.clone();
-        let cancel = Arc::clone(&self.cancel);
+        let cancel = self.cancel.clone();
         let known_total = self.total_len;
 
         let task = self.rt.spawn(async move {
@@ -315,10 +457,18 @@ impl ChunkedRangeSource {
 
 impl Drop for ChunkedRangeSource {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Release);
+        self.cancel.cancel();
         for chunk in self.chunks.values() {
             chunk.task.abort();
         }
+    }
+}
+
+async fn sleep_or_cancel(delay: Duration, cancel: &StreamCancelToken) -> bool {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => true,
+        () = tokio::time::sleep(delay) => cancel.is_cancelled(),
     }
 }
 
@@ -331,14 +481,15 @@ async fn fetch_chunk_streaming(
     max_len: u64,
     mut known_total: Option<u64>,
     on_refused: Option<RefusalCallback>,
-    cancel: Arc<AtomicBool>,
+    cancel: StreamCancelToken,
     slot: Arc<ChunkSlot>,
 ) {
     let mut cursor = start;
     let mut remaining = max_len;
     let mut empty_attempts = 0usize;
+    let mut transient_retries = 0usize;
 
-    while remaining > 0 && !cancel.load(Ordering::Acquire) {
+    while remaining > 0 && !cancel.is_cancelled() {
         let end_inclusive = cursor.saturating_add(remaining.saturating_sub(1));
         let range_header = format!("bytes={cursor}-{end_inclusive}");
 
@@ -350,9 +501,33 @@ async fn fetch_chunk_streaming(
             req = req.header(k.as_str(), v.as_str());
         }
 
-        let mut resp = match req.send().await {
+        let send_outcome = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                slot.finish_cancelled();
+                return;
+            }
+            res = req.send() => res,
+        };
+
+        let mut resp = match send_outcome {
             Ok(r) => r,
             Err(e) => {
+                if cancel.is_cancelled() {
+                    slot.finish_cancelled();
+                    return;
+                }
+                if transient_retries < MAX_TRANSIENT_RETRIES {
+                    transient_retries += 1;
+                    let backoff = Duration::from_millis(
+                        RETRY_BASE_BACKOFF_MS.saturating_mul(1u64 << (transient_retries - 1)),
+                    );
+                    if sleep_or_cancel(backoff, &cancel).await {
+                        slot.finish_cancelled();
+                        return;
+                    }
+                    continue;
+                }
                 slot.finish_with_error(io::ErrorKind::Other, format!("HTTP range error: {e}"));
                 return;
             }
@@ -379,6 +554,19 @@ async fn fetch_chunk_streaming(
                 "server answered 200 OK instead of 206 Partial Content for ranged seek".to_owned(),
             );
             return;
+        }
+        if (status == 429 || (500..=599).contains(&status))
+            && transient_retries < MAX_TRANSIENT_RETRIES
+        {
+            transient_retries += 1;
+            let backoff = Duration::from_millis(
+                RETRY_BASE_BACKOFF_MS.saturating_mul(1u64 << (transient_retries - 1)),
+            );
+            if sleep_or_cancel(backoff, &cancel).await {
+                slot.finish_cancelled();
+                return;
+            }
+            continue;
         }
         if status != 206 && status != 200 {
             slot.finish_with_error(
@@ -414,12 +602,21 @@ async fn fetch_chunk_streaming(
         }
 
         let mut got_this_req = 0u64;
+        let mut body_retry = false;
         loop {
-            if cancel.load(Ordering::Acquire) {
-                slot.finish_ok();
+            if cancel.is_cancelled() {
+                slot.finish_cancelled();
                 return;
             }
-            match resp.chunk().await {
+            let next_piece = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    slot.finish_cancelled();
+                    return;
+                }
+                chunk = resp.chunk() => chunk,
+            };
+            match next_piece {
                 Ok(Some(piece)) => {
                     if piece.is_empty() {
                         continue;
@@ -439,6 +636,22 @@ async fn fetch_chunk_streaming(
                 }
                 Ok(None) => break,
                 Err(e) => {
+                    if cancel.is_cancelled() {
+                        slot.finish_cancelled();
+                        return;
+                    }
+                    if transient_retries < MAX_TRANSIENT_RETRIES {
+                        transient_retries += 1;
+                        let backoff = Duration::from_millis(
+                            RETRY_BASE_BACKOFF_MS.saturating_mul(1u64 << (transient_retries - 1)),
+                        );
+                        if sleep_or_cancel(backoff, &cancel).await {
+                            slot.finish_cancelled();
+                            return;
+                        }
+                        body_retry = true;
+                        break;
+                    }
                     slot.finish_with_error(
                         io::ErrorKind::Other,
                         format!("HTTP range body error: {e}"),
@@ -446,6 +659,10 @@ async fn fetch_chunk_streaming(
                     return;
                 }
             }
+        }
+
+        if body_retry {
+            continue;
         }
 
         if got_this_req == 0 {
@@ -456,6 +673,7 @@ async fn fetch_chunk_streaming(
             continue;
         }
         empty_attempts = 0;
+        transient_retries = 0;
 
         if let Some(total) = known_total
             && cursor >= total
@@ -464,13 +682,23 @@ async fn fetch_chunk_streaming(
         }
     }
 
-    slot.finish_ok();
+    if cancel.is_cancelled() {
+        slot.finish_cancelled();
+    } else {
+        slot.finish_ok();
+    }
 }
 
 impl Read for ChunkedRangeSource {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
+        }
+        if self.cancel.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "HTTP range stream cancelled",
+            ));
         }
         if let Some(total) = self.total_len
             && self.pos >= total
@@ -489,6 +717,12 @@ impl Read for ChunkedRangeSource {
 
         let mut guard = slot.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
+            if self.cancel.is_cancelled() {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "HTTP range stream cancelled",
+                ));
+            }
             if self.total_len.is_none()
                 && let Some(tot) = guard.discovered_total
             {
@@ -729,6 +963,127 @@ mod tests {
             "expected progressive first read before 250ms stall, took {:?}",
             elapsed_first_read
         );
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn cancel_unblocks_stalled_http_chunk_under_200ms() {
+        // Server accepts TCP connection and never responds (simulating dead Wi-Fi / stall).
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let _server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+
+        let cancel = StreamCancelToken::new();
+        let cancel_trigger = cancel.clone();
+        let handle = Handle::current();
+        let url = format!("http://127.0.0.1:{}/stalled.bin", addr.port());
+
+        let reader_task = tokio::task::spawn_blocking(move || {
+            let mut src = ChunkedRangeSource::new_with_cancel(
+                Client::new(),
+                handle,
+                url,
+                Vec::new(),
+                Some(16_384),
+                4_096,
+                None,
+                cancel,
+            )
+            .expect("create stalled source");
+            let mut buf = [0u8; 64];
+            src.read(&mut buf)
+        });
+
+        // Give the reader a moment to block waiting on the stalled server, then cancel.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let t0 = Instant::now();
+        cancel_trigger.cancel();
+        let res = reader_task.await.expect("join reader");
+        let elapsed = t0.elapsed();
+
+        assert!(res.is_err(), "cancelled stalled read must return error");
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "cancelled read must return in <200ms, took {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn retries_transient_503_and_truncated_body_resuming_from_cursor() {
+        let payload: Vec<u8> = (0..4_096usize).map(|i| (i % 199) as u8).collect();
+        let payload_arc = Arc::new(payload.clone());
+        let attempt = Arc::new(AtomicUsize::new(0));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let att_srv = Arc::clone(&attempt);
+        let data_srv = Arc::clone(&payload_arc);
+
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let n_try = att_srv.fetch_add(1, Ordering::SeqCst);
+                let data = Arc::clone(&data_srv);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    if n_try == 0 {
+                        // First attempt: transient 503.
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                    } else if n_try == 1 {
+                        // Second attempt: send half the chunk and drop connection mid-body.
+                        let head = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4095/4096\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n";
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        let _ = sock.write_all(&data[..1_024]).await;
+                    } else {
+                        // Third attempt: resume from byte 1024 to end!
+                        let slice = &data[1_024..];
+                        let head = format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 1024-4095/4096\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            slice.len()
+                        );
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        let _ = sock.write_all(slice).await;
+                    }
+                });
+            }
+        });
+
+        let handle = Handle::current();
+        let url = format!("http://127.0.0.1:{}/flaky.bin", addr.port());
+        let got = tokio::task::spawn_blocking(move || {
+            let mut src = ChunkedRangeSource::new(
+                Client::new(),
+                handle,
+                url,
+                Vec::new(),
+                Some(4_096),
+                4_096,
+                None,
+            )
+            .expect("create flaky");
+            let mut all = Vec::new();
+            src.read_to_end(&mut all).expect("read after retries");
+            all
+        })
+        .await
+        .expect("join");
+
+        assert_eq!(got, payload);
+        assert_eq!(attempt.load(Ordering::SeqCst), 3);
         let _ = server.await;
     }
 }
