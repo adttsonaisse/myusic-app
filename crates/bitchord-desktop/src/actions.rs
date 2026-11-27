@@ -21,6 +21,8 @@ actions!(
         ToggleLyrics,
         ToggleTheme,
         FocusSearch,
+        NavigateBack,
+        NavigateForward,
         CloseWindowAction,
         ShowWindow,
         QuitApp,
@@ -62,6 +64,72 @@ impl Route {
     }
 }
 
+/// Bounded browser-style Back/Forward navigation history stack for top-level [`Route`]s.
+#[derive(Debug, Clone, Default)]
+pub struct NavigationHistory {
+    back_stack: Vec<Route>,
+    forward_stack: Vec<Route>,
+}
+
+impl NavigationHistory {
+    pub const MAX_ENTRIES: usize = 64;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records navigating from `current` to `next`.
+    /// Returns `false` (no-op) if `current == *next`.
+    pub fn push(&mut self, current: Route, next: &Route) -> bool {
+        if &current == next {
+            return false;
+        }
+        self.back_stack.push(current);
+        if self.back_stack.len() > Self::MAX_ENTRIES {
+            let excess = self.back_stack.len() - Self::MAX_ENTRIES;
+            self.back_stack.drain(0..excess);
+        }
+        self.forward_stack.clear();
+        true
+    }
+
+    pub fn can_go_back(&self) -> bool {
+        !self.back_stack.is_empty()
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        !self.forward_stack.is_empty()
+    }
+
+    /// Pops the previous route and pushes `current` onto the forward stack.
+    pub fn go_back(&mut self, current: Route) -> Option<Route> {
+        let prev = self.back_stack.pop()?;
+        self.forward_stack.push(current);
+        if self.forward_stack.len() > Self::MAX_ENTRIES {
+            let excess = self.forward_stack.len() - Self::MAX_ENTRIES;
+            self.forward_stack.drain(0..excess);
+        }
+        Some(prev)
+    }
+
+    /// Pops the next forward route and pushes `current` onto the back stack.
+    pub fn go_forward(&mut self, current: Route) -> Option<Route> {
+        let next = self.forward_stack.pop()?;
+        self.back_stack.push(current);
+        if self.back_stack.len() > Self::MAX_ENTRIES {
+            let excess = self.back_stack.len() - Self::MAX_ENTRIES;
+            self.back_stack.drain(0..excess);
+        }
+        Some(next)
+    }
+
+    #[allow(dead_code)]
+    pub fn clear(&mut self) {
+        self.back_stack.clear();
+        self.forward_stack.clear();
+    }
+}
+
 /// Linux-native keyboard bindings scoped so typing inside `TextInput` is never hijacked.
 pub fn default_keybindings() -> Vec<KeyBinding> {
     vec![
@@ -75,6 +143,8 @@ pub fn default_keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-left", SeekBack, Some("Player")),
         KeyBinding::new("ctrl-up", VolumeUp, Some("Player")),
         KeyBinding::new("ctrl-down", VolumeDown, Some("Player")),
+        KeyBinding::new("alt-left", NavigateBack, None),
+        KeyBinding::new("alt-right", NavigateForward, None),
         KeyBinding::new("ctrl-f", FocusSearch, None),
         KeyBinding::new("ctrl-t", ToggleTheme, None),
         KeyBinding::new("escape", CloseWindowAction, Some("Player")),
@@ -115,4 +185,64 @@ pub fn build_tray_icon() -> gpui_tray::Result<Icon> {
     }
 
     Icon::from_rgba(rgba, SIZE, SIZE).build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn navigation_history_tracks_back_forward_clears_forward_on_branch_and_caps_size() {
+        let mut hist = NavigationHistory::new();
+        assert!(!hist.can_go_back());
+        assert!(!hist.can_go_forward());
+
+        // Same-route push is a no-op.
+        assert!(!hist.push(Route::Home, &Route::Home));
+        assert!(!hist.can_go_back());
+
+        // Home -> Search -> Library -> Detail
+        let detail = Route::Detail {
+            browse_id: "MPREb_123".to_owned(),
+            title: "OutRun".to_owned(),
+            subtitle: "Album".to_owned(),
+            kind: BrowseType::Album,
+        };
+        assert!(hist.push(Route::Home, &Route::Search));
+        assert!(hist.push(Route::Search, &Route::Library));
+        assert!(hist.push(Route::Library, &detail));
+        assert!(hist.can_go_back());
+        assert!(!hist.can_go_forward());
+
+        // Go back twice: Detail -> Library -> Search
+        assert_eq!(hist.go_back(detail.clone()), Some(Route::Library));
+        assert!(hist.can_go_forward());
+        assert_eq!(hist.go_back(Route::Library), Some(Route::Search));
+
+        // Go forward once: Search -> Library
+        assert_eq!(hist.go_forward(Route::Search), Some(Route::Library));
+
+        // Navigating to a new destination clears the forward stack.
+        assert!(hist.push(Route::Library, &Route::Settings));
+        assert!(!hist.can_go_forward());
+        assert_eq!(hist.go_back(Route::Settings), Some(Route::Library));
+
+        // Verify bounded capacity.
+        for i in 0..(NavigationHistory::MAX_ENTRIES + 20) {
+            let next = Route::Detail {
+                browse_id: format!("id_{i}"),
+                title: format!("Item {i}"),
+                subtitle: String::new(),
+                kind: BrowseType::Playlist,
+            };
+            hist.push(Route::Home, &next);
+        }
+        let mut count = 0;
+        let mut cur = Route::Settings;
+        while let Some(prev) = hist.go_back(cur) {
+            cur = prev;
+            count += 1;
+        }
+        assert_eq!(count, NavigationHistory::MAX_ENTRIES);
+    }
 }

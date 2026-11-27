@@ -25,16 +25,17 @@ use gpui::{
 };
 
 use crate::actions::{
-    CloseWindowAction, FocusSearch, NextTrack, PlayPause, PrevTrack, QuitApp, Route, SeekBack,
-    SeekForward, ToggleLyrics, ToggleMute, ToggleNowPlaying, ToggleQueue, ToggleTheme, VolumeDown,
-    VolumeUp,
+    CloseWindowAction, FocusSearch, NavigateBack, NavigateForward, NavigationHistory, NextTrack,
+    PlayPause, PrevTrack, QuitApp, Route, SeekBack, SeekForward, ToggleLyrics, ToggleMute,
+    ToggleNowPlaying, ToggleQueue, ToggleTheme, VolumeDown, VolumeUp,
 };
 use crate::artwork::{
     ArtworkCache, ArtworkTier, fetch_and_decode_artwork_with_tier, song_thumbnail_url,
 };
 use crate::backend::{
-    AppBackend, BackendCommand, BackendEvent, DetailPayload, LibrarySnapshot, LyricsSyncState,
-    QueueViewSnapshot, SearchSuggestionsPayload, StreamBackendChoice,
+    AppBackend, BackendCommand, BackendEvent, DetailPayload, DownloadProgress, DownloadStatus,
+    LibrarySnapshot, LyricsSyncState, QueueViewSnapshot, SearchSuggestionsPayload,
+    StreamBackendChoice, eq_bands_from_settings,
 };
 use crate::branding;
 use crate::icons;
@@ -104,7 +105,9 @@ pub struct BitChordApp {
     pub theme_mode: ThemeMode,
     pub route: Route,
     pub previous_route: Route,
+    pub nav_history: NavigationHistory,
     pub sidebar_collapsed: bool,
+    pub autoplay_enabled: bool,
     pub queue_open: bool,
     pub nerd_stats_open: bool,
     pub close_to_tray: bool,
@@ -138,6 +141,11 @@ pub struct BitChordApp {
     pub library: LibrarySnapshot,
     pub liked_video_ids: HashSet<String>,
     pub library_source_filter: LibrarySourceFilter,
+    pub library_search_query: String,
+    pub library_search_results: Option<Vec<Song>>,
+    pub selected_playlist_id: Option<String>,
+    pub selected_playlist_songs: LoadState<Vec<Song>>,
+    pub active_downloads: HashMap<String, DownloadProgress>,
     pub party: ListenTogetherState,
     pub party_probe_status: Option<String>,
 
@@ -365,6 +373,10 @@ impl BitChordApp {
             _ => ThemeMode::Dark,
         };
 
+        let initial_eq_bands =
+            eq_bands_from_settings(&backend.initial_settings.eq_band_gains_db);
+        let initial_eq_preset = EqualizerPreset::matching(&initial_eq_bands);
+
         let playback = PlaybackSnapshot {
             state: PlaybackState::Stopped,
             current_song: None,
@@ -372,10 +384,10 @@ impl BitChordApp {
             duration_ms: 0,
             volume: backend.initial_settings.volume,
             muted: backend.initial_settings.muted,
-            speed: 1.0,
-            skip_silence: false,
-            spatial_audio: false,
-            eq_enabled: false,
+            speed: backend.initial_settings.playback_speed.clamp(0.5, 2.0),
+            skip_silence: backend.initial_settings.skip_silence,
+            spatial_audio: backend.initial_settings.spatial_audio,
+            eq_enabled: backend.initial_settings.eq_enabled,
             crossfade_seconds: backend.initial_settings.crossfade_seconds,
             crossfade_phase: bitchord_audio::CrossfadePhase::Idle,
             active_deck: bitchord_audio::DeckId::A,
@@ -407,7 +419,9 @@ impl BitChordApp {
             theme_mode: initial_theme,
             route: Route::Home,
             previous_route: Route::Home,
-            sidebar_collapsed: false,
+            nav_history: NavigationHistory::new(),
+            sidebar_collapsed: backend.initial_settings.sidebar_collapsed,
+            autoplay_enabled: backend.initial_settings.autoplay_enabled,
             queue_open: false,
             nerd_stats_open: false,
             close_to_tray: true,
@@ -435,11 +449,16 @@ impl BitChordApp {
             library: LibrarySnapshot::default(),
             liked_video_ids: HashSet::new(),
             library_source_filter: LibrarySourceFilter::All,
+            library_search_query: String::new(),
+            library_search_results: None,
+            selected_playlist_id: None,
+            selected_playlist_songs: LoadState::Idle,
+            active_downloads: HashMap::new(),
             party: ListenTogetherState::default(),
             party_probe_status: None,
-            eq_enabled: false,
-            eq_preset: EqualizerPreset::Flat,
-            eq_bands_db: [0.0; EqLayout::MANUAL_COUNT],
+            eq_enabled: backend.initial_settings.eq_enabled,
+            eq_preset: initial_eq_preset,
+            eq_bands_db: initial_eq_bands,
             stream_backend: StreamBackendChoice::Auto,
             audio_output_pref: backend.initial_settings.audio_output_mode,
             selected_alsa_device: if backend.initial_settings.alsa_exclusive_device.is_empty() {
@@ -544,11 +563,329 @@ impl BitChordApp {
     }
 
     pub fn navigate(&mut self, next: Route, cx: &mut Context<Self>) {
+        if self.route == next {
+            return;
+        }
+        let prev = self.route.clone();
+        if prev != Route::NowPlaying {
+            self.previous_route = prev.clone();
+        }
+        self.nav_history.push(prev, &next);
+        self.route = next;
+        cx.notify();
+    }
+
+    #[allow(dead_code)]
+    pub fn can_go_back(&self) -> bool {
+        self.nav_history.can_go_back()
+    }
+
+    #[allow(dead_code)]
+    pub fn can_go_forward(&self) -> bool {
+        self.nav_history.can_go_forward()
+    }
+
+    pub fn go_back(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(target) = self.nav_history.go_back(self.route.clone()) else {
+            return false;
+        };
+        self.apply_history_route(target, cx);
+        true
+    }
+
+    pub fn go_forward(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(target) = self.nav_history.go_forward(self.route.clone()) else {
+            return false;
+        };
+        self.apply_history_route(target, cx);
+        true
+    }
+
+    fn apply_history_route(&mut self, target: Route, cx: &mut Context<Self>) {
         if self.route != Route::NowPlaying {
             self.previous_route = self.route.clone();
         }
-        self.route = next;
+        if let Route::Detail {
+            ref browse_id,
+            ref title,
+            kind,
+            ..
+        } = target
+        {
+            let already_loaded = matches!(
+                &self.detail,
+                LoadState::Ready(p) if p.browse_id == *browse_id
+            );
+            if !already_loaded {
+                self.detail = LoadState::Loading;
+                self.send(
+                    BackendCommand::LoadDetail {
+                        browse_id: browse_id.clone(),
+                        kind,
+                        fallback_title: title.clone(),
+                    },
+                    cx,
+                );
+            }
+        }
+        self.route = target;
         cx.notify();
+    }
+
+    #[allow(dead_code)]
+    pub fn set_sidebar_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
+        if self.sidebar_collapsed == collapsed {
+            return;
+        }
+        self.sidebar_collapsed = collapsed;
+        self.send(BackendCommand::SetSidebarCollapsed(collapsed), cx);
+        cx.notify();
+    }
+
+    #[allow(dead_code)]
+    pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.set_sidebar_collapsed(!self.sidebar_collapsed, cx);
+    }
+
+    #[allow(dead_code)]
+    pub fn reorder_queue(&mut self, from_idx: usize, to_idx: usize, cx: &mut Context<Self>) {
+        if from_idx == to_idx
+            || from_idx >= self.queue.items.len()
+            || to_idx >= self.queue.items.len()
+        {
+            return;
+        }
+        self.send(BackendCommand::ReorderQueue { from_idx, to_idx }, cx);
+    }
+
+    #[allow(dead_code)]
+    pub fn set_autoplay_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.autoplay_enabled == enabled {
+            return;
+        }
+        self.autoplay_enabled = enabled;
+        self.send(BackendCommand::SetAutoplayEnabled(enabled), cx);
+        cx.notify();
+    }
+
+    #[allow(dead_code)]
+    pub fn toggle_autoplay(&mut self, cx: &mut Context<Self>) {
+        self.set_autoplay_enabled(!self.autoplay_enabled, cx);
+    }
+
+    #[allow(dead_code)]
+    pub fn start_radio(&mut self, song: Song, cx: &mut Context<Self>) {
+        self.send(BackendCommand::StartRadio(Box::new(song)), cx);
+    }
+
+    #[allow(dead_code)]
+    pub fn create_playlist(
+        &mut self,
+        name: String,
+        description: String,
+        initial_songs: Vec<Song>,
+        cx: &mut Context<Self>,
+    ) {
+        self.send(
+            BackendCommand::CreatePlaylist {
+                name,
+                description,
+                initial_songs,
+            },
+            cx,
+        );
+    }
+
+    #[allow(dead_code)]
+    pub fn save_queue_as_playlist(&mut self, name: String, cx: &mut Context<Self>) {
+        self.send(BackendCommand::SaveQueueAsPlaylist { name }, cx);
+    }
+
+    #[allow(dead_code)]
+    pub fn rename_playlist(
+        &mut self,
+        playlist_id: String,
+        new_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.send(
+            BackendCommand::RenamePlaylist {
+                playlist_id,
+                new_name,
+            },
+            cx,
+        );
+    }
+
+    #[allow(dead_code)]
+    pub fn delete_playlist(&mut self, playlist_id: String, cx: &mut Context<Self>) {
+        if self.selected_playlist_id.as_deref() == Some(playlist_id.as_str()) {
+            self.selected_playlist_id = None;
+            self.selected_playlist_songs = LoadState::Idle;
+        }
+        self.send(BackendCommand::DeletePlaylist { playlist_id }, cx);
+        cx.notify();
+    }
+
+    #[allow(dead_code)]
+    pub fn add_song_to_playlist(
+        &mut self,
+        playlist_id: String,
+        song: Song,
+        cx: &mut Context<Self>,
+    ) {
+        self.send(
+            BackendCommand::AddSongToPlaylist {
+                playlist_id,
+                song: Box::new(song),
+            },
+            cx,
+        );
+    }
+
+    #[allow(dead_code)]
+    pub fn remove_song_from_playlist(
+        &mut self,
+        playlist_id: String,
+        video_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.send(
+            BackendCommand::RemoveSongFromPlaylist {
+                playlist_id,
+                video_id,
+            },
+            cx,
+        );
+    }
+
+    #[allow(dead_code)]
+    pub fn reorder_playlist_track(
+        &mut self,
+        playlist_id: String,
+        from_idx: usize,
+        to_idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.send(
+            BackendCommand::ReorderPlaylistTrack {
+                playlist_id,
+                from_idx,
+                to_idx,
+            },
+            cx,
+        );
+    }
+
+    #[allow(dead_code)]
+    pub fn open_local_playlist(&mut self, playlist_id: String, cx: &mut Context<Self>) {
+        self.selected_playlist_id = Some(playlist_id.clone());
+        self.selected_playlist_songs = LoadState::Loading;
+        self.send(BackendCommand::LoadPlaylistSongs { playlist_id }, cx);
+        cx.notify();
+    }
+
+    #[allow(dead_code)]
+    pub fn close_local_playlist(&mut self, cx: &mut Context<Self>) {
+        self.selected_playlist_id = None;
+        self.selected_playlist_songs = LoadState::Idle;
+        cx.notify();
+    }
+
+    #[allow(dead_code)]
+    pub fn is_song_downloaded(&self, video_id: &str) -> bool {
+        self.library
+            .downloads
+            .iter()
+            .any(|d| d.video_id == video_id)
+    }
+
+    #[allow(dead_code)]
+    pub fn download_progress(&self, video_id: &str) -> Option<&DownloadProgress> {
+        self.active_downloads.get(video_id)
+    }
+
+    #[allow(dead_code)]
+    pub fn download_song(&mut self, song: Song, cx: &mut Context<Self>) {
+        self.send(BackendCommand::DownloadSong(Box::new(song)), cx);
+    }
+
+    #[allow(dead_code)]
+    pub fn cancel_download(&mut self, video_id: String, cx: &mut Context<Self>) {
+        self.send(BackendCommand::CancelDownload(video_id), cx);
+    }
+
+    #[allow(dead_code)]
+    pub fn delete_download(&mut self, video_id: String, cx: &mut Context<Self>) {
+        self.send(BackendCommand::DeleteDownload(video_id), cx);
+    }
+
+    #[allow(dead_code)]
+    pub fn refresh_home(&mut self, cx: &mut Context<Self>) {
+        self.send(BackendCommand::RefreshHome, cx);
+    }
+
+    #[allow(dead_code)]
+    pub fn refresh_current_detail(&mut self, cx: &mut Context<Self>) {
+        if let Route::Detail {
+            ref browse_id,
+            ref title,
+            kind,
+            ..
+        } = self.route
+        {
+            self.detail = LoadState::Loading;
+            self.send(
+                BackendCommand::RefreshDetail {
+                    browse_id: browse_id.clone(),
+                    kind,
+                    fallback_title: title.clone(),
+                },
+                cx,
+            );
+            cx.notify();
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn search_library(&mut self, query: String, cx: &mut Context<Self>) {
+        let trimmed = query.trim().to_owned();
+        self.library_search_query = trimmed.clone();
+        if trimmed.is_empty() {
+            self.library_search_results = None;
+            cx.notify();
+            return;
+        }
+        self.send(
+            BackendCommand::SearchLibrary {
+                query: trimmed,
+                limit: 200,
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
+    #[allow(dead_code)]
+    pub fn clear_library_search(&mut self, cx: &mut Context<Self>) {
+        self.library_search_query.clear();
+        self.library_search_results = None;
+        cx.notify();
+    }
+
+    /// Returns the active list of Library tracks applying both the FTS5 instant search
+    /// results (when a query is active) and the selected [`LibrarySourceFilter`].
+    #[allow(dead_code)]
+    pub fn visible_library_songs(&self) -> Vec<Song> {
+        let source = self
+            .library_search_results
+            .as_deref()
+            .unwrap_or(&self.library.songs);
+        source
+            .iter()
+            .filter(|s| self.library_source_filter.matches(s))
+            .cloned()
+            .collect()
     }
 
     pub fn open_detail(
@@ -915,6 +1252,13 @@ impl BitChordApp {
                 self.automix_mode = full.automix_mode;
                 self.automix_phrase_bars = full.automix_phrase_bars;
                 self.discord_rpc_enabled = full.discord_rpc_enabled;
+                self.sidebar_collapsed = full.sidebar_collapsed;
+                self.autoplay_enabled = full.autoplay_enabled;
+                self.active_downloads = full
+                    .active_downloads
+                    .into_iter()
+                    .map(|p| (p.video_id.clone(), p))
+                    .collect();
                 self.sync_lyrics_clock(cx);
 
                 if let Some(ref hero_url) = current_art_url {
@@ -1113,6 +1457,32 @@ impl BitChordApp {
                     self.ensure_artwork_loaded(&u, cx);
                 }
             }
+            BackendEvent::LibrarySearchResults { query, songs } => {
+                if self.library_search_query == query {
+                    let urls: Vec<String> = songs
+                        .iter()
+                        .take(18)
+                        .filter_map(song_thumbnail_url)
+                        .collect();
+                    self.library_search_results = Some(songs);
+                    for u in urls {
+                        self.ensure_artwork_loaded(&u, cx);
+                    }
+                }
+            }
+            BackendEvent::PlaylistSongsLoaded { playlist_id, songs } => {
+                if self.selected_playlist_id.as_deref() == Some(playlist_id.as_str()) {
+                    let urls: Vec<String> = songs
+                        .iter()
+                        .take(18)
+                        .filter_map(song_thumbnail_url)
+                        .collect();
+                    self.selected_playlist_songs = LoadState::Ready(songs);
+                    for u in urls {
+                        self.ensure_artwork_loaded(&u, cx);
+                    }
+                }
+            }
             BackendEvent::SearchHistoryUpdated(history) => {
                 let urls: Vec<String> = history
                     .iter()
@@ -1127,6 +1497,31 @@ impl BitChordApp {
             BackendEvent::LikedSongsUpdated(liked_ids) => {
                 self.liked_video_ids = liked_ids.clone();
                 self.library.liked_video_ids = liked_ids;
+            }
+            BackendEvent::LikedSongsListUpdated(liked_songs) => {
+                let urls: Vec<String> = liked_songs
+                    .iter()
+                    .take(18)
+                    .filter_map(song_thumbnail_url)
+                    .collect();
+                self.library.liked_songs = liked_songs;
+                for u in urls {
+                    self.ensure_artwork_loaded(&u, cx);
+                }
+            }
+            BackendEvent::AutoplayUpdated(enabled) => {
+                self.autoplay_enabled = enabled;
+            }
+            BackendEvent::DownloadProgressUpdated(progress) => {
+                if progress.status == DownloadStatus::Completed {
+                    self.active_downloads.remove(&progress.video_id);
+                } else {
+                    self.active_downloads
+                        .insert(progress.video_id.clone(), progress);
+                }
+            }
+            BackendEvent::DownloadRemoved(video_id) => {
+                self.active_downloads.remove(&video_id);
             }
             BackendEvent::LibraryTrackRecorded { song, stats } => {
                 let art_url = song_thumbnail_url(&song);
@@ -1322,6 +1717,19 @@ impl BitChordApp {
         handle.focus(window, cx);
     }
 
+    fn on_navigate_back(&mut self, _: &NavigateBack, _w: &mut Window, cx: &mut Context<Self>) {
+        self.go_back(cx);
+    }
+
+    fn on_navigate_forward(
+        &mut self,
+        _: &NavigateForward,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.go_forward(cx);
+    }
+
     fn on_escape_close(&mut self, _: &CloseWindowAction, _w: &mut Window, cx: &mut Context<Self>) {
         if self.search_suggestions_open {
             self.search_suggestions_open = false;
@@ -1391,6 +1799,8 @@ impl Render for BitChordApp {
             .on_action(cx.listener(Self::on_toggle_lyrics))
             .on_action(cx.listener(Self::on_toggle_theme))
             .on_action(cx.listener(Self::on_focus_search))
+            .on_action(cx.listener(Self::on_navigate_back))
+            .on_action(cx.listener(Self::on_navigate_forward))
             .on_action(cx.listener(Self::on_escape_close))
             .on_action(cx.listener(Self::on_quit))
             .size_full()

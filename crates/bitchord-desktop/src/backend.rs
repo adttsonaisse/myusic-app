@@ -6,7 +6,8 @@
 //! Lives in GPUI's `App` global state so closing the window to the system tray
 //! keeps playback, gapless preload, Listen Together, scrobbling, and MPRIS2 alive.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -50,13 +51,16 @@ use bitchord_netstorage::{
 };
 use bitchord_queue::QueueSource;
 use bitchord_storage::{
-    AppPaths, AppSettingsData, AudioOutputPreference, CachedStream, DEFAULT_LYRICS_CACHE_TTL_MS,
-    DEFAULT_LYRICS_NOT_FOUND_TTL_MS, DEFAULT_STREAM_CACHE_TTL_MS, DbStats, KeyringSecretStore,
-    LocalPlaylist, SavedSongMetadata, SearchHistoryRecord, SecretKey, SecretStore, SettingsStore,
-    SmbSettings, WebDavSettings, format_duration_ms, read_local_audio_tags,
+    AppPaths, AppSettingsData, AudioOutputPreference, CachedBrowseEntry, CachedStream,
+    DEFAULT_BROWSE_CACHE_TTL_MS, DEFAULT_LYRICS_CACHE_TTL_MS, DEFAULT_LYRICS_NOT_FOUND_TTL_MS,
+    DEFAULT_STREAM_CACHE_TTL_MS, DbStats, DownloadStore, KeyringSecretStore, LocalPlaylist, Probe,
+    SavedSongMetadata, SearchHistoryRecord, SecretKey, SecretStore, SettingsStore, SmbSettings,
+    WebDavSettings, estimated_kbps, format_duration_ms, read_local_audio_tags, sniff,
+    youtube_download_badge,
 };
 use gpui::Global;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
 use crate::artwork::{RemoteArtworkAuth, song_thumbnail_url};
@@ -93,26 +97,54 @@ pub struct QueueViewSnapshot {
     pub shuffle: bool,
     pub repeat_all: bool,
     pub repeat_one: bool,
+    #[allow(dead_code)]
+    pub autoplay_start_index: Option<usize>,
 }
 
-/// Snapshot of local library + downloads + history persisted in SQLite.
+/// Snapshot of local library + downloads + playlists + history persisted in SQLite.
 #[derive(Debug, Clone, Default)]
 pub struct LibrarySnapshot {
     pub stats: DbStats,
     pub songs: Vec<Song>,
+    pub liked_songs: Vec<Song>,
     pub downloads: Vec<SavedSongMetadata>,
     pub playlists: Vec<LocalPlaylist>,
+    #[allow(dead_code)]
+    pub playlist_summaries: Vec<(LocalPlaylist, usize)>,
     pub search_history: Vec<SearchHistoryRecord>,
     pub liked_video_ids: HashSet<String>,
 }
 
 /// Detail screen payload for an album, playlist, or artist browseId.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetailPayload {
     pub browse_id: String,
     pub header: Option<BrowseHeader>,
     pub songs: Vec<Song>,
     pub subtitle: String,
+}
+
+/// Lifecycle state of an active or recently finished offline download task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadStatus {
+    Queued,
+    Downloading,
+    Completed,
+    Failed(String),
+}
+
+/// Live progress snapshot for an offline track download managed via [`DownloadStore`].
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct DownloadProgress {
+    pub video_id: String,
+    pub title: String,
+    pub artist: String,
+    pub status: DownloadStatus,
+    pub bytes_downloaded: u64,
+    pub total_bytes: Option<u64>,
+    /// Normalized completion fraction in `0.0..=1.0`.
+    pub progress: f32,
 }
 
 /// Resolved lyrics payload for the active track.
@@ -165,6 +197,9 @@ pub struct FullStateSnapshot {
     pub automix_mode: AutomixMode,
     pub automix_phrase_bars: u32,
     pub discord_rpc_enabled: bool,
+    pub sidebar_collapsed: bool,
+    pub autoplay_enabled: bool,
+    pub active_downloads: Vec<DownloadProgress>,
 }
 
 /// Inbound command sent by GPUI views, shortcuts, or tray menu to the backend.
@@ -173,6 +208,7 @@ pub enum BackendCommand {
     /// Requests a full state sync snapshot (used on initial mount and tray reopen).
     SyncFullState,
     LoadHome,
+    RefreshHome,
     Search {
         query: String,
         filter: SearchFilter,
@@ -187,6 +223,11 @@ pub enum BackendCommand {
         kind: BrowseType,
         fallback_title: String,
     },
+    RefreshDetail {
+        browse_id: String,
+        kind: BrowseType,
+        fallback_title: String,
+    },
     PlayContext {
         songs: Vec<Song>,
         start_index: usize,
@@ -197,9 +238,16 @@ pub enum BackendCommand {
     PlayNext(Box<Song>),
     QueueJump(usize),
     QueueRemove(usize),
+    ReorderQueue {
+        from_idx: usize,
+        to_idx: usize,
+    },
     QueueClear,
     ToggleShuffle,
     CycleRepeat,
+    SetAutoplayEnabled(bool),
+    StartRadio(Box<Song>),
+    SetSidebarCollapsed(bool),
     PlayPause,
     NextTrack,
     PrevTrack,
@@ -224,6 +272,44 @@ pub enum BackendCommand {
     StartSleepAfterTrack,
     CancelSleepTimer,
     RefreshLibrary,
+    SearchLibrary {
+        query: String,
+        limit: usize,
+    },
+    CreatePlaylist {
+        name: String,
+        description: String,
+        initial_songs: Vec<Song>,
+    },
+    SaveQueueAsPlaylist {
+        name: String,
+    },
+    RenamePlaylist {
+        playlist_id: String,
+        new_name: String,
+    },
+    DeletePlaylist {
+        playlist_id: String,
+    },
+    AddSongToPlaylist {
+        playlist_id: String,
+        song: Box<Song>,
+    },
+    RemoveSongFromPlaylist {
+        playlist_id: String,
+        video_id: String,
+    },
+    ReorderPlaylistTrack {
+        playlist_id: String,
+        from_idx: usize,
+        to_idx: usize,
+    },
+    LoadPlaylistSongs {
+        playlist_id: String,
+    },
+    DownloadSong(Box<Song>),
+    CancelDownload(String),
+    DeleteDownload(String),
     ScanLocalFolder(PathBuf),
     TranslateLyrics {
         target_lang: String,
@@ -307,8 +393,20 @@ pub enum BackendEvent {
         result: Result<LyricsPayload, String>,
     },
     LibraryLoaded(LibrarySnapshot),
+    LibrarySearchResults {
+        query: String,
+        songs: Vec<Song>,
+    },
+    PlaylistSongsLoaded {
+        playlist_id: String,
+        songs: Vec<Song>,
+    },
     SearchHistoryUpdated(Vec<SearchHistoryRecord>),
     LikedSongsUpdated(HashSet<String>),
+    LikedSongsListUpdated(Vec<Song>),
+    AutoplayUpdated(bool),
+    DownloadProgressUpdated(DownloadProgress),
+    DownloadRemoved(String),
     LibraryTrackRecorded {
         song: Box<Song>,
         stats: DbStats,
@@ -618,12 +716,22 @@ struct InFlightTrackLoad {
     resume_position_ms: u64,
 }
 
+/// Restored playback track held in `Paused` state after app startup until the user
+/// presses Play or switches tracks (zero network/audio autoplay on launch).
+#[derive(Debug, Clone)]
+struct RestoredPausedTrack {
+    song: Song,
+    position_ms: u64,
+    duration_ms: u64,
+}
+
 #[derive(Debug)]
 struct PlaybackLoopState {
     last_state: PlaybackState,
     last_song_vid: Option<String>,
     last_published_pos_ms: u64,
     in_flight: Option<InFlightTrackLoad>,
+    restored_paused: Option<RestoredPausedTrack>,
 }
 
 impl Default for PlaybackLoopState {
@@ -633,12 +741,51 @@ impl Default for PlaybackLoopState {
             last_song_vid: None,
             last_published_pos_ms: 0,
             in_flight: None,
+            restored_paused: None,
         }
     }
 }
 
 impl PlaybackLoopState {
+    fn set_restored_paused(&mut self, song: Song, position_ms: u64, duration_ms: u64) {
+        let clamped_pos = if duration_ms > 0 {
+            position_ms.min(duration_ms)
+        } else {
+            position_ms
+        };
+        self.last_state = PlaybackState::Paused;
+        self.last_song_vid = Some(song.video_id.clone());
+        self.last_published_pos_ms = clamped_pos;
+        self.in_flight = None;
+        self.restored_paused = Some(RestoredPausedTrack {
+            song,
+            position_ms: clamped_pos,
+            duration_ms,
+        });
+    }
+
+    fn take_restored_paused(&mut self) -> Option<RestoredPausedTrack> {
+        self.restored_paused.take()
+    }
+
+    fn restored_position_ms(&self) -> Option<u64> {
+        self.restored_paused.as_ref().map(|r| r.position_ms)
+    }
+
+    fn seek_restored_paused(&mut self, target_ms: u64) -> Option<u64> {
+        let rp = self.restored_paused.as_mut()?;
+        let clamped = if rp.duration_ms > 0 {
+            target_ms.min(rp.duration_ms)
+        } else {
+            target_ms
+        };
+        rp.position_ms = clamped;
+        self.last_published_pos_ms = clamped;
+        Some(clamped)
+    }
+
     fn begin_async_load(&mut self, generation: u64, song: Song, resume_position_ms: u64) {
+        self.restored_paused = None;
         self.in_flight = Some(InFlightTrackLoad {
             generation,
             song,
@@ -666,22 +813,26 @@ impl PlaybackLoopState {
 
     fn sync_stopped(&mut self) {
         self.in_flight = None;
+        self.restored_paused = None;
         self.last_state = PlaybackState::Stopped;
         self.last_song_vid = None;
         self.last_published_pos_ms = 0;
     }
 
     /// Returns whether the periodic loop tick should emit `snap` to the UI.
-    /// Suppresses intermediate `Stopped` snapshots while a non-standby async track load
-    /// or auto-retry cycle owns the player bar so the UI never blanks out or resets
-    /// `last_published_pos_ms` to `0`.
+    /// Suppresses intermediate `Stopped` snapshots while a non-standby async track load,
+    /// restored paused session, or auto-retry cycle owns the player bar so the UI never
+    /// blanks out or resets `last_published_pos_ms` to `0`.
     fn should_publish_tick_snapshot(
         &mut self,
         snap: &PlaybackSnapshot,
         retry: &PlaybackErrorRetry,
     ) -> bool {
         if snap.state == PlaybackState::Stopped
-            && (self.in_flight.is_some() || retry.is_waiting_for_retry() || retry.is_exhausted())
+            && (self.in_flight.is_some()
+                || self.restored_paused.is_some()
+                || retry.is_waiting_for_retry()
+                || retry.is_exhausted())
         {
             return false;
         }
@@ -697,7 +848,7 @@ impl PlaybackLoopState {
     }
 
     /// Projects the observable playback snapshot for `SyncFullState` so reopening from
-    /// tray during an in-flight track load or auto-retry cycle restores `Buffering`/`Error`
+    /// tray or launching into a restored paused session shows `Paused`/`Buffering`/`Error`
     /// with the active song and resume position instead of a blank `Stopped` snapshot.
     fn effective_snapshot(
         &self,
@@ -711,6 +862,11 @@ impl PlaybackLoopState {
                 engine_snap.current_song = Some(load.song.clone());
                 engine_snap.position_ms = load.resume_position_ms;
                 engine_snap.duration_ms = duration_millis(load.song.duration_text.as_deref());
+            } else if let Some(ref rp) = self.restored_paused {
+                engine_snap.state = PlaybackState::Paused;
+                engine_snap.current_song = Some(rp.song.clone());
+                engine_snap.position_ms = rp.position_ms;
+                engine_snap.duration_ms = rp.duration_ms;
             } else if retry.is_waiting_for_retry()
                 && let Some(song) = current_song
                 && retry.video_id.as_deref() == Some(song.video_id.as_str())
@@ -733,6 +889,98 @@ impl PlaybackLoopState {
         }
         engine_snap
     }
+}
+
+/// Debounced & throttled controller for persisting [`PlaybackSessionState`] to SQLite
+/// without hammering disk on every 35ms backend tick.
+#[derive(Debug)]
+struct SessionSaver {
+    dirty: bool,
+    dirty_since: Option<Instant>,
+    last_saved_at: Option<Instant>,
+    last_saved_pos_ms: u64,
+    debounce: Duration,
+    playing_interval: Duration,
+}
+
+impl Default for SessionSaver {
+    fn default() -> Self {
+        Self {
+            dirty: false,
+            dirty_since: None,
+            last_saved_at: None,
+            last_saved_pos_ms: 0,
+            debounce: Duration::from_millis(600),
+            playing_interval: Duration::from_secs(5),
+        }
+    }
+}
+
+impl SessionSaver {
+    fn mark_dirty(&mut self, now: Instant) {
+        self.dirty = true;
+        self.dirty_since.get_or_insert(now);
+    }
+
+    fn should_flush(&self, now: Instant, is_playing: bool, current_pos_ms: u64) -> bool {
+        if self.dirty
+            && self
+                .dirty_since
+                .is_some_and(|t| now.saturating_duration_since(t) >= self.debounce)
+        {
+            return true;
+        }
+        if is_playing
+            && self
+                .last_saved_at
+                .is_none_or(|t| now.saturating_duration_since(t) >= self.playing_interval)
+            && current_pos_ms.abs_diff(self.last_saved_pos_ms) >= 1_500
+        {
+            return true;
+        }
+        false
+    }
+
+    fn mark_saved(&mut self, now: Instant, pos_ms: u64) {
+        self.dirty = false;
+        self.dirty_since = None;
+        self.last_saved_at = Some(now);
+        self.last_saved_pos_ms = pos_ms;
+    }
+
+    fn reset(&mut self) {
+        self.dirty = false;
+        self.dirty_since = None;
+        self.last_saved_at = None;
+        self.last_saved_pos_ms = 0;
+    }
+}
+
+struct DownloadTaskEntry {
+    cancel: StreamCancelToken,
+    progress: DownloadProgress,
+}
+
+const HOME_BROWSE_CACHE_KEY: &str = "home:default";
+
+fn detail_browse_cache_key(kind: BrowseType, browse_id: &str) -> (String, &'static str) {
+    let kind_str = match kind {
+        BrowseType::Artist => "artist",
+        BrowseType::Album => "album",
+        BrowseType::Playlist => "playlist",
+        BrowseType::Other => "detail",
+    };
+    (format!("{kind_str}:{browse_id}"), kind_str)
+}
+
+/// Converts persisted `AppSettingsData.eq_band_gains_db` (variable length) into the
+/// fixed-size manual EQ array expected by `bitchord-dsp-core`.
+pub(crate) fn eq_bands_from_settings(gains: &[f32]) -> [f32; EqLayout::MANUAL_COUNT] {
+    let mut bands = [0.0_f32; EqLayout::MANUAL_COUNT];
+    for (dst, src) in bands.iter_mut().zip(gains.iter()) {
+        *dst = src.clamp(-EqLayout::MANUAL_RANGE_DB, EqLayout::MANUAL_RANGE_DB);
+    }
+    bands
 }
 
 #[derive(Debug, Default)]
@@ -915,7 +1163,10 @@ enum InternalMsg {
     HomeFetchFinished(Option<HomeFeed>),
     LibraryCached(LibrarySnapshot),
     SearchHistoryCached(Vec<SearchHistoryRecord>),
-    LikedSongsCached(HashSet<String>),
+    LikedSongsCached {
+        ids: HashSet<String>,
+        songs: Vec<Song>,
+    },
     LibraryTrackUpdated {
         song: Box<Song>,
         stats: DbStats,
@@ -923,6 +1174,15 @@ enum InternalMsg {
     LyricsStateUpdated {
         video_id: String,
         state: LyricsSyncState,
+    },
+    AutoplayFetched {
+        generation: u64,
+        songs: Vec<Song>,
+        start_if_ended: bool,
+    },
+    DownloadProgressChanged(DownloadProgress),
+    DownloadTaskFinished {
+        video_id: String,
     },
 }
 
@@ -1020,6 +1280,18 @@ fn run_backend_thread(
     engine.set_volume(settings.volume);
     engine.set_muted(settings.muted);
     engine.set_crossfade_seconds(settings.crossfade_seconds);
+    engine.set_speed(settings.playback_speed.clamp(0.5, 2.0));
+    engine.set_skip_silence(settings.skip_silence);
+    engine.set_spatial_audio(settings.spatial_audio);
+
+    let mut eq_enabled = settings.eq_enabled;
+    let mut eq_bands_db = eq_bands_from_settings(&settings.eq_band_gains_db);
+    let mut eq_preset = EqualizerPreset::matching(&eq_bands_db);
+    engine.set_eq(EqTuningSnapshot::from_curve(
+        eq_enabled,
+        &manual_curve(&eq_bands_db),
+        0.0,
+    ));
 
     let audio_banner = (!pipewire_active).then(|| audio_msg.clone());
     let mut cached_audio_devices = enumerate_alsa_devices();
@@ -1118,7 +1390,10 @@ fn run_backend_thread(
     let load_gen = Arc::new(AtomicU64::new(0));
     let preload_gen = Arc::new(AtomicU64::new(0));
     let party_gen = Arc::new(AtomicU64::new(0));
+    let autoplay_gen = Arc::new(AtomicU64::new(0));
+    let library_search_gen = Arc::new(AtomicU64::new(0));
     let analysis_sem = Arc::new(tokio::sync::Semaphore::new(1));
+    let download_sem = Arc::new(tokio::sync::Semaphore::new(2));
     let onnx_paths = Arc::new(OnnxModelPaths::discover(&paths.models_dir()));
 
     let mut active_load_cancel: Option<StreamCancelToken> = None;
@@ -1132,10 +1407,9 @@ fn run_backend_thread(
     let mut home_fetch = HomeFetchState::default();
     let mut suggest_gate = SearchSuggestGate::default();
     let mut cached_library: Option<LibrarySnapshot> = None;
-
-    let mut eq_enabled = false;
-    let mut eq_preset = EqualizerPreset::Flat;
-    let mut eq_bands_db = [0.0_f32; EqLayout::MANUAL_COUNT];
+    let mut autoplay_in_flight: Option<String> = None;
+    let mut autoplay_play_on_arrival = false;
+    let mut active_downloads: HashMap<String, DownloadTaskEntry> = HashMap::new();
 
     let mut party_runtime: Option<PartyRuntime> = None;
     let party_state_shared: Arc<Mutex<ListenTogetherState>> =
@@ -1145,12 +1419,30 @@ fn run_backend_thread(
     let mut last_output_error: Option<String> = None;
     let mut last_reconnect_attempt: Option<Instant> = None;
     let mut last_mpris_key: Option<MprisPublishKey> = None;
+    let mut session_saver = SessionSaver::default();
 
     // Initial asynchronous SQLite library snapshot load (never blocks backend startup).
     spawn_library_refresh(&rt, &db_worker, &internal_tx, &events);
 
     let mut last_tick = Instant::now();
     let mut loop_state = PlaybackLoopState::default();
+
+    // Restore persisted PlaybackSessionState in PAUSED state so queue, active track,
+    // position, shuffle, repeat, and autoplay boundary come back ready without auto-playing.
+    if let Some(session) = db_worker.load_playback_session_blocking() {
+        let saved_pos_ms = session.position_ms;
+        if let Some(song) = queue.restore_session(session) {
+            let dur_ms = duration_millis(song.duration_text.as_deref());
+            let clamped_pos = if dur_ms > 0 {
+                saved_pos_ms.min(dur_ms)
+            } else {
+                saved_pos_ms
+            };
+            current_playing_song = Some(song.clone());
+            loop_state.set_restored_paused(song, clamped_pos, dur_ms);
+            session_saver.mark_saved(Instant::now(), clamped_pos);
+        }
+    }
 
     loop {
         // 1. Wait reactively for an inbound UI command or an async internal completion.
@@ -1196,6 +1488,14 @@ fn run_backend_thread(
                     MprisCommand::Pause => {
                         engine.pause();
                         error_retry.reset();
+                        flush_session_now(
+                            &queue,
+                            &loop_state,
+                            &engine,
+                            &db_worker,
+                            &mut session_saver,
+                            false,
+                        );
                     }
                     MprisCommand::PlayPause => cmds.push(BackendCommand::PlayPause),
                     MprisCommand::Stop => {
@@ -1230,6 +1530,7 @@ fn run_backend_thread(
                             guard += 1;
                         }
                         emit_queue(&queue, &events);
+                        session_saver.mark_dirty(Instant::now());
                         invalidate_and_repreload(
                             &mut engine,
                             &queue,
@@ -1374,6 +1675,18 @@ fn run_backend_thread(
                                 &resolver,
                                 &remote_auth,
                                 &db_worker,
+                                &internal_tx,
+                            );
+
+                            session_saver.mark_dirty(Instant::now());
+                            maybe_trigger_autoplay(
+                                &queue,
+                                settings.autoplay_enabled,
+                                &mut autoplay_in_flight,
+                                &autoplay_gen,
+                                false,
+                                &rt,
+                                &yt_repo,
                                 &internal_tx,
                             );
                         }
@@ -1536,9 +1849,10 @@ fn run_backend_thread(
                         lib.search_history = history;
                     }
                 }
-                InternalMsg::LikedSongsCached(liked_ids) => {
+                InternalMsg::LikedSongsCached { ids, songs } => {
                     if let Some(ref mut lib) = cached_library {
-                        lib.liked_video_ids = liked_ids;
+                        lib.liked_video_ids = ids;
+                        lib.liked_songs = songs;
                     }
                 }
                 InternalMsg::LibraryTrackUpdated { song, stats } => {
@@ -1557,6 +1871,79 @@ fn run_backend_thread(
                         lyrics_sync_state = state;
                     }
                 }
+                InternalMsg::AutoplayFetched {
+                    generation,
+                    songs,
+                    start_if_ended,
+                } => {
+                    autoplay_in_flight = None;
+                    let should_start = start_if_ended || autoplay_play_on_arrival;
+                    autoplay_play_on_arrival = false;
+                    if autoplay_gen.load(Ordering::Acquire) != generation {
+                        continue;
+                    }
+                    let added = queue.append_autoplay(songs);
+                    if added > 0 {
+                        emit_queue(&queue, &events);
+                        session_saver.mark_dirty(Instant::now());
+                        let state_now = engine.snapshot().state;
+                        if should_start
+                            && matches!(state_now, PlaybackState::Ended | PlaybackState::Stopped)
+                            && loop_state.in_flight.is_none()
+                            && let Some(next_idx) = queue.next_index(true)
+                            && let Some(song) = queue.jump(next_idx)
+                        {
+                            error_retry.reset();
+                            emit_queue(&queue, &events);
+                            lyrics_sync_state = LyricsSyncState::Loading;
+                            start_async_song_load_at(
+                                &mut engine,
+                                &mut loop_state,
+                                &mut current_playing_song,
+                                &load_gen,
+                                &preload_gen,
+                                &mut active_load_cancel,
+                                &mut preload_cancel,
+                                &mut preloaded_next_song,
+                                &rt,
+                                &http_arc,
+                                &resolver,
+                                &remote_auth,
+                                &db_worker,
+                                &current_lyrics,
+                                song,
+                                0,
+                                false,
+                                &internal_tx,
+                                &events,
+                            );
+                        } else if preloaded_next_song.is_none() {
+                            let cur_gen = load_gen.load(Ordering::Acquire);
+                            spawn_standby_preload_for_queue(
+                                cur_gen,
+                                &load_gen,
+                                &preload_gen,
+                                &mut preload_cancel,
+                                &queue,
+                                &rt,
+                                &http_arc,
+                                &resolver,
+                                &remote_auth,
+                                &db_worker,
+                                &internal_tx,
+                            );
+                        }
+                    }
+                }
+                InternalMsg::DownloadProgressChanged(progress) => {
+                    if let Some(entry) = active_downloads.get_mut(&progress.video_id) {
+                        entry.progress = progress.clone();
+                    }
+                    events.emit(BackendEvent::DownloadProgressUpdated(progress));
+                }
+                InternalMsg::DownloadTaskFinished { video_id } => {
+                    active_downloads.remove(&video_id);
+                }
             }
         }
 
@@ -1564,6 +1951,17 @@ fn run_backend_thread(
         for cmd in cmds {
             match cmd {
                 BackendCommand::Shutdown => {
+                    flush_session_now(
+                        &queue,
+                        &loop_state,
+                        &engine,
+                        &db_worker,
+                        &mut session_saver,
+                        true,
+                    );
+                    for (_, entry) in active_downloads.drain() {
+                        entry.cancel.cancel();
+                    }
                     cancel_all_loads(
                         &load_gen,
                         &preload_gen,
@@ -1605,20 +2003,38 @@ fn run_backend_thread(
                         automix_mode: settings.automix_mode,
                         automix_phrase_bars: settings.automix_phrase_bars,
                         discord_rpc_enabled: settings.discord_rpc_enabled,
+                        sidebar_collapsed: settings.sidebar_collapsed,
+                        autoplay_enabled: settings.autoplay_enabled,
+                        active_downloads: active_downloads
+                            .values()
+                            .map(|e| e.progress.clone())
+                            .collect(),
                     };
                     events.emit(BackendEvent::FullStateSynced(Box::new(full)));
 
                     if home_fetch.should_start_on_sync() {
                         home_fetch.mark_started();
-                        spawn_load_home(&rt, &yt_repo, &internal_tx, &events);
+                        spawn_load_home(&rt, &yt_repo, &db_worker, false, &internal_tx, &events);
                     }
                     if cached_library.is_none() {
                         spawn_library_refresh(&rt, &db_worker, &internal_tx, &events);
                     }
                 }
                 BackendCommand::LoadHome => {
+                    let force_refresh = home_fetch.cached.is_some();
                     home_fetch.mark_started();
-                    spawn_load_home(&rt, &yt_repo, &internal_tx, &events);
+                    spawn_load_home(
+                        &rt,
+                        &yt_repo,
+                        &db_worker,
+                        force_refresh,
+                        &internal_tx,
+                        &events,
+                    );
+                }
+                BackendCommand::RefreshHome => {
+                    home_fetch.mark_started();
+                    spawn_load_home(&rt, &yt_repo, &db_worker, true, &internal_tx, &events);
                 }
                 BackendCommand::Search { query, filter } => {
                     let trimmed = query.trim().to_owned();
@@ -1730,10 +2146,15 @@ fn run_backend_thread(
                     let events_c = events.clone();
                     rt.spawn(async move {
                         let (_liked, liked_ids) = db_c.toggle_song_liked(*song).await;
+                        let liked_songs = db_c.list_liked_songs().await;
                         let _ = itx
-                            .send(InternalMsg::LikedSongsCached(liked_ids.clone()))
+                            .send(InternalMsg::LikedSongsCached {
+                                ids: liked_ids.clone(),
+                                songs: liked_songs.clone(),
+                            })
                             .await;
                         events_c.emit(BackendEvent::LikedSongsUpdated(liked_ids));
+                        events_c.emit(BackendEvent::LikedSongsListUpdated(liked_songs));
                     });
                 }
                 BackendCommand::LoadDetail {
@@ -1741,45 +2162,32 @@ fn run_backend_thread(
                     kind,
                     fallback_title,
                 } => {
-                    events.emit(BackendEvent::DetailLoading);
-                    let repo = Arc::clone(&yt_repo);
-                    let events_c = events.clone();
-                    rt.spawn(async move {
-                        let res = if kind == BrowseType::Artist {
-                            repo.artist_page(&browse_id).await.map(|page| {
-                                let title = page.name.unwrap_or(fallback_title);
-                                let subtitle = page
-                                    .subscriber_count_text
-                                    .unwrap_or_else(|| "Artist".to_owned());
-                                DetailPayload {
-                                    browse_id: browse_id.clone(),
-                                    header: Some(BrowseHeader {
-                                        title,
-                                        subtitle: subtitle.clone(),
-                                        thumbnail_url: page.thumbnail_url,
-                                    }),
-                                    songs: page.songs,
-                                    subtitle,
-                                }
-                            })
-                        } else {
-                            repo.browse_songs(&browse_id, None)
-                                .await
-                                .map(|(header, songs, _)| {
-                                    let subtitle = header
-                                        .as_ref()
-                                        .map(|h| h.subtitle.clone())
-                                        .unwrap_or_default();
-                                    DetailPayload {
-                                        browse_id: browse_id.clone(),
-                                        header,
-                                        songs,
-                                        subtitle,
-                                    }
-                                })
-                        };
-                        events_c.emit(BackendEvent::DetailLoaded(res.map_err(|e| e.to_string())));
-                    });
+                    spawn_load_detail(
+                        &rt,
+                        &yt_repo,
+                        &db_worker,
+                        browse_id,
+                        kind,
+                        fallback_title,
+                        false,
+                        &events,
+                    );
+                }
+                BackendCommand::RefreshDetail {
+                    browse_id,
+                    kind,
+                    fallback_title,
+                } => {
+                    spawn_load_detail(
+                        &rt,
+                        &yt_repo,
+                        &db_worker,
+                        browse_id,
+                        kind,
+                        fallback_title,
+                        true,
+                        &events,
+                    );
                 }
                 BackendCommand::PlayContext {
                     songs,
@@ -1796,8 +2204,12 @@ fn run_backend_thread(
                     if let Some(song) =
                         queue.play_context(&songs, start_index, &source, unix_now_ms() as u64)
                     {
+                        autoplay_gen.fetch_add(1, Ordering::AcqRel);
+                        autoplay_in_flight = None;
+                        autoplay_play_on_arrival = false;
                         error_retry.reset();
                         emit_queue(&queue, &events);
+                        session_saver.mark_dirty(Instant::now());
                         lyrics_sync_state = LyricsSyncState::Loading;
                         start_async_song_load_at(
                             &mut engine,
@@ -1824,8 +2236,12 @@ fn run_backend_thread(
                 }
                 BackendCommand::PlayNext(song) => match queue.play_next(*song) {
                     PlayNextOutcome::StartedImmediately(s) => {
+                        autoplay_gen.fetch_add(1, Ordering::AcqRel);
+                        autoplay_in_flight = None;
+                        autoplay_play_on_arrival = false;
                         error_retry.reset();
                         emit_queue(&queue, &events);
+                        session_saver.mark_dirty(Instant::now());
                         lyrics_sync_state = LyricsSyncState::Loading;
                         start_async_song_load_at(
                             &mut engine,
@@ -1851,6 +2267,7 @@ fn run_backend_thread(
                     }
                     PlayNextOutcome::InsertedNext => {
                         emit_queue(&queue, &events);
+                        session_saver.mark_dirty(Instant::now());
                         invalidate_and_repreload(
                             &mut engine,
                             &queue,
@@ -1872,6 +2289,7 @@ fn run_backend_thread(
                     if let Some(song) = queue.jump(idx) {
                         error_retry.reset();
                         emit_queue(&queue, &events);
+                        session_saver.mark_dirty(Instant::now());
                         lyrics_sync_state = LyricsSyncState::Loading;
                         start_async_song_load_at(
                             &mut engine,
@@ -1899,6 +2317,9 @@ fn run_backend_thread(
                 BackendCommand::QueueRemove(idx) => match queue.remove(idx) {
                     QueueRemoveOutcome::OutOfBounds => {}
                     QueueRemoveOutcome::Emptied => {
+                        autoplay_gen.fetch_add(1, Ordering::AcqRel);
+                        autoplay_in_flight = None;
+                        autoplay_play_on_arrival = false;
                         cancel_all_loads(
                             &load_gen,
                             &preload_gen,
@@ -1910,12 +2331,15 @@ fn run_backend_thread(
                         current_playing_song = None;
                         engine.stop();
                         loop_state.sync_stopped();
+                        db_worker.clear_playback_session();
+                        session_saver.reset();
                         emit_queue(&queue, &events);
                         events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                     }
                     QueueRemoveOutcome::ActiveReplaced(song) => {
                         error_retry.reset();
                         emit_queue(&queue, &events);
+                        session_saver.mark_dirty(Instant::now());
                         lyrics_sync_state = LyricsSyncState::Loading;
                         start_async_song_load_at(
                             &mut engine,
@@ -1941,6 +2365,7 @@ fn run_backend_thread(
                     }
                     QueueRemoveOutcome::Updated => {
                         emit_queue(&queue, &events);
+                        session_saver.mark_dirty(Instant::now());
                         invalidate_and_repreload(
                             &mut engine,
                             &queue,
@@ -1957,7 +2382,40 @@ fn run_backend_thread(
                         );
                     }
                 },
+                BackendCommand::ReorderQueue { from_idx, to_idx } => {
+                    if queue.reorder(from_idx, to_idx) {
+                        emit_queue(&queue, &events);
+                        session_saver.mark_dirty(Instant::now());
+                        invalidate_and_repreload(
+                            &mut engine,
+                            &queue,
+                            &load_gen,
+                            &preload_gen,
+                            &mut preload_cancel,
+                            &mut preloaded_next_song,
+                            &rt,
+                            &http_arc,
+                            &resolver,
+                            &remote_auth,
+                            &db_worker,
+                            &internal_tx,
+                        );
+                        maybe_trigger_autoplay(
+                            &queue,
+                            settings.autoplay_enabled,
+                            &mut autoplay_in_flight,
+                            &autoplay_gen,
+                            false,
+                            &rt,
+                            &yt_repo,
+                            &internal_tx,
+                        );
+                    }
+                }
                 BackendCommand::QueueClear => {
+                    autoplay_gen.fetch_add(1, Ordering::AcqRel);
+                    autoplay_in_flight = None;
+                    autoplay_play_on_arrival = false;
                     queue.clear();
                     cancel_all_loads(
                         &load_gen,
@@ -1970,12 +2428,15 @@ fn run_backend_thread(
                     current_playing_song = None;
                     engine.stop();
                     loop_state.sync_stopped();
+                    db_worker.clear_playback_session();
+                    session_saver.reset();
                     emit_queue(&queue, &events);
                     events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                 }
                 BackendCommand::ToggleShuffle => {
                     let _ = queue.toggle_shuffle(unix_now_ms() as u64);
                     emit_queue(&queue, &events);
+                    session_saver.mark_dirty(Instant::now());
                     invalidate_and_repreload(
                         &mut engine,
                         &queue,
@@ -1994,6 +2455,7 @@ fn run_backend_thread(
                 BackendCommand::CycleRepeat => {
                     queue.cycle_repeat();
                     emit_queue(&queue, &events);
+                    session_saver.mark_dirty(Instant::now());
                     invalidate_and_repreload(
                         &mut engine,
                         &queue,
@@ -2008,6 +2470,97 @@ fn run_backend_thread(
                         &db_worker,
                         &internal_tx,
                     );
+                    maybe_trigger_autoplay(
+                        &queue,
+                        settings.autoplay_enabled,
+                        &mut autoplay_in_flight,
+                        &autoplay_gen,
+                        false,
+                        &rt,
+                        &yt_repo,
+                        &internal_tx,
+                    );
+                }
+                BackendCommand::SetAutoplayEnabled(enabled) => {
+                    settings.autoplay_enabled = enabled;
+                    save_settings_async(&rt, &settings_path, &settings);
+                    events.emit(BackendEvent::AutoplayUpdated(enabled));
+                    if enabled {
+                        maybe_trigger_autoplay(
+                            &queue,
+                            true,
+                            &mut autoplay_in_flight,
+                            &autoplay_gen,
+                            false,
+                            &rt,
+                            &yt_repo,
+                            &internal_tx,
+                        );
+                    } else {
+                        autoplay_gen.fetch_add(1, Ordering::AcqRel);
+                        autoplay_in_flight = None;
+                        autoplay_play_on_arrival = false;
+                    }
+                }
+                BackendCommand::StartRadio(seed_song) => {
+                    let seed = *seed_song;
+                    let seed_vid = seed.video_id.clone();
+                    let seed_title = seed.title.clone();
+                    let radio_generation = autoplay_gen.fetch_add(1, Ordering::AcqRel) + 1;
+                    autoplay_play_on_arrival = false;
+                    if let Some(started) =
+                        queue.start_radio(seed, Vec::new(), unix_now_ms() as u64)
+                    {
+                        error_retry.reset();
+                        emit_queue(&queue, &events);
+                        session_saver.mark_dirty(Instant::now());
+                        lyrics_sync_state = LyricsSyncState::Loading;
+                        start_async_song_load_at(
+                            &mut engine,
+                            &mut loop_state,
+                            &mut current_playing_song,
+                            &load_gen,
+                            &preload_gen,
+                            &mut active_load_cancel,
+                            &mut preload_cancel,
+                            &mut preloaded_next_song,
+                            &rt,
+                            &http_arc,
+                            &resolver,
+                            &remote_auth,
+                            &db_worker,
+                            &current_lyrics,
+                            started,
+                            0,
+                            false,
+                            &internal_tx,
+                            &events,
+                        );
+                        if crate::queue_state::is_youtube_radio_seed(&seed_vid) {
+                            autoplay_in_flight = Some(seed_vid.clone());
+                            spawn_radio_fetch(
+                                radio_generation,
+                                seed_vid,
+                                false,
+                                &rt,
+                                &yt_repo,
+                                &internal_tx,
+                            );
+                            events.emit(BackendEvent::StatusNotice(format!(
+                                "Starting radio for \"{seed_title}\"..."
+                            )));
+                        } else {
+                            autoplay_in_flight = None;
+                            events.emit(BackendEvent::StatusNotice(
+                                "Radio continuation is only available for YouTube Music tracks"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
+                }
+                BackendCommand::SetSidebarCollapsed(collapsed) => {
+                    settings.sidebar_collapsed = collapsed;
+                    save_settings_async(&rt, &settings_path, &settings);
                 }
                 BackendCommand::PlayPause => {
                     let snap_before = engine.snapshot();
@@ -2032,6 +2585,31 @@ fn run_backend_thread(
                             &current_lyrics,
                             fb.song,
                             fb.position_ms,
+                            false,
+                            &internal_tx,
+                            &events,
+                        );
+                    } else if let Some(rp) = loop_state.take_restored_paused() {
+                        // First Play press on a restored paused session: open decoder at saved position.
+                        error_retry.reset();
+                        lyrics_sync_state = LyricsSyncState::Loading;
+                        start_async_song_load_at(
+                            &mut engine,
+                            &mut loop_state,
+                            &mut current_playing_song,
+                            &load_gen,
+                            &preload_gen,
+                            &mut active_load_cancel,
+                            &mut preload_cancel,
+                            &mut preloaded_next_song,
+                            &rt,
+                            &http_arc,
+                            &resolver,
+                            &remote_auth,
+                            &db_worker,
+                            &current_lyrics,
+                            rp.song,
+                            rp.position_ms,
                             false,
                             &internal_tx,
                             &events,
@@ -2121,7 +2699,18 @@ fn run_backend_thread(
                         }
                     } else {
                         engine.toggle_play_pause();
-                        events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                        let next_snap = engine.snapshot();
+                        if next_snap.state == PlaybackState::Paused {
+                            flush_session_now(
+                                &queue,
+                                &loop_state,
+                                &engine,
+                                &db_worker,
+                                &mut session_saver,
+                                false,
+                            );
+                        }
+                        events.emit(BackendEvent::PlaybackUpdated(Box::new(next_snap)));
                     }
                 }
                 BackendCommand::NextTrack => {
@@ -2131,6 +2720,7 @@ fn run_backend_thread(
                         error_retry.reset();
                         let _ = queue.jump(next_idx);
                         emit_queue(&queue, &events);
+                        session_saver.mark_dirty(Instant::now());
 
                         // Fast path: promote already-preloaded standby deck instantly without
                         // tearing down audio or re-resolving the stream!
@@ -2216,6 +2806,16 @@ fn run_backend_thread(
                                 &db_worker,
                                 &internal_tx,
                             );
+                            maybe_trigger_autoplay(
+                                &queue,
+                                settings.autoplay_enabled,
+                                &mut autoplay_in_flight,
+                                &autoplay_gen,
+                                false,
+                                &rt,
+                                &yt_repo,
+                                &internal_tx,
+                            );
                         } else {
                             lyrics_sync_state = LyricsSyncState::Loading;
                             start_async_song_load_at(
@@ -2276,6 +2876,7 @@ fn run_backend_thread(
                     {
                         error_retry.reset();
                         emit_queue(&queue, &events);
+                        session_saver.mark_dirty(Instant::now());
                         lyrics_sync_state = LyricsSyncState::Loading;
                         start_async_song_load_at(
                             &mut engine,
@@ -2301,17 +2902,42 @@ fn run_backend_thread(
                     }
                 }
                 BackendCommand::SeekMs(ms) => {
-                    if let Ok(actual) = engine.seek_ms(ms) {
+                    if let Some(actual) = loop_state.seek_restored_paused(ms) {
+                        session_saver.mark_dirty(Instant::now());
+                        notify_mpris_seeked(&rt, mpris_svc.as_ref(), actual);
+                        let snap = loop_state.effective_snapshot(
+                            engine.snapshot(),
+                            &error_retry,
+                            current_playing_song.as_ref(),
+                        );
+                        events.emit(BackendEvent::PlaybackUpdated(Box::new(snap)));
+                    } else if let Ok(actual) = engine.seek_ms(ms) {
+                        session_saver.mark_dirty(Instant::now());
                         notify_mpris_seeked(&rt, mpris_svc.as_ref(), actual);
                         events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                     }
                 }
                 BackendCommand::SeekDeltaMs(delta) => {
-                    let cur = engine.position_ms() as i64;
-                    let target = (cur + delta).max(0) as u64;
-                    if let Ok(actual) = engine.seek_ms(target) {
-                        notify_mpris_seeked(&rt, mpris_svc.as_ref(), actual);
-                        events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                    if let Some(cur_ms) = loop_state.restored_position_ms() {
+                        let target = (cur_ms as i64 + delta).max(0) as u64;
+                        if let Some(actual) = loop_state.seek_restored_paused(target) {
+                            session_saver.mark_dirty(Instant::now());
+                            notify_mpris_seeked(&rt, mpris_svc.as_ref(), actual);
+                            let snap = loop_state.effective_snapshot(
+                                engine.snapshot(),
+                                &error_retry,
+                                current_playing_song.as_ref(),
+                            );
+                            events.emit(BackendEvent::PlaybackUpdated(Box::new(snap)));
+                        }
+                    } else {
+                        let cur = engine.position_ms() as i64;
+                        let target = (cur + delta).max(0) as u64;
+                        if let Ok(actual) = engine.seek_ms(target) {
+                            session_saver.mark_dirty(Instant::now());
+                            notify_mpris_seeked(&rt, mpris_svc.as_ref(), actual);
+                            events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                        }
                     }
                 }
                 BackendCommand::SetVolume(vol) => {
@@ -2328,15 +2954,22 @@ fn run_backend_thread(
                     events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                 }
                 BackendCommand::SetSpeed(speed) => {
-                    engine.set_speed(speed);
+                    let clamped = speed.clamp(0.5, 2.0);
+                    engine.set_speed(clamped);
+                    settings.playback_speed = clamped;
+                    save_settings_async(&rt, &settings_path, &settings);
                     events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                 }
                 BackendCommand::SetSkipSilence(on) => {
                     engine.set_skip_silence(on);
+                    settings.skip_silence = on;
+                    save_settings_async(&rt, &settings_path, &settings);
                     events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                 }
                 BackendCommand::SetSpatial(on) => {
                     engine.set_spatial_audio(on);
+                    settings.spatial_audio = on;
+                    save_settings_async(&rt, &settings_path, &settings);
                     events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                 }
                 BackendCommand::SetCrossfadeSeconds(secs) => {
@@ -2388,14 +3021,18 @@ fn run_backend_thread(
                     preset,
                     bands_db,
                 } => {
+                    let effective_bands = if preset == EqualizerPreset::Custom {
+                        bands_db
+                    } else {
+                        eq_bands_from_settings(preset.bands_db())
+                    };
                     eq_enabled = enabled;
                     eq_preset = preset;
-                    eq_bands_db = bands_db;
-                    let curve: EqCurve = if preset == EqualizerPreset::Custom {
-                        manual_curve(&bands_db)
-                    } else {
-                        manual_curve(preset.bands_db())
-                    };
+                    eq_bands_db = effective_bands;
+                    settings.eq_enabled = enabled;
+                    settings.eq_band_gains_db = effective_bands.to_vec();
+                    save_settings_async(&rt, &settings_path, &settings);
+                    let curve: EqCurve = manual_curve(&effective_bands);
                     engine.set_eq(EqTuningSnapshot::from_curve(enabled, &curve, 0.0));
                     events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                 }
@@ -2419,6 +3056,312 @@ fn run_backend_thread(
                 }
                 BackendCommand::RefreshLibrary => {
                     spawn_library_refresh(&rt, &db_worker, &internal_tx, &events);
+                }
+                BackendCommand::SearchLibrary { query, limit } => {
+                    let search_gen = library_search_gen.fetch_add(1, Ordering::AcqRel) + 1;
+                    let gen_ref = Arc::clone(&library_search_gen);
+                    let db_c = db_worker.clone();
+                    let events_c = events.clone();
+                    let capped_limit = limit.clamp(1, 500);
+                    rt.spawn(async move {
+                        let songs = db_c.search_cached_songs(query.clone(), capped_limit).await;
+                        if gen_ref.load(Ordering::Acquire) != search_gen {
+                            return;
+                        }
+                        events_c.emit(BackendEvent::LibrarySearchResults { query, songs });
+                    });
+                }
+                BackendCommand::CreatePlaylist {
+                    name,
+                    description,
+                    initial_songs,
+                } => {
+                    let trimmed = name.trim().to_owned();
+                    if trimmed.is_empty() {
+                        events.emit(BackendEvent::ErrorNotice(
+                            "Playlist name cannot be empty.".to_owned(),
+                        ));
+                        continue;
+                    }
+                    let now = unix_now_ms();
+                    let pl_id = format!("local_pl:{now}");
+                    let thumb = initial_songs.first().and_then(song_thumbnail_url);
+                    let track_count = initial_songs.len();
+                    let playlist = LocalPlaylist {
+                        id: pl_id,
+                        title: trimmed.clone(),
+                        description: description.trim().to_owned(),
+                        thumbnail_url: thumb,
+                        source: "local".to_owned(),
+                        created_at: now,
+                        updated_at: now,
+                    };
+                    let db_c = db_worker.clone();
+                    let itx = internal_tx.clone();
+                    let events_c = events.clone();
+                    rt.spawn(async move {
+                        match db_c.create_playlist(playlist, initial_songs).await {
+                            Ok(lib) => {
+                                let _ = itx.send(InternalMsg::LibraryCached(lib.clone())).await;
+                                events_c.emit(BackendEvent::LibraryLoaded(lib));
+                                let msg = if track_count > 0 {
+                                    format!("Created playlist \"{trimmed}\" ({track_count} tracks)")
+                                } else {
+                                    format!("Created playlist \"{trimmed}\"")
+                                };
+                                events_c.emit(BackendEvent::StatusNotice(msg));
+                            }
+                            Err(err) => events_c.emit(BackendEvent::ErrorNotice(err)),
+                        }
+                    });
+                }
+                BackendCommand::SaveQueueAsPlaylist { name } => {
+                    let trimmed = name.trim().to_owned();
+                    let queue_songs = queue.items().to_vec();
+                    if queue_songs.is_empty() {
+                        events.emit(BackendEvent::ErrorNotice(
+                            "Cannot save an empty queue as a playlist.".to_owned(),
+                        ));
+                        continue;
+                    }
+                    let final_name = if trimmed.is_empty() {
+                        "Queue Snapshot".to_owned()
+                    } else {
+                        trimmed
+                    };
+                    let now = unix_now_ms();
+                    let pl_id = format!("local_pl:{now}");
+                    let thumb = queue_songs.first().and_then(song_thumbnail_url);
+                    let count = queue_songs.len();
+                    let playlist = LocalPlaylist {
+                        id: pl_id,
+                        title: final_name.clone(),
+                        description: format!("Saved from queue ({count} tracks)"),
+                        thumbnail_url: thumb,
+                        source: "local".to_owned(),
+                        created_at: now,
+                        updated_at: now,
+                    };
+                    let db_c = db_worker.clone();
+                    let itx = internal_tx.clone();
+                    let events_c = events.clone();
+                    rt.spawn(async move {
+                        match db_c.create_playlist(playlist, queue_songs).await {
+                            Ok(lib) => {
+                                let _ = itx.send(InternalMsg::LibraryCached(lib.clone())).await;
+                                events_c.emit(BackendEvent::LibraryLoaded(lib));
+                                events_c.emit(BackendEvent::StatusNotice(format!(
+                                    "Saved queue as \"{final_name}\" ({count} tracks)"
+                                )));
+                            }
+                            Err(err) => events_c.emit(BackendEvent::ErrorNotice(err)),
+                        }
+                    });
+                }
+                BackendCommand::RenamePlaylist {
+                    playlist_id,
+                    new_name,
+                } => {
+                    let trimmed = new_name.trim().to_owned();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let db_c = db_worker.clone();
+                    let itx = internal_tx.clone();
+                    let events_c = events.clone();
+                    rt.spawn(async move {
+                        match db_c.rename_playlist(playlist_id, trimmed.clone()).await {
+                            Ok((updated, lib)) => {
+                                let _ = itx.send(InternalMsg::LibraryCached(lib.clone())).await;
+                                events_c.emit(BackendEvent::LibraryLoaded(lib));
+                                if updated {
+                                    events_c.emit(BackendEvent::StatusNotice(format!(
+                                        "Renamed playlist to \"{trimmed}\""
+                                    )));
+                                }
+                            }
+                            Err(err) => events_c.emit(BackendEvent::ErrorNotice(err)),
+                        }
+                    });
+                }
+                BackendCommand::DeletePlaylist { playlist_id } => {
+                    let db_c = db_worker.clone();
+                    let itx = internal_tx.clone();
+                    let events_c = events.clone();
+                    rt.spawn(async move {
+                        match db_c.delete_playlist(playlist_id).await {
+                            Ok(lib) => {
+                                let _ = itx.send(InternalMsg::LibraryCached(lib.clone())).await;
+                                events_c.emit(BackendEvent::LibraryLoaded(lib));
+                                events_c.emit(BackendEvent::StatusNotice(
+                                    "Deleted local playlist".to_owned(),
+                                ));
+                            }
+                            Err(err) => events_c.emit(BackendEvent::ErrorNotice(err)),
+                        }
+                    });
+                }
+                BackendCommand::AddSongToPlaylist { playlist_id, song } => {
+                    let title = song.title.clone();
+                    let db_c = db_worker.clone();
+                    let itx = internal_tx.clone();
+                    let events_c = events.clone();
+                    rt.spawn(async move {
+                        match db_c
+                            .add_song_to_playlist(playlist_id.clone(), *song)
+                            .await
+                        {
+                            Ok((added, songs, lib)) => {
+                                let _ = itx.send(InternalMsg::LibraryCached(lib.clone())).await;
+                                events_c.emit(BackendEvent::LibraryLoaded(lib));
+                                events_c.emit(BackendEvent::PlaylistSongsLoaded {
+                                    playlist_id,
+                                    songs,
+                                });
+                                let msg = if added {
+                                    format!("Added \"{title}\" to playlist")
+                                } else {
+                                    format!("\"{title}\" is already in this playlist")
+                                };
+                                events_c.emit(BackendEvent::StatusNotice(msg));
+                            }
+                            Err(err) => events_c.emit(BackendEvent::ErrorNotice(err)),
+                        }
+                    });
+                }
+                BackendCommand::RemoveSongFromPlaylist {
+                    playlist_id,
+                    video_id,
+                } => {
+                    let db_c = db_worker.clone();
+                    let itx = internal_tx.clone();
+                    let events_c = events.clone();
+                    rt.spawn(async move {
+                        match db_c
+                            .remove_song_from_playlist(playlist_id.clone(), video_id)
+                            .await
+                        {
+                            Ok((_removed, songs, lib)) => {
+                                let _ = itx.send(InternalMsg::LibraryCached(lib.clone())).await;
+                                events_c.emit(BackendEvent::LibraryLoaded(lib));
+                                events_c.emit(BackendEvent::PlaylistSongsLoaded {
+                                    playlist_id,
+                                    songs,
+                                });
+                            }
+                            Err(err) => events_c.emit(BackendEvent::ErrorNotice(err)),
+                        }
+                    });
+                }
+                BackendCommand::ReorderPlaylistTrack {
+                    playlist_id,
+                    from_idx,
+                    to_idx,
+                } => {
+                    let db_c = db_worker.clone();
+                    let itx = internal_tx.clone();
+                    let events_c = events.clone();
+                    rt.spawn(async move {
+                        match db_c
+                            .reorder_playlist_track(playlist_id.clone(), from_idx, to_idx)
+                            .await
+                        {
+                            Ok((_moved, songs, lib)) => {
+                                let _ = itx.send(InternalMsg::LibraryCached(lib.clone())).await;
+                                events_c.emit(BackendEvent::LibraryLoaded(lib));
+                                events_c.emit(BackendEvent::PlaylistSongsLoaded {
+                                    playlist_id,
+                                    songs,
+                                });
+                            }
+                            Err(err) => events_c.emit(BackendEvent::ErrorNotice(err)),
+                        }
+                    });
+                }
+                BackendCommand::LoadPlaylistSongs { playlist_id } => {
+                    let db_c = db_worker.clone();
+                    let events_c = events.clone();
+                    rt.spawn(async move {
+                        let songs = db_c.playlist_songs(playlist_id.clone()).await;
+                        events_c.emit(BackendEvent::PlaylistSongsLoaded { playlist_id, songs });
+                    });
+                }
+                BackendCommand::DownloadSong(song) => {
+                    let song = *song;
+                    if active_downloads.contains_key(&song.video_id) {
+                        events.emit(BackendEvent::StatusNotice(format!(
+                            "\"{}\" is already downloading",
+                            song.title
+                        )));
+                        continue;
+                    }
+                    let cancel_tok = StreamCancelToken::new();
+                    let initial = DownloadProgress {
+                        video_id: song.video_id.clone(),
+                        title: song.title.clone(),
+                        artist: song.artist.clone(),
+                        status: DownloadStatus::Queued,
+                        bytes_downloaded: 0,
+                        total_bytes: None,
+                        progress: 0.0,
+                    };
+                    active_downloads.insert(
+                        song.video_id.clone(),
+                        DownloadTaskEntry {
+                            cancel: cancel_tok.clone(),
+                            progress: initial.clone(),
+                        },
+                    );
+                    events.emit(BackendEvent::DownloadProgressUpdated(initial));
+                    spawn_download_song(
+                        &rt,
+                        Arc::clone(&download_sem),
+                        Arc::clone(&http_arc),
+                        Arc::clone(&resolver),
+                        db_worker.clone(),
+                        paths.active_downloads_dir(settings.export_downloads).to_path_buf(),
+                        settings.download_quality.max_kbps(),
+                        song,
+                        cancel_tok,
+                        internal_tx.clone(),
+                        events.clone(),
+                    );
+                }
+                BackendCommand::CancelDownload(video_id) => {
+                    if let Some(entry) = active_downloads.remove(&video_id) {
+                        entry.cancel.cancel();
+                        events.emit(BackendEvent::DownloadRemoved(video_id));
+                        events.emit(BackendEvent::StatusNotice("Download cancelled".to_owned()));
+                    }
+                }
+                BackendCommand::DeleteDownload(video_id) => {
+                    if let Some(entry) = active_downloads.remove(&video_id) {
+                        entry.cancel.cancel();
+                    }
+                    let db_c = db_worker.clone();
+                    let itx = internal_tx.clone();
+                    let events_c = events.clone();
+                    rt.spawn(async move {
+                        match db_c.delete_download(video_id.clone()).await {
+                            Ok((prev_meta, lib)) => {
+                                if let Some(meta) = prev_meta
+                                    && let Some(path) = local_path_from_uri(&meta.uri)
+                                {
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        let _ = DownloadStore::delete(&path);
+                                    })
+                                    .await;
+                                }
+                                let _ = itx.send(InternalMsg::LibraryCached(lib.clone())).await;
+                                events_c.emit(BackendEvent::LibraryLoaded(lib));
+                                events_c.emit(BackendEvent::DownloadRemoved(video_id));
+                                events_c.emit(BackendEvent::StatusNotice(
+                                    "Removed offline download".to_owned(),
+                                ));
+                            }
+                            Err(err) => events_c.emit(BackendEvent::ErrorNotice(err)),
+                        }
+                    });
                 }
                 BackendCommand::ScanLocalFolder(folder) => {
                     let db_c = db_worker.clone();
@@ -3203,6 +4146,7 @@ fn run_backend_thread(
 
             if queue.advance_to_matching_next(&active_song.video_id) {
                 emit_queue(&queue, &events);
+                session_saver.mark_dirty(Instant::now());
             }
             if snap.duration_ms > 0 {
                 let dur_text = format_duration_ms(snap.duration_ms);
@@ -3252,39 +4196,78 @@ fn run_backend_thread(
                 &db_worker,
                 &internal_tx,
             );
+            maybe_trigger_autoplay(
+                &queue,
+                settings.autoplay_enabled,
+                &mut autoplay_in_flight,
+                &autoplay_gen,
+                false,
+                &rt,
+                &yt_repo,
+                &internal_tx,
+            );
         }
 
-        // 5e. Auto-advance queue when track cleanly finishes without a preloaded standby deck.
-        if snap.state == PlaybackState::Ended
-            && loop_state.last_state == PlaybackState::Playing
-            && let Some(next_idx) = queue.next_index(true)
-            && let Some(song) = queue.jump(next_idx)
+        // 5e. Auto-advance queue when track cleanly finishes without a preloaded standby deck,
+        //     or fetch Autoplay/Radio continuation when the queue reaches its tail.
+        if snap.state == PlaybackState::Ended && loop_state.last_state == PlaybackState::Playing {
+            if let Some(next_idx) = queue.next_index(true)
+                && let Some(song) = queue.jump(next_idx)
+            {
+                error_retry.reset();
+                emit_queue(&queue, &events);
+                session_saver.mark_dirty(Instant::now());
+                lyrics_sync_state = LyricsSyncState::Loading;
+                start_async_song_load_at(
+                    &mut engine,
+                    &mut loop_state,
+                    &mut current_playing_song,
+                    &load_gen,
+                    &preload_gen,
+                    &mut active_load_cancel,
+                    &mut preload_cancel,
+                    &mut preloaded_next_song,
+                    &rt,
+                    &http_arc,
+                    &resolver,
+                    &remote_auth,
+                    &db_worker,
+                    &current_lyrics,
+                    song,
+                    0,
+                    false,
+                    &internal_tx,
+                    &events,
+                );
+                snap = engine.snapshot();
+            } else if settings.autoplay_enabled {
+                if autoplay_in_flight.is_some() {
+                    autoplay_play_on_arrival = true;
+                } else {
+                    maybe_trigger_autoplay(
+                        &queue,
+                        true,
+                        &mut autoplay_in_flight,
+                        &autoplay_gen,
+                        true,
+                        &rt,
+                        &yt_repo,
+                        &internal_tx,
+                    );
+                }
+            }
+        }
+
+        // 5f. Debounced/throttled automatic PlaybackSessionState persistence.
+        let now_loop = Instant::now();
+        let is_playing_now = snap.state == PlaybackState::Playing;
+        let current_pos_now = loop_state
+            .restored_position_ms()
+            .unwrap_or(snap.position_ms);
+        if !queue.is_empty() && session_saver.should_flush(now_loop, is_playing_now, current_pos_now)
         {
-            error_retry.reset();
-            emit_queue(&queue, &events);
-            lyrics_sync_state = LyricsSyncState::Loading;
-            start_async_song_load_at(
-                &mut engine,
-                &mut loop_state,
-                &mut current_playing_song,
-                &load_gen,
-                &preload_gen,
-                &mut active_load_cancel,
-                &mut preload_cancel,
-                &mut preloaded_next_song,
-                &rt,
-                &http_arc,
-                &resolver,
-                &remote_auth,
-                &db_worker,
-                &current_lyrics,
-                song,
-                0,
-                false,
-                &internal_tx,
-                &events,
-            );
-            snap = engine.snapshot();
+            db_worker.save_playback_session(queue.to_session_state(current_pos_now, unix_now_ms()));
+            session_saver.mark_saved(now_loop, current_pos_now);
         }
 
         if loop_state.should_publish_tick_snapshot(&snap, &error_retry) {
@@ -3465,21 +4448,429 @@ fn notify_mpris_seeked(rt: &Handle, mpris_svc: Option<&Arc<MprisService>>, posit
     }
 }
 
+fn flush_session_now(
+    queue: &QueueController,
+    loop_state: &PlaybackLoopState,
+    engine: &AudioEngine,
+    db_worker: &DbWorker,
+    session_saver: &mut SessionSaver,
+    blocking: bool,
+) {
+    if queue.is_empty() {
+        db_worker.clear_playback_session();
+        session_saver.reset();
+        return;
+    }
+    let pos_ms = loop_state
+        .restored_position_ms()
+        .unwrap_or_else(|| engine.position_ms());
+    let state = queue.to_session_state(pos_ms, unix_now_ms());
+    if blocking {
+        db_worker.save_playback_session_blocking(state);
+    } else {
+        db_worker.save_playback_session(state);
+    }
+    session_saver.mark_saved(Instant::now(), pos_ms);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_trigger_autoplay(
+    queue: &QueueController,
+    autoplay_enabled: bool,
+    autoplay_in_flight: &mut Option<String>,
+    autoplay_gen: &Arc<AtomicU64>,
+    start_if_ended: bool,
+    rt: &Handle,
+    yt_repo: &Arc<YtMusicRepository>,
+    internal_tx: &Sender<InternalMsg>,
+) {
+    if autoplay_in_flight.is_some() {
+        return;
+    }
+    let Some(seed) = queue.needs_autoplay_continuation(autoplay_enabled, 1) else {
+        return;
+    };
+    let generation = autoplay_gen.load(Ordering::Acquire);
+    *autoplay_in_flight = Some(seed.video_id.clone());
+    spawn_radio_fetch(
+        generation,
+        seed.video_id,
+        start_if_ended,
+        rt,
+        yt_repo,
+        internal_tx,
+    );
+}
+
+fn spawn_radio_fetch(
+    generation: u64,
+    seed_video_id: String,
+    start_if_ended: bool,
+    rt: &Handle,
+    yt_repo: &Arc<YtMusicRepository>,
+    internal_tx: &Sender<InternalMsg>,
+) {
+    let repo = Arc::clone(yt_repo);
+    let itx = internal_tx.clone();
+    rt.spawn(async move {
+        let songs = repo
+            .radio_queue(&seed_video_id, true, false)
+            .await
+            .unwrap_or_default();
+        let _ = itx
+            .send(InternalMsg::AutoplayFetched {
+                generation,
+                songs,
+                start_if_ended,
+            })
+            .await;
+    });
+}
+
 fn spawn_load_home(
     rt: &Handle,
     yt_repo: &Arc<YtMusicRepository>,
+    db_worker: &DbWorker,
+    force_refresh: bool,
     internal_tx: &Sender<InternalMsg>,
     events: &EventHub,
 ) {
     events.emit(BackendEvent::HomeLoading);
     let repo = Arc::clone(yt_repo);
+    let db_c = db_worker.clone();
     let itx = internal_tx.clone();
     let events_c = events.clone();
     rt.spawn(async move {
+        if !force_refresh
+            && let Some(entry) = db_c
+                .get_browse_cache(HOME_BROWSE_CACHE_KEY.to_owned())
+                .await
+            && let Ok(feed) = serde_json::from_str::<HomeFeed>(&entry.payload_json)
+        {
+            let _ = itx
+                .send(InternalMsg::HomeFetchFinished(Some(feed.clone())))
+                .await;
+            events_c.emit(BackendEvent::HomeLoaded(Ok(feed)));
+            return;
+        }
+
         let res = repo.home().await.map_err(|e| e.to_string());
+        if let Ok(ref feed) = res
+            && let Ok(payload_json) = serde_json::to_string(feed)
+        {
+            db_c.put_browse_cache(CachedBrowseEntry::with_ttl(
+                HOME_BROWSE_CACHE_KEY,
+                "home",
+                payload_json,
+                DEFAULT_BROWSE_CACHE_TTL_MS,
+            ));
+        }
         let cached = res.as_ref().ok().cloned();
         let _ = itx.send(InternalMsg::HomeFetchFinished(cached)).await;
         events_c.emit(BackendEvent::HomeLoaded(res));
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_load_detail(
+    rt: &Handle,
+    yt_repo: &Arc<YtMusicRepository>,
+    db_worker: &DbWorker,
+    browse_id: String,
+    kind: BrowseType,
+    fallback_title: String,
+    force_refresh: bool,
+    events: &EventHub,
+) {
+    events.emit(BackendEvent::DetailLoading);
+    let repo = Arc::clone(yt_repo);
+    let db_c = db_worker.clone();
+    let events_c = events.clone();
+    let (cache_key, cache_kind) = detail_browse_cache_key(kind, &browse_id);
+    rt.spawn(async move {
+        if !force_refresh
+            && let Some(entry) = db_c.get_browse_cache(cache_key.clone()).await
+            && let Ok(payload) = serde_json::from_str::<DetailPayload>(&entry.payload_json)
+        {
+            events_c.emit(BackendEvent::DetailLoaded(Ok(payload)));
+            return;
+        }
+
+        let res = if kind == BrowseType::Artist {
+            repo.artist_page(&browse_id).await.map(|page| {
+                let title = page.name.unwrap_or(fallback_title);
+                let subtitle = page
+                    .subscriber_count_text
+                    .unwrap_or_else(|| "Artist".to_owned());
+                DetailPayload {
+                    browse_id: browse_id.clone(),
+                    header: Some(BrowseHeader {
+                        title,
+                        subtitle: subtitle.clone(),
+                        thumbnail_url: page.thumbnail_url,
+                    }),
+                    songs: page.songs,
+                    subtitle,
+                }
+            })
+        } else {
+            repo.browse_songs(&browse_id, None)
+                .await
+                .map(|(header, songs, _)| {
+                    let subtitle = header
+                        .as_ref()
+                        .map(|h| h.subtitle.clone())
+                        .unwrap_or_default();
+                    DetailPayload {
+                        browse_id: browse_id.clone(),
+                        header,
+                        songs,
+                        subtitle,
+                    }
+                })
+        };
+
+        if let Ok(ref payload) = res
+            && let Ok(payload_json) = serde_json::to_string(payload)
+        {
+            db_c.put_browse_cache(CachedBrowseEntry::with_ttl(
+                cache_key,
+                cache_kind,
+                payload_json,
+                DEFAULT_BROWSE_CACHE_TTL_MS,
+            ));
+        }
+        events_c.emit(BackendEvent::DetailLoaded(res.map_err(|e| e.to_string())));
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_download_song(
+    rt: &Handle,
+    sem: Arc<tokio::sync::Semaphore>,
+    http: Arc<Client>,
+    resolver: Arc<StreamResolver>,
+    db_worker: DbWorker,
+    downloads_dir: PathBuf,
+    max_kbps: i32,
+    song: Song,
+    cancel_tok: StreamCancelToken,
+    internal_tx: Sender<InternalMsg>,
+    events: EventHub,
+) {
+    rt.spawn(async move {
+        let vid = song.video_id.clone();
+        let make_progress = |status: DownloadStatus, downloaded: u64, total: Option<u64>| {
+            let progress = match status {
+                DownloadStatus::Completed => 1.0,
+                DownloadStatus::Queued | DownloadStatus::Failed(_) => 0.0,
+                DownloadStatus::Downloading => total
+                    .filter(|&t| t > 0)
+                    .map_or(0.0, |t| (downloaded as f32 / t as f32).clamp(0.0, 1.0)),
+            };
+            DownloadProgress {
+                video_id: song.video_id.clone(),
+                title: song.title.clone(),
+                artist: song.artist.clone(),
+                status,
+                bytes_downloaded: downloaded,
+                total_bytes: total,
+                progress,
+            }
+        };
+
+        let result: Result<Option<(SavedSongMetadata, u64)>, String> = async {
+            if cancel_tok.is_cancelled() {
+                return Ok(None);
+            }
+            let Ok(_permit) = sem.acquire().await else {
+                return Err("Download queue closed".to_owned());
+            };
+            if cancel_tok.is_cancelled() {
+                return Ok(None);
+            }
+
+            if let Some(existing) = db_worker.get_download(vid.clone()).await
+                && let Some(existing_path) = resolve_offline_download_path(&existing)
+            {
+                let size = std::fs::metadata(&existing_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                return Ok(Some((existing, size)));
+            }
+            if song
+                .local_path
+                .as_deref()
+                .is_some_and(|p| Path::new(p).is_file())
+            {
+                return Err("Track is already stored locally on disk.".to_owned());
+            }
+
+            let capped_kbps = u32::try_from(max_kbps).unwrap_or(u32::MAX);
+            let req = ResolveRequest::for_playback(&song.video_id, capped_kbps);
+            let stream = resolver.resolve(req).await.map_err(|e| e.to_string())?;
+            if cancel_tok.is_cancelled() {
+                return Ok(None);
+            }
+            if stream.is_live_hls {
+                return Err("Live HLS streams cannot be saved offline.".to_owned());
+            }
+
+            let mut http_req = http.get(&stream.url);
+            for (k, v) in &stream.media_headers {
+                http_req = http_req.header(k, v);
+            }
+            let mut resp = http_req.send().await.map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("Download HTTP {}", resp.status().as_u16()));
+            }
+            let content_type = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_owned();
+            let total_bytes = resp.content_length().or(stream.content_length);
+
+            let first_chunk = match resp.chunk().await.map_err(|e| e.to_string())? {
+                Some(chunk) if !chunk.is_empty() => chunk,
+                _ => return Err("Download stream returned empty body.".to_owned()),
+            };
+            if cancel_tok.is_cancelled() {
+                return Ok(None);
+            }
+
+            let ext = match sniff(&first_chunk, &content_type, Some(&stream.ext), total_bytes) {
+                Some(Probe::Manifest { .. }) => {
+                    return Err("Manifest streams cannot be downloaded directly.".to_owned());
+                }
+                Some(Probe::File { container, .. }) => container.extension().to_owned(),
+                None if !stream.ext.trim().is_empty() => stream.ext.trim().to_ascii_lowercase(),
+                None => "webm".to_owned(),
+            };
+
+            let store = DownloadStore::new(&downloads_dir);
+            let file_name = DownloadStore::file_name_for(&song, &ext);
+            let pending = store.begin(&file_name).map_err(|e| e.to_string())?;
+            let mut writer = pending.open_writer().map_err(|e| e.to_string())?;
+            writer.write_all(&first_chunk).map_err(|e| e.to_string())?;
+
+            let mut downloaded = first_chunk.len() as u64;
+            let mut last_emit = Instant::now();
+            let mut last_emit_bytes = downloaded;
+            let _ = internal_tx
+                .send(InternalMsg::DownloadProgressChanged(make_progress(
+                    DownloadStatus::Downloading,
+                    downloaded,
+                    total_bytes,
+                )))
+                .await;
+
+            while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+                if cancel_tok.is_cancelled() {
+                    drop(writer);
+                    pending.abort();
+                    return Ok(None);
+                }
+                if chunk.is_empty() {
+                    continue;
+                }
+                writer.write_all(&chunk).map_err(|e| e.to_string())?;
+                downloaded = downloaded.saturating_add(chunk.len() as u64);
+                if last_emit.elapsed() >= Duration::from_millis(120)
+                    || downloaded.saturating_sub(last_emit_bytes) >= 64 * 1024
+                {
+                    last_emit = Instant::now();
+                    last_emit_bytes = downloaded;
+                    let _ = internal_tx
+                        .send(InternalMsg::DownloadProgressChanged(make_progress(
+                            DownloadStatus::Downloading,
+                            downloaded,
+                            total_bytes,
+                        )))
+                        .await;
+                }
+            }
+
+            if cancel_tok.is_cancelled() {
+                drop(writer);
+                pending.abort();
+                return Ok(None);
+            }
+            writer.flush().map_err(|e| e.to_string())?;
+            drop(writer);
+
+            let final_path = pending.commit().map_err(|e| e.to_string())?;
+            let dur_secs = stream
+                .duration_ms
+                .or_else(|| {
+                    let ms = duration_millis(song.duration_text.as_deref());
+                    (ms > 0).then_some(ms)
+                })
+                .map(|ms| ms / 1_000);
+            let kbps = if stream.kbps > 0 {
+                stream.kbps as i32
+            } else {
+                estimated_kbps(Some(downloaded), dur_secs).unwrap_or(0) as i32
+            };
+            let badge = youtube_download_badge(&ext, kbps);
+            let meta = SavedSongMetadata {
+                video_id: song.video_id.clone(),
+                title: song.title.clone(),
+                artist: song.artist.clone(),
+                thumbnail_url: song_thumbnail_url(&song),
+                duration_text: song
+                    .duration_text
+                    .clone()
+                    .or_else(|| stream.duration_ms.map(format_duration_ms)),
+                album_name: song.album_name.clone(),
+                uri: format!("file://{}", final_path.display()),
+                download_format: badge,
+                date_added_seconds: Some(unix_now_ms() / 1_000),
+            };
+            let lib = db_worker.upsert_download(meta.clone()).await?;
+            let _ = internal_tx
+                .send(InternalMsg::LibraryCached(lib.clone()))
+                .await;
+            events.emit(BackendEvent::LibraryLoaded(lib));
+            Ok(Some((meta, downloaded)))
+        }
+        .await;
+
+        match result {
+            Ok(Some((_meta, total_saved))) => {
+                let _ = internal_tx
+                    .send(InternalMsg::DownloadProgressChanged(make_progress(
+                        DownloadStatus::Completed,
+                        total_saved,
+                        (total_saved > 0).then_some(total_saved),
+                    )))
+                    .await;
+                events.emit(BackendEvent::StatusNotice(format!(
+                    "Downloaded \"{}\" for offline playback",
+                    song.title
+                )));
+            }
+            Ok(None) => {
+                // Cancelled cleanly; CancelDownload already notified UI.
+            }
+            Err(err) => {
+                let _ = internal_tx
+                    .send(InternalMsg::DownloadProgressChanged(make_progress(
+                        DownloadStatus::Failed(err.clone()),
+                        0,
+                        None,
+                    )))
+                    .await;
+                events.emit(BackendEvent::ErrorNotice(format!(
+                    "Download failed for \"{}\": {err}",
+                    song.title
+                )));
+            }
+        }
+        let _ = internal_tx
+            .send(InternalMsg::DownloadTaskFinished { video_id: vid })
+            .await;
     });
 }
 
@@ -3819,6 +5210,12 @@ fn local_path_from_uri(uri: &str) -> Option<PathBuf> {
     Some(PathBuf::from(path_str))
 }
 
+/// Resolves an existing local file path for a persisted offline download entry so
+/// playback always prefers the local offline copy over network streaming.
+fn resolve_offline_download_path(meta: &SavedSongMetadata) -> Option<PathBuf> {
+    local_path_from_uri(&meta.uri).filter(|p| p.is_file())
+}
+
 fn parse_url_expire_ms(url: &str) -> Option<i64> {
     let (_, query) = url.split_once('?')?;
     for pair in query.split('&') {
@@ -3934,9 +5331,7 @@ async fn prepare_track_decoder(
         if song.thumbnail_url.as_deref().is_none_or(str::is_empty) {
             song.thumbnail_url = dl.thumbnail_url.clone();
         }
-        if let Some(dl_path) = local_path_from_uri(&dl.uri)
-            && dl_path.is_file()
-        {
+        if let Some(dl_path) = resolve_offline_download_path(&dl) {
             return open_local_prepared(song, dl_path, "Offline", load_gen, generation, cancel_tok)
                 .await
                 .map_err(map_err);
@@ -4795,6 +6190,9 @@ mod tests {
             automix_mode: AutomixMode::Off,
             automix_phrase_bars: 0,
             discord_rpc_enabled: false,
+            sidebar_collapsed: false,
+            autoplay_enabled: true,
+            active_downloads: Vec::new(),
         };
 
         let (hub, rx) = EventHub::new(16);
@@ -4898,6 +6296,7 @@ mod tests {
             last_song_vid: Some(songs[0].video_id.clone()),
             last_published_pos_ms: 52_000,
             in_flight: None,
+            restored_paused: None,
         };
 
         // Simulate `start_async_song_load_at` stopping the old track and emitting Buffering
@@ -4943,6 +6342,7 @@ mod tests {
             last_song_vid: Some(song.video_id.clone()),
             last_published_pos_ms: 45_000,
             in_flight: None,
+            restored_paused: None,
         };
         let mut retry = PlaybackErrorRetry::default();
         let t0 = Instant::now();
@@ -5235,5 +6635,310 @@ mod tests {
 
         db.shutdown_blocking();
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn queue_reorder_and_autoplay_boundary_stay_accurate() {
+        let mut q = QueueController::default();
+        let ctx_songs = sample_songs(2); // vid_0, vid_1
+        q.play_context(&ctx_songs, 0, &test_source(), 11);
+        assert_eq!(q.autoplay_start_index(), None);
+
+        // Append autoplay recommendations (with duplicate vid_1 that must be skipped).
+        let recs = vec![
+            Song::new("vid_1", "Dup", "Artist", None),
+            Song::new("auto_0", "Auto 0", "Artist", None),
+            Song::new("auto_1", "Auto 1", "Artist", None),
+        ];
+        assert_eq!(q.append_autoplay(recs), 2);
+        assert_eq!(q.autoplay_start_index(), Some(2));
+        assert_eq!(q.items().len(), 4);
+        assert_eq!(q.items()[2].queue_tier, bitchord_model::QueueTier::Autoplay);
+
+        // Promote auto_0 (idx 2) above boundary to idx 1 -> becomes UserQueue, boundary shifts to 3.
+        assert!(q.reorder(2, 1));
+        assert_eq!(q.items()[1].video_id, "auto_0");
+        assert_eq!(q.items()[1].queue_tier, bitchord_model::QueueTier::UserQueue);
+        assert_eq!(q.autoplay_start_index(), Some(3));
+        assert_eq!(q.current_index(), Some(0));
+
+        // Move active track (idx 0) down to idx 2 -> current_index tracks it to 2.
+        assert!(q.reorder(0, 2));
+        assert_eq!(q.current_index(), Some(2));
+        assert_eq!(q.current_song().map(|s| s.video_id.as_str()), Some("vid_0"));
+        assert_eq!(q.autoplay_start_index(), Some(3));
+
+        // Moving a non-autoplay item past the autoplay boundary shifts boundary left by 1.
+        assert!(q.reorder(2, 3));
+        assert_eq!(q.current_index(), Some(3));
+        assert_eq!(q.autoplay_start_index(), Some(2));
+
+        // Out-of-bounds or no-op reorder safely returns false.
+        assert!(!q.reorder(1, 1));
+        assert!(!q.reorder(0, 99));
+
+        // Autoplay continuation triggers near tail only when repeat is off and seed is YouTube ID.
+        assert!(q.needs_autoplay_continuation(true, 1).is_some());
+        assert!(q.needs_autoplay_continuation(false, 1).is_none());
+        q.cycle_repeat(); // repeat_all -> suppresses autoplay
+        assert!(q.needs_autoplay_continuation(true, 1).is_none());
+    }
+
+    #[test]
+    fn playback_session_save_restore_paused_and_session_saver_debounce() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test tokio runtime");
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "myusic_session_v5_test_{}_{}",
+            std::process::id(),
+            unix_now_ms()
+        ));
+        let db = DbWorker::start(tmp_dir.join("library.db"));
+
+        // 1. Build a queue with autoplay section, repeat_all, and save blocking.
+        let mut q = QueueController::default();
+        let mut s0 = Song::new("vid_a", "Song A", "Artist", None);
+        s0.duration_text = Some("3:30".to_owned());
+        let mut s1 = Song::new("vid_b", "Song B", "Artist", None);
+        s1.duration_text = Some("4:00".to_owned());
+        q.play_context(&[s0, s1], 1, &test_source(), 5);
+        q.append_autoplay(vec![Song::new("vid_c", "Song C", "Artist", None)]);
+        q.cycle_repeat(); // repeat_all
+
+        let saved = q.to_session_state(77_500, 1_700_000_000_000);
+        db.save_playback_session_blocking(saved.clone());
+
+        // 2. Restore on next startup -> queue restored & PlaybackLoopState projects Paused.
+        let loaded = db
+            .load_playback_session_blocking()
+            .expect("persisted session");
+        assert_eq!(loaded.position_ms, 77_500);
+        assert_eq!(loaded.repeat_mode, "all");
+        assert_eq!(loaded.autoplay_start_index, Some(2));
+
+        let mut restored_q = QueueController::default();
+        let restored_song = restored_q.restore_session(loaded).expect("restored song");
+        assert_eq!(restored_song.video_id, "vid_b");
+        assert_eq!(restored_q.current_index(), Some(1));
+        assert!(restored_q.repeat_all());
+        assert_eq!(restored_q.autoplay_start_index(), Some(2));
+
+        let engine = AudioEngine::with_null_sink();
+        let retry = PlaybackErrorRetry::default();
+        let mut loop_state = PlaybackLoopState::default();
+        loop_state.set_restored_paused(restored_song.clone(), 77_500, 240_000);
+
+        let stopped_snap = engine.snapshot();
+        assert!(!loop_state.should_publish_tick_snapshot(&stopped_snap, &retry));
+        let projected = loop_state.effective_snapshot(stopped_snap, &retry, Some(&restored_song));
+        assert_eq!(projected.state, PlaybackState::Paused);
+        assert_eq!(projected.position_ms, 77_500);
+        assert_eq!(
+            projected.current_song.as_ref().map(|s| s.video_id.as_str()),
+            Some("vid_b")
+        );
+
+        // Seeking while still restored-paused updates position cleanly without opening audio.
+        assert_eq!(loop_state.seek_restored_paused(90_000), Some(90_000));
+        let taken = loop_state.take_restored_paused().expect("take restored");
+        assert_eq!(taken.position_ms, 90_000);
+
+        // 3. Verify SessionSaver debounce and periodic playing throttle.
+        let mut saver = SessionSaver::default();
+        let t0 = Instant::now();
+        saver.mark_dirty(t0);
+        assert!(!saver.should_flush(t0 + Duration::from_millis(200), false, 0));
+        assert!(saver.should_flush(t0 + Duration::from_millis(650), false, 0));
+        saver.mark_saved(t0 + Duration::from_millis(650), 10_000);
+        assert!(!saver.should_flush(t0 + Duration::from_secs(2), true, 12_000));
+        assert!(saver.should_flush(t0 + Duration::from_secs(6), true, 15_000));
+
+        // 4. Clearing session removes the persisted row.
+        db.clear_playback_session();
+        rt.block_on(async {
+            assert!(db.load_playback_session().await.is_none());
+        });
+
+        db.shutdown_blocking();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn db_worker_playlists_crud_fts5_search_browse_cache_and_offline_download_preference() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test tokio runtime");
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "myusic_phase3_worker_test_{}_{}",
+            std::process::id(),
+            unix_now_ms()
+        ));
+        let db = DbWorker::start(tmp_dir.join("library.db"));
+
+        rt.block_on(async {
+            let s1 = Song::new("yt_starboy", "Starboy", "The Weeknd", None);
+            let s2 = Song::new("yt_night", "Nightcall", "Kavinsky", None);
+            let s3 = Song::new("yt_instant", "Instant Crush", "Daft Punk", None);
+
+            // 1. Local playlist CRUD: create -> add -> reorder -> rename -> remove -> delete.
+            let pl = LocalPlaylist {
+                id: "local_pl:1".to_owned(),
+                title: "Synthwave Mix".to_owned(),
+                description: "Night drive".to_owned(),
+                thumbnail_url: None,
+                source: "local".to_owned(),
+                created_at: 100,
+                updated_at: 100,
+            };
+            let snap = db
+                .create_playlist(pl, vec![s1.clone(), s2.clone()])
+                .await
+                .expect("create playlist");
+            assert_eq!(snap.playlist_summaries.len(), 1);
+            assert_eq!(snap.playlist_summaries[0].1, 2);
+
+            let (added, songs_after_add, snap2) = db
+                .add_song_to_playlist("local_pl:1".to_owned(), s3.clone())
+                .await
+                .expect("add song");
+            assert!(added);
+            assert_eq!(songs_after_add.len(), 3);
+            assert_eq!(snap2.playlist_summaries[0].1, 3);
+
+            let (moved, songs_reordered, _) = db
+                .reorder_playlist_track("local_pl:1".to_owned(), 2, 0)
+                .await
+                .expect("reorder playlist");
+            assert!(moved);
+            assert_eq!(songs_reordered[0].video_id, "yt_instant");
+
+            let (renamed, snap3) = db
+                .rename_playlist("local_pl:1".to_owned(), "Midnight Drive".to_owned())
+                .await
+                .expect("rename");
+            assert!(renamed);
+            assert_eq!(snap3.playlist_summaries[0].0.title, "Midnight Drive");
+
+            let (removed, songs_after_rm, _) = db
+                .remove_song_from_playlist("local_pl:1".to_owned(), "yt_night".to_owned())
+                .await
+                .expect("remove song");
+            assert!(removed);
+            assert_eq!(songs_after_rm.len(), 2);
+
+            // 2. Instant FTS5 library search (prefix & special char safe).
+            let hits = db.search_cached_songs("week".to_owned(), 20).await;
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].video_id, "yt_starboy");
+            let special_hits = db.search_cached_songs("\"daft\" -punk".to_owned(), 20).await;
+            assert_eq!(special_hits.len(), 1);
+            assert_eq!(special_hits[0].video_id, "yt_instant");
+            let no_err_hits = db
+                .search_cached_songs("OR NOT \"*\" (---)".to_owned(), 20)
+                .await;
+            assert!(no_err_hits.is_empty());
+
+            // 3. Browse cache TTL hit/miss round trip for DetailPayload & HomeFeed.
+            let (detail_key, detail_kind) =
+                detail_browse_cache_key(BrowseType::Album, "MPREb_test");
+            let detail = DetailPayload {
+                browse_id: "MPREb_test".to_owned(),
+                header: Some(BrowseHeader {
+                    title: "OutRun".to_owned(),
+                    subtitle: "Album".to_owned(),
+                    thumbnail_url: None,
+                }),
+                songs: vec![s2.clone()],
+                subtitle: "Album".to_owned(),
+            };
+            db.put_browse_cache(CachedBrowseEntry::with_ttl(
+                detail_key.clone(),
+                detail_kind,
+                serde_json::to_string(&detail).expect("serialize detail"),
+                DEFAULT_BROWSE_CACHE_TTL_MS,
+            ));
+            let hit = db
+                .get_browse_cache(detail_key)
+                .await
+                .expect("browse cache hit");
+            let decoded: DetailPayload =
+                serde_json::from_str(&hit.payload_json).expect("decode detail");
+            assert_eq!(decoded.songs.len(), 1);
+            assert_eq!(decoded.songs[0].video_id, "yt_night");
+
+            // 4. Offline download store + DB record + offline playback path preference.
+            let dl_dir = tmp_dir.join("downloads");
+            let store = DownloadStore::new(&dl_dir);
+            let fname = DownloadStore::file_name_for(&s1, "webm");
+            let pending = store.begin(&fname).expect("begin download");
+            {
+                let mut w = pending.open_writer().expect("writer");
+                w.write_all(&[0x1A, 0x45, 0xDF, 0xA3, 0x01, 0x02])
+                    .expect("write");
+            }
+            let committed = pending.commit().expect("commit");
+            let dl_meta = SavedSongMetadata {
+                video_id: s1.video_id.clone(),
+                title: s1.title.clone(),
+                artist: s1.artist.clone(),
+                thumbnail_url: None,
+                duration_text: Some("3:50".to_owned()),
+                album_name: None,
+                uri: format!("file://{}", committed.display()),
+                download_format: Some("OPUS · 160 kbps".to_owned()),
+                date_added_seconds: Some(1_700_000_000),
+            };
+            let lib_with_dl = db.upsert_download(dl_meta).await.expect("upsert download");
+            assert_eq!(lib_with_dl.downloads.len(), 1);
+
+            let fetched_dl = db
+                .get_download("yt_starboy".to_owned())
+                .await
+                .expect("download hit");
+            assert_eq!(
+                resolve_offline_download_path(&fetched_dl),
+                Some(committed.clone())
+            );
+
+            let (prev_dl, lib_after_del) = db
+                .delete_download("yt_starboy".to_owned())
+                .await
+                .expect("delete download");
+            assert!(prev_dl.is_some());
+            assert!(lib_after_del.downloads.is_empty());
+            assert!(DownloadStore::delete(&committed).expect("delete file"));
+            assert_eq!(resolve_offline_download_path(&fetched_dl), None);
+
+            // Clean up playlist delete check.
+            let lib_after_pl_del = db
+                .delete_playlist("local_pl:1".to_owned())
+                .await
+                .expect("delete playlist");
+            assert!(lib_after_pl_del.playlist_summaries.is_empty());
+        });
+
+        db.shutdown_blocking();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn eq_bands_from_settings_clamps_and_adapts_variable_length_vectors() {
+        let legacy_10 = vec![20.0, -20.0, 3.5, 0.0, 1.0, 2.0, -1.5, 4.0, 5.0, 6.0];
+        let adapted = eq_bands_from_settings(&legacy_10);
+        assert_eq!(adapted.len(), EqLayout::MANUAL_COUNT);
+        assert_eq!(adapted[0], EqLayout::MANUAL_RANGE_DB);
+        assert_eq!(adapted[1], -EqLayout::MANUAL_RANGE_DB);
+        assert_eq!(adapted[2], 3.5);
+        assert_eq!(adapted[6], -1.5);
+
+        let short = vec![2.5];
+        let padded = eq_bands_from_settings(&short);
+        assert_eq!(padded[0], 2.5);
+        assert_eq!(padded[1], 0.0);
     }
 }
