@@ -5,7 +5,7 @@
 //! Links system `libsqlite3` (`rusqlite 0.43`) with WAL mode, busy timeout,
 //! and explicit `PRAGMA user_version` schema migrations.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,10 +18,13 @@ use thiserror::Error;
 
 use crate::downloads::{SavedCollection, SavedSongMetadata};
 
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 const MAX_SEARCH_HISTORY: usize = 20;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
 const CACHE_SIZE_KIB: i64 = -16_000;
+
+/// Default disk budget (128 MiB) for LRU pruning of the `artwork_index` table.
+pub const DEFAULT_ARTWORK_CACHE_MAX_BYTES: i64 = 128 * 1024 * 1024;
 
 /// Default TTL (4 hours) for cached stream URLs when callers do not derive an
 /// explicit `expire` timestamp from the URL.
@@ -115,6 +118,162 @@ pub struct CachedLyrics {
     pub not_found: bool,
     pub fetched_at: i64,
     pub expires_at: i64,
+}
+
+/// Persistent SQLite index row for a disk-cached artwork thumbnail.
+///
+/// Timestamps (`last_accessed_ms`, `created_at_ms`) are Unix epoch milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtworkIndexEntry {
+    pub cache_key: String,
+    pub tier: i32,
+    pub file_path: String,
+    pub byte_size: i64,
+    pub last_accessed_ms: i64,
+    pub created_at_ms: i64,
+}
+
+/// Rich search history entry including optional v4 track/album metadata
+/// (`album`, `duration_text`, `duration_ms`) alongside the base
+/// [`SearchHistoryEntity`] fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHistoryRecord {
+    pub id: String,
+    pub title: String,
+    pub subtitle: String,
+    pub artwork_url: Option<String>,
+    pub entity_type: EntityType,
+    pub timestamp: i64,
+    #[serde(default)]
+    pub album: Option<String>,
+    #[serde(default)]
+    pub duration_text: Option<String>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+}
+
+impl SearchHistoryRecord {
+    /// Wraps an existing [`SearchHistoryEntity`] with empty optional metadata.
+    pub fn from_entity(entity: SearchHistoryEntity) -> Self {
+        Self {
+            id: entity.id,
+            title: entity.title,
+            subtitle: entity.subtitle,
+            artwork_url: entity.artwork_url,
+            entity_type: entity.entity_type,
+            timestamp: entity.timestamp,
+            album: None,
+            duration_text: None,
+            duration_ms: None,
+        }
+    }
+
+    /// Builds a rich track history record directly from a [`Song`].
+    pub fn from_song(song: &Song, timestamp: i64) -> Self {
+        let duration_ms = {
+            let ms = song.duration_millis();
+            (ms > 0).then_some(ms)
+        };
+        let duration_text = song
+            .duration_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| duration_ms.map(format_duration_ms));
+        let album = song
+            .album_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        Self {
+            id: song.video_id.clone(),
+            title: song.title.clone(),
+            subtitle: song.artist.clone(),
+            artwork_url: song.thumbnail_url.clone(),
+            entity_type: EntityType::Track,
+            timestamp,
+            album,
+            duration_text,
+            duration_ms,
+        }
+    }
+
+    /// Attaches optional album and duration metadata using a builder style.
+    pub fn with_metadata(
+        mut self,
+        album: Option<String>,
+        duration_text: Option<String>,
+        duration_ms: Option<u64>,
+    ) -> Self {
+        self.album = album;
+        self.duration_text = duration_text;
+        self.duration_ms = duration_ms;
+        self
+    }
+
+    /// Repairs legacy history rows that filed `MPSPP*` podcast browse ids as `Track`.
+    pub fn with_corrected_type(mut self) -> Self {
+        if self.entity_type == EntityType::Track && self.id.starts_with("MPSPP") {
+            self.entity_type = EntityType::Other;
+        }
+        self
+    }
+
+    /// Returns `true` if this entry represents a raw search query (`q:<term>`).
+    pub fn is_query(&self) -> bool {
+        self.id
+            .get(..2)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("q:"))
+    }
+
+    /// Projects this record down to the base [`SearchHistoryEntity`].
+    pub fn to_entity(&self) -> SearchHistoryEntity {
+        SearchHistoryEntity {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            subtitle: self.subtitle.clone(),
+            artwork_url: self.artwork_url.clone(),
+            entity_type: self.entity_type,
+            timestamp: self.timestamp,
+        }
+        .with_corrected_type()
+    }
+
+    /// Converts playable track entries into a [`Song`] enriched with stored album/duration.
+    pub fn to_song(&self) -> Option<Song> {
+        if self.entity_type == EntityType::Track && !self.is_query() {
+            let mut song = Song::new(
+                self.id.clone(),
+                self.title.clone(),
+                self.subtitle.clone(),
+                self.artwork_url.clone(),
+            );
+            song.album_name = self.album.clone();
+            song.duration_text = self
+                .duration_text
+                .clone()
+                .or_else(|| self.duration_ms.filter(|&ms| ms > 0).map(format_duration_ms));
+            Some(song)
+        } else {
+            None
+        }
+    }
+}
+
+impl From<SearchHistoryEntity> for SearchHistoryRecord {
+    fn from(entity: SearchHistoryEntity) -> Self {
+        Self::from_entity(entity)
+    }
+}
+
+impl From<SearchHistoryRecord> for SearchHistoryEntity {
+    fn from(record: SearchHistoryRecord) -> Self {
+        record.to_entity()
+    }
 }
 
 /// High-level row counts for CLI diagnostics and settings storage summary.
@@ -369,6 +528,44 @@ impl LibraryDb {
                     ON lyrics_cache (expires_at);
                 "#,
             )?;
+            tx.pragma_update(None, "user_version", 3)?;
+            tx.commit()?;
+        }
+        if version < 4 {
+            let tx = self.conn.unchecked_transaction()?;
+            if !table_has_column(&tx, "search_history", "album")? {
+                tx.execute_batch("ALTER TABLE search_history ADD COLUMN album TEXT;")?;
+            }
+            if !table_has_column(&tx, "search_history", "duration_text")? {
+                tx.execute_batch("ALTER TABLE search_history ADD COLUMN duration_text TEXT;")?;
+            }
+            if !table_has_column(&tx, "search_history", "duration_ms")? {
+                tx.execute_batch("ALTER TABLE search_history ADD COLUMN duration_ms INTEGER;")?;
+            }
+            if !table_has_column(&tx, "songs", "is_liked")? {
+                tx.execute_batch(
+                    "ALTER TABLE songs ADD COLUMN is_liked INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            if !table_has_column(&tx, "songs", "liked_at")? {
+                tx.execute_batch("ALTER TABLE songs ADD COLUMN liked_at INTEGER;")?;
+            }
+            tx.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS artwork_index (
+                    cache_key TEXT PRIMARY KEY,
+                    tier INTEGER NOT NULL,
+                    file_path TEXT NOT NULL,
+                    byte_size INTEGER NOT NULL,
+                    last_accessed_ms INTEGER NOT NULL,
+                    created_at_ms INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_artwork_index_last_accessed
+                    ON artwork_index (last_accessed_ms ASC);
+                CREATE INDEX IF NOT EXISTS idx_songs_liked
+                    ON songs (liked_at DESC) WHERE is_liked = 1;
+                "#,
+            )?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
         }
@@ -606,10 +803,19 @@ impl LibraryDb {
 
     /// Atomically replaces all cached songs whose `video_id` starts with `prefix`
     /// (e.g. `"webdav:"` or `"smb:"`), removing stale remote entries without touching
-    /// YouTube or local disk tracks.
+    /// YouTube or local disk tracks (and preserving liked status for retained entries).
     pub fn replace_prefixed_songs(&self, prefix: &str, songs: &[Song]) -> Result<usize, DbError> {
         let like_pattern = format!("{prefix}%");
         let tx = self.conn.unchecked_transaction()?;
+        let prev_liked: HashMap<String, Option<i64>> = {
+            let mut stmt = tx.prepare(
+                "SELECT video_id, liked_at FROM songs WHERE video_id LIKE ?1 AND is_liked = 1",
+            )?;
+            let rows = stmt.query_map(params![&like_pattern], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+            })?;
+            rows.collect::<Result<HashMap<_, _>, _>>()?
+        };
         tx.execute(
             "DELETE FROM songs WHERE video_id LIKE ?1",
             params![like_pattern],
@@ -617,29 +823,9 @@ impl LibraryDb {
         let now = unix_now_ms();
         let mut count = 0usize;
         {
-            let mut stmt = tx.prepare(
-                r#"
-                INSERT INTO songs (
-                    video_id, title, artist, thumbnail_url, duration_text,
-                    album_name, album_id, artist_id,
-                    is_explicit, is_video, local_uri, local_path, updated_at, duration_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-                ON CONFLICT(video_id) DO UPDATE SET
-                    title = excluded.title,
-                    artist = excluded.artist,
-                    thumbnail_url = excluded.thumbnail_url,
-                    duration_text = COALESCE(excluded.duration_text, songs.duration_text),
-                    album_name = excluded.album_name,
-                    album_id = excluded.album_id,
-                    artist_id = excluded.artist_id,
-                    is_explicit = excluded.is_explicit,
-                    is_video = excluded.is_video,
-                    local_uri = excluded.local_uri,
-                    local_path = excluded.local_path,
-                    updated_at = excluded.updated_at,
-                    duration_ms = COALESCE(excluded.duration_ms, songs.duration_ms)
-                "#,
-            )?;
+            let mut stmt = tx.prepare(UPSERT_SONG_SQL)?;
+            let mut restore_like_stmt =
+                tx.prepare("UPDATE songs SET is_liked = 1, liked_at = ?2 WHERE video_id = ?1")?;
             for song in songs {
                 if !song.video_id.starts_with(prefix) {
                     continue;
@@ -662,6 +848,9 @@ impl LibraryDb {
                     now,
                     duration_ms,
                 ])?;
+                if let Some(&liked_at) = prev_liked.get(&song.video_id) {
+                    restore_like_stmt.execute(params![song.video_id, liked_at])?;
+                }
                 count += 1;
             }
         }
@@ -669,34 +858,226 @@ impl LibraryDb {
         Ok(count)
     }
 
-    // ---- Search history (capped at 20, case-insensitive id dedup) -----------
+    // ---- Liked / favorite songs ---------------------------------------------
+
+    /// Sets the liked flag for `song`. When `liked` is `true`, the song is first
+    /// upserted into `songs` so tracks liked directly from the player bar or
+    /// search results are always persisted. Returns the resulting liked state.
+    pub fn set_song_liked(&self, song: &Song, liked: bool) -> Result<bool, DbError> {
+        let now = unix_now_ms();
+        let tx = self.conn.unchecked_transaction()?;
+        if liked {
+            upsert_song_in_tx(&tx, song, now)?;
+            tx.execute(
+                r#"
+                UPDATE songs
+                SET is_liked = 1,
+                    liked_at = CASE WHEN is_liked = 1 AND liked_at IS NOT NULL THEN liked_at ELSE ?2 END
+                WHERE video_id = ?1
+                "#,
+                params![song.video_id, now],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE songs SET is_liked = 0, liked_at = NULL WHERE video_id = ?1",
+                params![song.video_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(liked)
+    }
+
+    /// Updates the liked flag for an existing song row by `video_id`.
+    /// Returns `true` if a row existed and was updated.
+    pub fn set_video_liked(&self, video_id: &str, liked: bool) -> Result<bool, DbError> {
+        let now = unix_now_ms();
+        let changed = if liked {
+            self.conn.execute(
+                r#"
+                UPDATE songs
+                SET is_liked = 1,
+                    liked_at = CASE WHEN is_liked = 1 AND liked_at IS NOT NULL THEN liked_at ELSE ?2 END
+                WHERE video_id = ?1
+                "#,
+                params![video_id, now],
+            )?
+        } else {
+            self.conn.execute(
+                "UPDATE songs SET is_liked = 0, liked_at = NULL WHERE video_id = ?1",
+                params![video_id],
+            )?
+        };
+        Ok(changed > 0)
+    }
+
+    /// Atomically toggles the liked state for `song` (upserting it into `songs`
+    /// if it was not yet stored). Returns the new liked state (`true` = liked).
+    pub fn toggle_song_liked(&self, song: &Song) -> Result<bool, DbError> {
+        let now = unix_now_ms();
+        let tx = self.conn.unchecked_transaction()?;
+        let currently_liked: bool = tx
+            .query_row(
+                "SELECT is_liked FROM songs WHERE video_id = ?1",
+                params![song.video_id],
+                |row| row.get::<_, i32>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            != 0;
+        let next_liked = !currently_liked;
+        if next_liked {
+            upsert_song_in_tx(&tx, song, now)?;
+            tx.execute(
+                "UPDATE songs SET is_liked = 1, liked_at = ?2 WHERE video_id = ?1",
+                params![song.video_id, now],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE songs SET is_liked = 0, liked_at = NULL WHERE video_id = ?1",
+                params![song.video_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(next_liked)
+    }
+
+    /// Returns `true` if `video_id` is currently marked as liked in `songs`.
+    pub fn is_song_liked(&self, video_id: &str) -> Result<bool, DbError> {
+        let liked: Option<i32> = self
+            .conn
+            .query_row(
+                "SELECT is_liked FROM songs WHERE video_id = ?1",
+                params![video_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(liked.unwrap_or(0) != 0)
+    }
+
+    /// Lists all liked `video_id`s ordered most-recently-liked first.
+    pub fn list_liked_video_ids(&self) -> Result<Vec<String>, DbError> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT video_id
+            FROM songs
+            WHERE is_liked = 1
+            ORDER BY COALESCE(liked_at, updated_at) DESC, video_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Lists all liked [`Song`] rows ordered most-recently-liked first.
+    pub fn list_liked_songs(&self) -> Result<Vec<Song>, DbError> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT video_id, title, artist, thumbnail_url, duration_text,
+                   album_name, album_id, artist_id,
+                   is_explicit, is_video, local_uri, local_path, duration_ms
+            FROM songs
+            WHERE is_liked = 1
+            ORDER BY COALESCE(liked_at, updated_at) DESC, video_id ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], row_to_song)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    // ---- Search history (capped at 20, case-insensitive id & query dedup) ---
 
     pub fn record_search_history(&self, entity: &SearchHistoryEntity) -> Result<(), DbError> {
-        let entity = entity.clone().with_corrected_type();
-        let entity_type = match entity.entity_type {
+        self.record_search_history_entry(&SearchHistoryRecord::from_entity(entity.clone()))
+    }
+
+    /// Records a rich v4 search history entry (`album`, `duration_text`,
+    /// `duration_ms`). When recording a non-query entity (track/artist/album/playlist),
+    /// any matching query row (`q:<term>` or `entity_type = 'query'`) whose text
+    /// matches or prefixes the selected entity is pruned to avoid duplicate cards.
+    pub fn record_search_history_entry(&self, entry: &SearchHistoryRecord) -> Result<(), DbError> {
+        let entry = entry.clone().with_corrected_type();
+        let entity_type = match entry.entity_type {
             EntityType::Track => "TRACK",
             EntityType::Album => "ALBUM",
             EntityType::Artist => "ARTIST",
             EntityType::Playlist => "PLAYLIST",
             EntityType::Other => "OTHER",
         };
+        let album = entry
+            .album
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let raw_duration_text = entry
+            .duration_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let duration_ms: Option<i64> = entry
+            .duration_ms
+            .filter(|&ms| ms > 0)
+            .map(|ms| ms as i64)
+            .or_else(|| {
+                let parsed = duration_millis(raw_duration_text.as_deref());
+                (parsed > 0).then_some(parsed as i64)
+            });
+        let duration_text = raw_duration_text
+            .or_else(|| duration_ms.and_then(|ms| (ms > 0).then(|| format_duration_ms(ms as u64))));
+
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM search_history WHERE lower(id) = lower(?1)",
-            params![entity.id],
+            params![entry.id],
         )?;
+
+        if !entry.is_query() {
+            let query_rows: Vec<(String, String)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, title FROM search_history \
+                     WHERE lower(id) LIKE 'q:%' OR lower(entity_type) = 'query'",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let mut delete_stmt = tx.prepare("DELETE FROM search_history WHERE id = ?1")?;
+            for (qid, qtitle) in query_rows {
+                let query_text = if qtitle.trim().is_empty() {
+                    qid.get(2..).unwrap_or("")
+                } else {
+                    qtitle.as_str()
+                };
+                if query_matches_entity(
+                    query_text,
+                    &entry.title,
+                    &entry.subtitle,
+                    album.as_deref(),
+                ) {
+                    delete_stmt.execute(params![qid])?;
+                }
+            }
+        }
+
         tx.execute(
             r#"
-            INSERT INTO search_history (id, title, subtitle, artwork_url, entity_type, timestamp)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            INSERT INTO search_history (
+                id, title, subtitle, artwork_url, entity_type, timestamp,
+                album, duration_text, duration_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             "#,
             params![
-                entity.id,
-                entity.title,
-                entity.subtitle,
-                entity.artwork_url,
+                entry.id,
+                entry.title,
+                entry.subtitle,
+                entry.artwork_url,
                 entity_type,
-                entity.timestamp,
+                entry.timestamp,
+                album,
+                duration_text,
+                duration_ms,
             ],
         )?;
         // Enforce MAX_SEARCH_HISTORY cap keeping most recent rows.
@@ -714,33 +1095,26 @@ impl LibraryDb {
     }
 
     pub fn list_search_history(&self) -> Result<Vec<SearchHistoryEntity>, DbError> {
+        Ok(self
+            .list_search_history_entries()?
+            .into_iter()
+            .map(SearchHistoryRecord::into)
+            .collect())
+    }
+
+    /// Lists up to 20 recent search history entries including v4 metadata
+    /// (`album`, `duration_text`, `duration_ms`), newest first.
+    pub fn list_search_history_entries(&self) -> Result<Vec<SearchHistoryRecord>, DbError> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT id, title, subtitle, artwork_url, entity_type, timestamp
+            SELECT id, title, subtitle, artwork_url, entity_type, timestamp,
+                   album, duration_text, duration_ms
             FROM search_history
             ORDER BY timestamp DESC
             LIMIT ?1
             "#,
         )?;
-        let rows = stmt.query_map(params![MAX_SEARCH_HISTORY as i64], |row| {
-            let raw_type: String = row.get(4)?;
-            let entity_type = match raw_type.as_str() {
-                "TRACK" => EntityType::Track,
-                "ALBUM" => EntityType::Album,
-                "ARTIST" => EntityType::Artist,
-                "PLAYLIST" => EntityType::Playlist,
-                _ => EntityType::Other,
-            };
-            Ok(SearchHistoryEntity {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                subtitle: row.get(2)?,
-                artwork_url: row.get(3)?,
-                entity_type,
-                timestamp: row.get(5)?,
-            }
-            .with_corrected_type())
-        })?;
+        let rows = stmt.query_map(params![MAX_SEARCH_HISTORY as i64], row_to_search_history_record)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -1259,6 +1633,158 @@ impl LibraryDb {
         Ok(deleted)
     }
 
+    // ---- Disk artwork cache index & LRU pruning -----------------------------
+
+    /// Inserts or updates a disk-cached artwork entry in `artwork_index`.
+    /// Preserves the original `created_at_ms` when updating an existing key.
+    pub fn upsert_artwork_entry(&self, entry: &ArtworkIndexEntry) -> Result<(), DbError> {
+        let now = unix_now_ms();
+        let last_accessed_ms = if entry.last_accessed_ms > 0 {
+            entry.last_accessed_ms
+        } else {
+            now
+        };
+        let created_at_ms = if entry.created_at_ms > 0 {
+            entry.created_at_ms
+        } else {
+            now
+        };
+        let byte_size = entry.byte_size.max(0);
+        self.conn.execute(
+            r#"
+            INSERT INTO artwork_index (
+                cache_key, tier, file_path, byte_size, last_accessed_ms, created_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                tier = excluded.tier,
+                file_path = excluded.file_path,
+                byte_size = excluded.byte_size,
+                last_accessed_ms = excluded.last_accessed_ms
+            "#,
+            params![
+                entry.cache_key,
+                entry.tier,
+                entry.file_path,
+                byte_size,
+                last_accessed_ms,
+                created_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Fetches a single entry from `artwork_index` by `cache_key`.
+    pub fn get_artwork_entry(&self, cache_key: &str) -> Result<Option<ArtworkIndexEntry>, DbError> {
+        let row = self
+            .conn
+            .query_row(
+                r#"
+                SELECT cache_key, tier, file_path, byte_size, last_accessed_ms, created_at_ms
+                FROM artwork_index
+                WHERE cache_key = ?1
+                "#,
+                params![cache_key],
+                row_to_artwork_index_entry,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Updates `last_accessed_ms` for `cache_key` to the current wall clock.
+    /// Returns `true` if a matching row existed.
+    pub fn touch_artwork_entry(&self, cache_key: &str) -> Result<bool, DbError> {
+        self.touch_artwork_entry_at(cache_key, unix_now_ms())
+    }
+
+    /// Updates `last_accessed_ms` for `cache_key` to an explicit timestamp.
+    /// Returns `true` if a matching row existed.
+    pub fn touch_artwork_entry_at(
+        &self,
+        cache_key: &str,
+        accessed_at_ms: i64,
+    ) -> Result<bool, DbError> {
+        let changed = self.conn.execute(
+            "UPDATE artwork_index SET last_accessed_ms = ?2 WHERE cache_key = ?1",
+            params![cache_key, accessed_at_ms],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Deletes a single entry from `artwork_index` by `cache_key`.
+    /// Returns `true` if a row was deleted.
+    pub fn delete_artwork_entry(&self, cache_key: &str) -> Result<bool, DbError> {
+        let deleted = self.conn.execute(
+            "DELETE FROM artwork_index WHERE cache_key = ?1",
+            params![cache_key],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    /// Returns the total tracked `byte_size` across all entries in `artwork_index`.
+    pub fn artwork_total_bytes(&self) -> Result<i64, DbError> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(byte_size), 0) FROM artwork_index",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(total.max(0))
+    }
+
+    /// Evicts least-recently-accessed entries from `artwork_index` until total
+    /// `byte_size <= max_bytes`, returning the evicted `file_path` list in LRU
+    /// order so the caller can remove those files from disk.
+    pub fn prune_artwork_lru(&self, max_bytes: i64) -> Result<Vec<String>, DbError> {
+        let budget = max_bytes.max(0);
+        let tx = self.conn.unchecked_transaction()?;
+        let mut total: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(byte_size), 0) FROM artwork_index",
+            [],
+            |row| row.get(0),
+        )?;
+        if total <= budget {
+            return Ok(Vec::new());
+        }
+
+        let candidates: Vec<(String, String, i64)> = {
+            let mut stmt = tx.prepare(
+                r#"
+                SELECT cache_key, file_path, byte_size
+                FROM artwork_index
+                ORDER BY last_accessed_ms ASC, created_at_ms ASC, cache_key ASC
+                "#,
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut evicted_keys = Vec::new();
+        let mut evicted_paths = Vec::new();
+        for (cache_key, file_path, byte_size) in candidates {
+            if total <= budget {
+                break;
+            }
+            total = total.saturating_sub(byte_size.max(0));
+            evicted_keys.push(cache_key);
+            evicted_paths.push(file_path);
+        }
+
+        if !evicted_keys.is_empty() {
+            let mut del_stmt =
+                tx.prepare("DELETE FROM artwork_index WHERE cache_key = ?1")?;
+            for key in &evicted_keys {
+                del_stmt.execute(params![key])?;
+            }
+        }
+        tx.commit()?;
+        Ok(evicted_paths)
+    }
+
     pub fn stats(&self) -> Result<DbStats, DbError> {
         self.conn
             .query_row(
@@ -1308,6 +1834,133 @@ ON CONFLICT(video_id) DO UPDATE SET
     updated_at = excluded.updated_at,
     duration_ms = COALESCE(excluded.duration_ms, songs.duration_ms)
 "#;
+
+fn upsert_song_in_tx(tx: &Connection, song: &Song, now: i64) -> Result<(), DbError> {
+    let is_explicit: Option<i32> = song.is_explicit.map(i32::from);
+    let duration_ms = song_duration_ms_opt(song);
+    tx.execute(
+        UPSERT_SONG_SQL,
+        params![
+            song.video_id,
+            song.title,
+            song.artist,
+            song.thumbnail_url,
+            song.duration_text,
+            song.album_name,
+            song.album_id,
+            song.artist_id,
+            is_explicit,
+            i32::from(song.is_video),
+            song.local_uri,
+            song.local_path,
+            now,
+            duration_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+fn normalize_search_text(raw: &str) -> String {
+    raw.split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Returns `true` when an existing raw query entry (`query_text`) is a duplicate
+/// or close prefix/token match for a selected non-query entity (`title`,
+/// `subtitle`, optional `album`).
+fn query_matches_entity(
+    query_text: &str,
+    entity_title: &str,
+    entity_subtitle: &str,
+    entity_album: Option<&str>,
+) -> bool {
+    let q = normalize_search_text(query_text);
+    let title = normalize_search_text(entity_title);
+    if q.is_empty() || title.is_empty() {
+        return false;
+    }
+    if q == title {
+        return true;
+    }
+    let q_chars = q.chars().count();
+    let title_chars = title.chars().count();
+    if q_chars >= 3 && title.starts_with(&q) {
+        return true;
+    }
+    if title_chars >= 3 && q.starts_with(&title) {
+        return true;
+    }
+    let q_words: Vec<&str> = q.split_whitespace().collect();
+    if q_words.len() >= 2 && q_chars >= 4 {
+        let mut haystack = title.clone();
+        let sub = normalize_search_text(entity_subtitle);
+        if !sub.is_empty() {
+            haystack.push(' ');
+            haystack.push_str(&sub);
+        }
+        if let Some(alb) = entity_album {
+            let alb_norm = normalize_search_text(alb);
+            if !alb_norm.is_empty() {
+                haystack.push(' ');
+                haystack.push_str(&alb_norm);
+            }
+        }
+        let all_words_in_haystack = q_words.iter().all(|w| haystack.contains(w));
+        let overlaps_title = q_words
+            .iter()
+            .any(|w| w.chars().count() >= 3 && title.contains(w));
+        if all_words_in_haystack && overlaps_title {
+            return true;
+        }
+    }
+    false
+}
+
+fn row_to_artwork_index_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtworkIndexEntry> {
+    Ok(ArtworkIndexEntry {
+        cache_key: row.get(0)?,
+        tier: row.get(1)?,
+        file_path: row.get(2)?,
+        byte_size: row.get(3)?,
+        last_accessed_ms: row.get(4)?,
+        created_at_ms: row.get(5)?,
+    })
+}
+
+fn row_to_search_history_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchHistoryRecord> {
+    let raw_type: String = row.get(4)?;
+    let entity_type = match raw_type.as_str() {
+        "TRACK" => EntityType::Track,
+        "ALBUM" => EntityType::Album,
+        "ARTIST" => EntityType::Artist,
+        "PLAYLIST" => EntityType::Playlist,
+        _ => EntityType::Other,
+    };
+    let album: Option<String> = row.get(6)?;
+    let duration_text: Option<String> = row.get(7)?;
+    let stored_ms: Option<i64> = row.get(8)?;
+    let duration_ms = stored_ms
+        .and_then(|ms| (ms > 0).then_some(ms as u64))
+        .or_else(|| {
+            let parsed = duration_millis(duration_text.as_deref());
+            (parsed > 0).then_some(parsed)
+        });
+    let duration_text = duration_text.or_else(|| duration_ms.map(format_duration_ms));
+    Ok(SearchHistoryRecord {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        subtitle: row.get(2)?,
+        artwork_url: row.get(3)?,
+        entity_type,
+        timestamp: row.get(5)?,
+        album,
+        duration_text,
+        duration_ms,
+    }
+    .with_corrected_type())
+}
 
 fn song_duration_ms_opt(song: &Song) -> Option<i64> {
     let ms = song.duration_millis();
@@ -1654,9 +2307,9 @@ mod tests {
             .expect("seed v2 schema");
         }
 
-        // Open through LibraryDb: must migrate cleanly to v3 and set connection pragmas.
-        let db = LibraryDb::open(&db_path).expect("migrate v2 -> v3");
-        assert_eq!(db.schema_version().unwrap(), 3);
+        // Open through LibraryDb: must migrate cleanly through v3 -> v4 and set connection pragmas.
+        let db = LibraryDb::open(&db_path).expect("migrate v2 -> v4");
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
 
         let busy_timeout: i64 = db
             .conn
@@ -1701,9 +2354,9 @@ mod tests {
         db.checkpoint_passive().expect("passive checkpoint");
         drop(db);
 
-        // Re-opening an already-v3 DB must be idempotent.
-        let reopened = LibraryDb::open(&db_path).expect("reopen v3");
-        assert_eq!(reopened.schema_version().unwrap(), 3);
+        // Re-opening an already-migrated DB must be idempotent.
+        let reopened = LibraryDb::open(&db_path).expect("reopen v4");
+        assert_eq!(reopened.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(reopened.stats().unwrap().songs, 3);
         drop(reopened);
 
@@ -1947,5 +2600,402 @@ mod tests {
                 .any(|d| d.contains("USE TEMP B-TREE")),
             "unexpected temp B-tree sort in query plan: {plan_details:?}"
         );
+    }
+
+    #[test]
+    fn sqlite_v3_to_v4_migration_preserves_data_and_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!(
+            "bitchord_storage_v3_to_v4_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let db_path = dir.join("library.sqlite");
+
+        // Build an authentic v3 database on disk (no artwork_index, no search_history metadata
+        // columns, no songs.is_liked/liked_at columns).
+        {
+            let conn = Connection::open(&db_path).expect("open raw v3 sqlite");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE songs (
+                    video_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    artist TEXT NOT NULL,
+                    thumbnail_url TEXT,
+                    duration_text TEXT,
+                    album_name TEXT,
+                    album_id TEXT,
+                    artist_id TEXT,
+                    is_explicit INTEGER,
+                    is_video INTEGER NOT NULL DEFAULT 0,
+                    local_uri TEXT,
+                    local_path TEXT,
+                    updated_at INTEGER NOT NULL,
+                    duration_ms INTEGER
+                );
+                CREATE TABLE local_playlists (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    thumbnail_url TEXT,
+                    source TEXT NOT NULL DEFAULT 'local',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE local_playlist_tracks (
+                    playlist_id TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    video_id TEXT NOT NULL,
+                    PRIMARY KEY (playlist_id, position),
+                    FOREIGN KEY (playlist_id) REFERENCES local_playlists(id) ON DELETE CASCADE
+                );
+                CREATE TABLE search_history (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    subtitle TEXT NOT NULL,
+                    artwork_url TEXT,
+                    entity_type TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL
+                );
+                CREATE TABLE listening_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    video_id TEXT NOT NULL,
+                    played_at INTEGER NOT NULL,
+                    duration_ms INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE downloads (
+                    video_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    artist TEXT NOT NULL,
+                    thumbnail_url TEXT,
+                    duration_text TEXT,
+                    album_name TEXT,
+                    uri TEXT NOT NULL,
+                    download_format TEXT,
+                    date_added_seconds INTEGER
+                );
+                CREATE TABLE downloaded_collections (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    subtitle TEXT NOT NULL DEFAULT '',
+                    thumbnail_url TEXT,
+                    playlist INTEGER NOT NULL DEFAULT 0,
+                    video_ids_json TEXT NOT NULL DEFAULT '[]'
+                );
+                CREATE TABLE track_analysis (
+                    video_id TEXT PRIMARY KEY,
+                    analysis_json TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE stream_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    video_id TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    ext TEXT NOT NULL,
+                    kbps INTEGER NOT NULL,
+                    content_length INTEGER,
+                    duration_ms INTEGER,
+                    loudness_db REAL,
+                    is_live_hls INTEGER NOT NULL DEFAULT 0,
+                    client_name TEXT NOT NULL DEFAULT '',
+                    profile_id TEXT NOT NULL DEFAULT '',
+                    headers_json TEXT NOT NULL DEFAULT '{}',
+                    range_chunk_bytes INTEGER,
+                    expires_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE lyrics_cache (
+                    video_id TEXT PRIMARY KEY,
+                    source TEXT,
+                    lines_json TEXT NOT NULL DEFAULT '[]',
+                    is_synced INTEGER NOT NULL DEFAULT 0,
+                    not_found INTEGER NOT NULL DEFAULT 0,
+                    fetched_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL
+                );
+                INSERT INTO songs (video_id, title, artist, duration_text, updated_at, duration_ms)
+                VALUES ('v3-track', 'Instant Crush', 'Daft Punk', '5:37', 5000, 337000);
+                INSERT INTO search_history (id, title, subtitle, artwork_url, entity_type, timestamp)
+                VALUES ('v3-track', 'Instant Crush', 'Daft Punk', 'https://art/ic', 'TRACK', 5100);
+                PRAGMA user_version = 3;
+                "#,
+            )
+            .expect("seed v3 schema");
+        }
+
+        let db = LibraryDb::open(&db_path).expect("migrate v3 -> v4");
+        assert_eq!(db.schema_version().unwrap(), 4);
+
+        // Existing v3 rows survived intact with clean defaults for v4 columns.
+        assert!(!db.is_song_liked("v3-track").unwrap());
+        let entries = db.list_search_history_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "v3-track");
+        assert_eq!(entries[0].album, None);
+        assert_eq!(entries[0].duration_text, None);
+        assert_eq!(entries[0].duration_ms, None);
+
+        // New v4 tables/columns are operational right away.
+        db.upsert_artwork_entry(&ArtworkIndexEntry {
+            cache_key: "art-v4".into(),
+            tier: 256,
+            file_path: "/cache/artwork/art-v4_256.img".into(),
+            byte_size: 4096,
+            last_accessed_ms: 1000,
+            created_at_ms: 1000,
+        })
+        .unwrap();
+        assert!(db.get_artwork_entry("art-v4").unwrap().is_some());
+        assert!(db.set_video_liked("v3-track", true).unwrap());
+        assert!(db.is_song_liked("v3-track").unwrap());
+        drop(db);
+
+        // Re-opening must be idempotent and preserve v4 state.
+        let reopened = LibraryDb::open(&db_path).expect("reopen v4");
+        assert_eq!(reopened.schema_version().unwrap(), 4);
+        assert!(reopened.is_song_liked("v3-track").unwrap());
+        assert!(reopened.get_artwork_entry("art-v4").unwrap().is_some());
+        drop(reopened);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn artwork_index_upsert_touch_delete_and_lru_pruning() {
+        let db = LibraryDb::open_in_memory().expect("open in-memory db");
+
+        let e1 = ArtworkIndexEntry {
+            cache_key: "k1_256".into(),
+            tier: 256,
+            file_path: "/tmp/art/k1_256.img".into(),
+            byte_size: 1_000,
+            last_accessed_ms: 100,
+            created_at_ms: 100,
+        };
+        let e2 = ArtworkIndexEntry {
+            cache_key: "k2_256".into(),
+            tier: 256,
+            file_path: "/tmp/art/k2_256.img".into(),
+            byte_size: 2_000,
+            last_accessed_ms: 200,
+            created_at_ms: 200,
+        };
+        let e3 = ArtworkIndexEntry {
+            cache_key: "k3_512".into(),
+            tier: 512,
+            file_path: "/tmp/art/k3_512.img".into(),
+            byte_size: 3_000,
+            last_accessed_ms: 300,
+            created_at_ms: 300,
+        };
+
+        db.upsert_artwork_entry(&e1).unwrap();
+        db.upsert_artwork_entry(&e2).unwrap();
+        db.upsert_artwork_entry(&e3).unwrap();
+        assert_eq!(db.artwork_total_bytes().unwrap(), 6_000);
+        assert_eq!(db.get_artwork_entry("k1_256").unwrap(), Some(e1.clone()));
+
+        // Updating an existing entry preserves created_at_ms while updating size/last_accessed_ms.
+        db.upsert_artwork_entry(&ArtworkIndexEntry {
+            cache_key: "k1_256".into(),
+            tier: 256,
+            file_path: "/tmp/art/k1_256.img".into(),
+            byte_size: 1_500,
+            last_accessed_ms: 150,
+            created_at_ms: 999,
+        })
+        .unwrap();
+        let updated_e1 = db.get_artwork_entry("k1_256").unwrap().expect("k1 present");
+        assert_eq!(updated_e1.byte_size, 1_500);
+        assert_eq!(updated_e1.last_accessed_ms, 150);
+        assert_eq!(updated_e1.created_at_ms, 100);
+        assert_eq!(db.artwork_total_bytes().unwrap(), 6_500);
+
+        // Touching k1 promotes it to most-recently-accessed (last_accessed_ms = 400).
+        assert!(db.touch_artwork_entry_at("k1_256", 400).unwrap());
+        assert!(!db.touch_artwork_entry_at("missing", 400).unwrap());
+
+        // Budget larger than total evicts nothing.
+        assert!(db.prune_artwork_lru(10_000).unwrap().is_empty());
+
+        // Now LRU order is: k2 (200, 2000B), k3 (300, 3000B), k1 (400, 1500B).
+        // Pruning to 4_500B must evict only k2 (6500 - 2000 = 4500 <= 4500).
+        let evicted = db.prune_artwork_lru(4_500).unwrap();
+        assert_eq!(evicted, vec!["/tmp/art/k2_256.img".to_owned()]);
+        assert_eq!(db.artwork_total_bytes().unwrap(), 4_500);
+        assert!(db.get_artwork_entry("k2_256").unwrap().is_none());
+        assert!(db.get_artwork_entry("k3_512").unwrap().is_some());
+        assert!(db.get_artwork_entry("k1_256").unwrap().is_some());
+
+        // Pruning to 1_500B must evict k3 and leave k1 intact.
+        let evicted2 = db.prune_artwork_lru(1_500).unwrap();
+        assert_eq!(evicted2, vec!["/tmp/art/k3_512.img".to_owned()]);
+        assert_eq!(db.artwork_total_bytes().unwrap(), 1_500);
+        assert!(db.get_artwork_entry("k1_256").unwrap().is_some());
+
+        // Delete remaining entry.
+        assert!(db.delete_artwork_entry("k1_256").unwrap());
+        assert!(!db.delete_artwork_entry("k1_256").unwrap());
+        assert_eq!(db.artwork_total_bytes().unwrap(), 0);
+
+        // Confirm LRU scan can leverage idx_artwork_index_last_accessed.
+        let plan_details: Vec<String> = {
+            let mut stmt = db
+                .conn
+                .prepare(
+                    "EXPLAIN QUERY PLAN \
+                     SELECT cache_key, file_path, byte_size FROM artwork_index \
+                     ORDER BY last_accessed_ms ASC",
+                )
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(
+            plan_details
+                .iter()
+                .any(|d| d.contains("idx_artwork_index_last_accessed")),
+            "expected idx_artwork_index_last_accessed in query plan, got: {plan_details:?}"
+        );
+    }
+
+    #[test]
+    fn search_history_rich_metadata_and_query_dedup() {
+        let db = LibraryDb::open_in_memory().expect("open in-memory db");
+
+        // Record several query rows: exact, prefix, artist+title, legacy entity_type='query',
+        // and an unrelated query that must be kept.
+        for (id, title, ts) in [
+            ("q:nightcall", "nightcall", 100),
+            ("q:Night", "Night", 101),
+            ("q:kavinsky nightcall", "kavinsky nightcall", 102),
+            ("q:ambient jazz", "ambient jazz", 103),
+        ] {
+            db.record_search_history(&SearchHistoryEntity {
+                id: id.into(),
+                title: title.into(),
+                subtitle: "Search query".into(),
+                artwork_url: None,
+                entity_type: EntityType::Other,
+                timestamp: ts,
+            })
+            .unwrap();
+        }
+        // Also insert a legacy/external row explicitly using entity_type = 'query'.
+        db.conn
+            .execute(
+                "INSERT INTO search_history (id, title, subtitle, artwork_url, entity_type, timestamp) \
+                 VALUES ('legacy-q-1', 'Nightcall', 'Search', NULL, 'query', 104)",
+                [],
+            )
+            .unwrap();
+
+        // Recording the selected track with rich v4 metadata should clean up all matching
+        // query duplicates while preserving the unrelated "ambient jazz" query.
+        let mut song = Song::new(
+            "MV_3Dpw-BRY",
+            "Nightcall",
+            "Kavinsky",
+            Some("https://art/nightcall".into()),
+        );
+        song.album_name = Some("OutRun".into());
+        song.duration_text = Some("4:18".into());
+        let record = SearchHistoryRecord::from_song(&song, 200);
+        db.record_search_history_entry(&record).unwrap();
+
+        let entries = db.list_search_history_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "MV_3Dpw-BRY");
+        assert_eq!(entries[0].album.as_deref(), Some("OutRun"));
+        assert_eq!(entries[0].duration_text.as_deref(), Some("4:18"));
+        assert_eq!(entries[0].duration_ms, Some(258_000));
+        assert_eq!(entries[1].id, "q:ambient jazz");
+
+        // `to_song()` carries album and duration metadata cleanly.
+        let restored = entries[0].to_song().expect("track converts to song");
+        assert_eq!(restored.album_name.as_deref(), Some("OutRun"));
+        assert_eq!(restored.duration_text.as_deref(), Some("4:18"));
+
+        // Recording an entry with only duration_ms auto-formats duration_text (including H:MM:SS).
+        let long_mix = SearchHistoryRecord::from_entity(SearchHistoryEntity {
+            id: "mix-1".into(),
+            title: "Late Night Mix".into(),
+            subtitle: "DJ Synth".into(),
+            artwork_url: None,
+            entity_type: EntityType::Track,
+            timestamp: 300,
+        })
+        .with_metadata(Some("Live Sets".into()), None, Some(3_723_000));
+        db.record_search_history_entry(&long_mix).unwrap();
+
+        let entries_after = db.list_search_history_entries().unwrap();
+        assert_eq!(entries_after[0].id, "mix-1");
+        assert_eq!(entries_after[0].album.as_deref(), Some("Live Sets"));
+        assert_eq!(entries_after[0].duration_text.as_deref(), Some("1:02:03"));
+        assert_eq!(entries_after[0].duration_ms, Some(3_723_000));
+
+        // Legacy `list_search_history()` remains compatible.
+        let legacy = db.list_search_history().unwrap();
+        assert_eq!(legacy.len(), 3);
+        assert_eq!(legacy[0].id, "mix-1");
+    }
+
+    #[test]
+    fn liked_songs_toggle_upsert_and_ordering() {
+        let db = LibraryDb::open_in_memory().expect("open in-memory db");
+
+        let mut song_a = Song::new("vid-a", "Track A", "Artist A", Some("https://art/a".into()));
+        song_a.duration_text = Some("3:30".into());
+        let song_b = Song::new("vid-b", "Track B", "Artist B", None);
+
+        // Song not yet in `songs` can be toggled liked directly (auto-upserted).
+        assert!(!db.is_song_liked("vid-a").unwrap());
+        assert!(db.toggle_song_liked(&song_a).unwrap());
+        assert!(db.is_song_liked("vid-a").unwrap());
+        assert!(db.get_song("vid-a").unwrap().is_some());
+
+        // Set explicit liked_at timestamps to verify deterministic newest-liked-first ordering.
+        assert!(db.set_song_liked(&song_b, true).unwrap());
+        db.conn
+            .execute("UPDATE songs SET liked_at = 1000 WHERE video_id = 'vid-a'", [])
+            .unwrap();
+        db.conn
+            .execute("UPDATE songs SET liked_at = 2000 WHERE video_id = 'vid-b'", [])
+            .unwrap();
+
+        assert_eq!(
+            db.list_liked_video_ids().unwrap(),
+            vec!["vid-b".to_owned(), "vid-a".to_owned()]
+        );
+        let liked_songs = db.list_liked_songs().unwrap();
+        assert_eq!(liked_songs.len(), 2);
+        assert_eq!(liked_songs[0].video_id, "vid-b");
+        assert_eq!(liked_songs[1].video_id, "vid-a");
+        assert_eq!(liked_songs[1].duration_text.as_deref(), Some("3:30"));
+
+        // Re-upserting a liked song does not clobber its liked status.
+        db.upsert_song(&Song::new("vid-a", "Track A (Remaster)", "Artist A", None))
+            .unwrap();
+        assert!(db.is_song_liked("vid-a").unwrap());
+
+        // Toggling again unlikes it without deleting the song row.
+        assert!(!db.toggle_song_liked(&song_a).unwrap());
+        assert!(!db.is_song_liked("vid-a").unwrap());
+        assert!(db.get_song("vid-a").unwrap().is_some());
+        assert_eq!(db.list_liked_video_ids().unwrap(), vec!["vid-b".to_owned()]);
+
+        // `set_video_liked` returns false for unknown video_id and true for existing ones.
+        assert!(!db.set_video_liked("unknown-id", true).unwrap());
+        assert!(db.set_video_liked("vid-b", false).unwrap());
+        assert!(db.list_liked_video_ids().unwrap().is_empty());
+
+        // `replace_prefixed_songs` preserves liked state for retained remote entries.
+        let dav_song = Song::new("webdav:1", "Cloud Song", "Artist", None);
+        assert!(db.set_song_liked(&dav_song, true).unwrap());
+        assert_eq!(db.replace_prefixed_songs("webdav:", &[dav_song]).unwrap(), 1);
+        assert!(db.is_song_liked("webdav:1").unwrap());
     }
 }

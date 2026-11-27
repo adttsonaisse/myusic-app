@@ -18,8 +18,9 @@ pub mod settings;
 pub mod tagger;
 
 pub use db::{
-    CachedLyrics, CachedStream, DEFAULT_LYRICS_CACHE_TTL_MS, DEFAULT_LYRICS_NOT_FOUND_TTL_MS,
-    DEFAULT_STREAM_CACHE_TTL_MS, DbError, DbStats, LibraryDb, ListeningRecord, LocalPlaylist,
+    ArtworkIndexEntry, CachedLyrics, CachedStream, DEFAULT_ARTWORK_CACHE_MAX_BYTES,
+    DEFAULT_LYRICS_CACHE_TTL_MS, DEFAULT_LYRICS_NOT_FOUND_TTL_MS, DEFAULT_STREAM_CACHE_TTL_MS,
+    DbError, DbStats, LibraryDb, ListeningRecord, LocalPlaylist, SearchHistoryRecord,
     SongMetadata, format_duration_ms,
 };
 pub use downloads::{
