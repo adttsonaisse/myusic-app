@@ -196,21 +196,32 @@ pub async fn fetch_and_decode_artwork(
     }
 
     let art_dir = cache_dir.join("artwork");
-    let _ = std::fs::create_dir_all(&art_dir);
     let key = fnv1a_hex(&normalized);
     let disk_path = art_dir.join(format!("{key}.img"));
 
-    // Fast path: try decoding from local disk cache; self-heal if corrupt.
-    if disk_path.exists() {
-        if let Ok(cached_bytes) = std::fs::read(&disk_path)
-            && let Ok(art) = decode_artwork_bytes(&cached_bytes)
-        {
-            return Ok(art);
+    // Fast path: check, read, and decode local disk cache on Tokio's blocking pool
+    // so image decode & filesystem I/O never stall async audio chunk fetches.
+    let fast_disk_path = disk_path.clone();
+    let fast_art_dir = art_dir.clone();
+    let cached_hit = tokio::task::spawn_blocking(move || {
+        let _ = std::fs::create_dir_all(&fast_art_dir);
+        if fast_disk_path.exists() {
+            if let Ok(cached_bytes) = std::fs::read(&fast_disk_path)
+                && let Ok(art) = decode_artwork_bytes(&cached_bytes)
+            {
+                return Some(art);
+            }
+            let _ = std::fs::remove_file(&fast_disk_path);
         }
-        let _ = std::fs::remove_file(&disk_path);
+        None
+    })
+    .await
+    .map_err(|e| format!("artwork cache task join error: {e}"))?;
+    if let Some(art) = cached_hit {
+        return Ok(art);
     }
 
-    let raw_bytes = if SmbConfig::is_smb_url(&normalized) {
+    if SmbConfig::is_smb_url(&normalized) {
         let Some(auth) = remote_auth.filter(|a| a.smb.is_configured()) else {
             return Err("SMB artwork requires configured SMB share".to_owned());
         };
@@ -222,10 +233,10 @@ pub async fn fetch_and_decode_artwork(
             .read_file_capped(&auth.smb, &normalized, MAX_COVER_BYTES)
             .await
             .map_err(|e| format!("SMB artwork read failed: {e}"))?;
-        let art = decode_artwork_bytes(&bytes)?;
-        let _ = std::fs::write(&disk_path, &bytes);
-        return Ok(art);
-    } else if normalized.starts_with("http://") || normalized.starts_with("https://") {
+        return decode_and_persist_blocking(bytes, disk_path).await;
+    }
+
+    if normalized.starts_with("http://") || normalized.starts_with("https://") {
         let _permit = fetch_semaphore()
             .acquire()
             .await
@@ -254,14 +265,33 @@ pub async fn fetch_and_decode_artwork(
             .await
             .map_err(|e| format!("artwork body failed: {e}"))?
             .to_vec();
-        let art = decode_artwork_bytes(&bytes)?;
-        let _ = std::fs::write(&disk_path, &bytes);
-        return Ok(art);
-    } else {
-        std::fs::read(&normalized).map_err(|e| format!("local artwork read failed: {e}"))?
-    };
+        return decode_and_persist_blocking(bytes, disk_path).await;
+    }
 
-    decode_artwork_bytes(&raw_bytes)
+    // Local filesystem cover path: read + decode off async worker threads.
+    tokio::task::spawn_blocking(move || {
+        let raw_bytes =
+            std::fs::read(&normalized).map_err(|e| format!("local artwork read failed: {e}"))?;
+        decode_artwork_bytes(&raw_bytes)
+    })
+    .await
+    .map_err(|e| format!("local artwork task join error: {e}"))?
+}
+
+async fn decode_and_persist_blocking(
+    bytes: Vec<u8>,
+    disk_path: std::path::PathBuf,
+) -> Result<CachedArtwork, String> {
+    tokio::task::spawn_blocking(move || {
+        let art = decode_artwork_bytes(&bytes)?;
+        let tmp_path = disk_path.with_extension("img.tmp");
+        if std::fs::write(&tmp_path, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp_path, &disk_path);
+        }
+        Ok(art)
+    })
+    .await
+    .map_err(|e| format!("artwork decode task join error: {e}"))?
 }
 
 fn decode_artwork_bytes(raw_bytes: &[u8]) -> Result<CachedArtwork, String> {

@@ -9,14 +9,16 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use bitchord_audio::{AlsaDeviceInfo, AudioOutputMode, PlaybackSnapshot, PlaybackState};
+use bitchord_audio::{
+    AlsaDeviceInfo, AudioOutputMode, OutputStreamHealth, PlaybackSnapshot, PlaybackState,
+};
 use bitchord_dsp_core::{EqLayout, EqualizerPreset};
 use bitchord_integrations::ListenTogetherState;
 use bitchord_model::{
     BrowseItem, BrowseType, EntityType, HomeFeed, PlaybackSourceType, SearchFilter,
     SearchHistoryEntity, SearchResult, Song,
 };
-use bitchord_storage::AudioOutputPreference;
+use bitchord_storage::{AudioOutputPreference, format_duration_ms};
 use gpui::prelude::*;
 use gpui::{
     App, Bounds, Context, Decorations, Entity, FocusHandle, Focusable, ListAlignment, ListOffset,
@@ -31,7 +33,7 @@ use crate::actions::{
 use crate::artwork::{ArtworkCache, fetch_and_decode_artwork, song_thumbnail_url};
 use crate::backend::{
     AppBackend, BackendCommand, BackendEvent, DetailPayload, LibrarySnapshot, LyricsPayload,
-    QueueViewSnapshot, SearchSuggestionsPayload, StreamBackendChoice,
+    LyricsSyncState, QueueViewSnapshot, SearchSuggestionsPayload, StreamBackendChoice,
 };
 use crate::icons;
 use crate::text_input::{TextInput, TextInputEvent};
@@ -289,7 +291,9 @@ impl BitChordApp {
             }
         }));
 
-        // Consume discrete backend events without polling timers (`gpui-linux.md` §3.3).
+        // Discard stale events queued while closed to tray, then consume live events
+        // and request a complete state snapshot from the running background backend.
+        backend.drain_stale_events();
         let evt_rx = backend.evt_rx.clone();
         let event_task = cx.spawn(async move |this, cx| {
             while let Ok(evt) = evt_rx.recv().await {
@@ -334,11 +338,14 @@ impl BitChordApp {
             output_sample_rate_hz: bitchord_audio::OUTPUT_SAMPLE_RATE,
             bit_perfect_active: false,
             automix_plan_summary: None,
+            output_health: OutputStreamHealth::default(),
+            needs_output_reconnect: false,
+            output_error: None,
         };
 
-        // Trigger initial Home feed + Library load immediately.
-        backend.send(BackendCommand::LoadHome);
-        backend.send(BackendCommand::RefreshLibrary);
+        // Sync full live backend state (restores playback, queue, lyrics, devices, and
+        // cached Home/Library instantaneously on reopen from tray, or loads them on startup).
+        backend.send(BackendCommand::SyncFullState);
 
         let now = Instant::now();
         Self {
@@ -778,6 +785,101 @@ impl BitChordApp {
 
     fn handle_backend_event(&mut self, evt: BackendEvent, cx: &mut Context<Self>) {
         match evt {
+            BackendEvent::FullStateSynced(full) => {
+                let full = *full;
+                self.pipewire_active = full.pipewire_active;
+                self.audio_banner = full.audio_banner;
+                if self.selected_alsa_device == "hw:0,0"
+                    && let Some(usb) = full.audio_devices.iter().find(|d| d.is_usb_dac)
+                {
+                    self.selected_alsa_device = usb.hw_id.clone();
+                } else if !full.selected_alsa_device.is_empty() {
+                    self.selected_alsa_device = full.selected_alsa_device;
+                }
+                self.audio_devices = full.audio_devices;
+
+                let mut prefetch_urls = Vec::new();
+                if let Some(ref song) = full.playback.current_song
+                    && let Some(url) = song_thumbnail_url(song)
+                {
+                    prefetch_urls.push(url);
+                }
+                for song in full.queue.items.iter().take(24) {
+                    if let Some(url) = song_thumbnail_url(song) {
+                        prefetch_urls.push(url);
+                    }
+                }
+                self.playback = full.playback;
+                self.playback_synced_at = Instant::now();
+                self.queue = full.queue;
+
+                self.active_lyric_idx = None;
+                self.prev_lyric_idx = None;
+                self.lyrics_manual_scroll_until = None;
+                match full.lyrics {
+                    LyricsSyncState::Idle => {
+                        self.lyrics = LoadState::Idle;
+                        self.lyrics_list_state = ListState::new(0, ListAlignment::Top, px(260.0));
+                    }
+                    LyricsSyncState::Loading => {
+                        self.lyrics = LoadState::Loading;
+                        self.lyrics_list_state = ListState::new(0, ListAlignment::Top, px(260.0));
+                    }
+                    LyricsSyncState::Ready(payload) => {
+                        let count = payload.lines.len();
+                        self.lyrics_list_state =
+                            ListState::new(count, ListAlignment::Top, px(260.0));
+                        self.lyrics = LoadState::Ready(payload);
+                    }
+                    LyricsSyncState::Error(err) => {
+                        self.lyrics = LoadState::Error(err);
+                        self.lyrics_list_state = ListState::new(0, ListAlignment::Top, px(260.0));
+                    }
+                }
+
+                if let Some(feed) = full.home {
+                    for shelf in &feed.shelves {
+                        for item in shelf.items.iter().take(10) {
+                            if let Some(ref u) = item.thumbnail_url {
+                                prefetch_urls.push(u.clone());
+                            } else if let Some(ref vid) = item.video_id {
+                                let tmp = Song::new(vid.clone(), "", "", None);
+                                if let Some(fb) = song_thumbnail_url(&tmp) {
+                                    prefetch_urls.push(fb);
+                                }
+                            }
+                        }
+                    }
+                    self.home = LoadState::Ready(feed);
+                }
+                if let Some(lib) = full.library {
+                    for h in &lib.search_history {
+                        if let Some(ref u) = h.artwork_url {
+                            prefetch_urls.push(u.clone());
+                        }
+                    }
+                    for s in lib.songs.iter().take(18) {
+                        if let Some(u) = song_thumbnail_url(s) {
+                            prefetch_urls.push(u);
+                        }
+                    }
+                    self.library = lib;
+                }
+
+                self.party = full.party;
+                self.eq_enabled = full.eq_enabled;
+                self.eq_preset = full.eq_preset;
+                self.eq_bands_db = full.eq_bands_db;
+                self.stream_backend = full.stream_backend;
+                self.audio_output_pref = full.audio_output_pref;
+                self.automix_mode = full.automix_mode;
+                self.automix_phrase_bars = full.automix_phrase_bars;
+                self.discord_rpc_enabled = full.discord_rpc_enabled;
+
+                for u in prefetch_urls {
+                    self.ensure_artwork_loaded(&u, cx);
+                }
+            }
             BackendEvent::AudioBackendReady {
                 pipewire_active,
                 message,
@@ -968,6 +1070,27 @@ impl BitChordApp {
                 }
                 self.library = lib;
                 for u in urls {
+                    self.ensure_artwork_loaded(&u, cx);
+                }
+            }
+            BackendEvent::SearchHistoryUpdated(history) => {
+                let urls: Vec<String> = history
+                    .iter()
+                    .filter_map(|h| h.artwork_url.clone())
+                    .collect();
+                self.library.stats.search_history = history.len();
+                self.library.search_history = history;
+                for u in urls {
+                    self.ensure_artwork_loaded(&u, cx);
+                }
+            }
+            BackendEvent::LibraryTrackRecorded { song, stats } => {
+                let art_url = song_thumbnail_url(&song);
+                self.library.stats = stats;
+                self.library.songs.retain(|s| s.video_id != song.video_id);
+                self.library.songs.insert(0, *song);
+                self.library.songs.truncate(200);
+                if let Some(u) = art_url {
                     self.ensure_artwork_loaded(&u, cx);
                 }
             }
@@ -1350,10 +1473,7 @@ impl Render for BitChordApp {
     }
 }
 
-/// Formats milliseconds as `m:ss` (tabular alignment).
+/// Formats milliseconds as `m:ss` or `h:mm:ss` (tabular alignment).
 pub fn format_time_ms(ms: u64) -> String {
-    let total_secs = ms / 1_000;
-    let mins = total_secs / 60;
-    let secs = total_secs % 60;
-    format!("{mins}:{secs:02}")
+    format_duration_ms(ms)
 }

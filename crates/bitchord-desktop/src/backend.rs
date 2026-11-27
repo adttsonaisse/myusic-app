@@ -10,23 +10,23 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use async_channel::{Receiver, Sender};
+use async_channel::{Receiver, Sender, TrySendError};
 use bitchord_audio::{
     AlsaDeviceInfo, AudioDecoder, AudioEngine, AudioOutputMode, DecodedPacket, EqTuningSnapshot,
-    MprisCommand, MprisService, MprisState, OUTPUT_SAMPLE_RATE, PlaybackSnapshot, PlaybackState,
-    PlaybackStatus, RefusalCallback, analyze_audio_file, build_mpris_metadata,
-    enumerate_alsa_devices, open_http_decoder,
+    LoopStatus, MprisCommand, MprisService, MprisState, OUTPUT_SAMPLE_RATE, PlaybackSnapshot,
+    PlaybackState, PlaybackStatus, RefusalCallback, StreamCancelToken, analyze_audio_file,
+    build_mpris_metadata, enumerate_alsa_devices, open_http_decoder_with_cancel,
 };
 use bitchord_automix::{
     AutomixMode, OnnxAutomixStatus, OnnxModelPaths, TrackAnalysis, TransitionPlan, plan_transition,
 };
 use bitchord_dsp_core::{EqCurve, EqLayout, EqualizerPreset, manual_curve};
 use bitchord_innertube::{
-    BrowseHeader, InnertubeClient, InnertubeParser, NativeStreamBackend, ResolveRequest,
-    ResolvedStream, StreamBackend, StreamResolver, UploadedTracks, YtMusicRepository,
-    build_shared_http_client,
+    BrowseHeader, CipherSandbox, InnertubeClient, InnertubeParser, NativeStreamBackend,
+    ProbePolicy, ResolveRequest, ResolvedStream, StreamBackend, StreamResolver, UploadedTracks,
+    YtMusicRepository, build_shared_http_client,
 };
 #[cfg(feature = "ytdlp-bridge")]
 use bitchord_innertube::{FallbackStreamBackend, YtDlpStreamBackend};
@@ -40,23 +40,26 @@ use bitchord_lyrics::{
     TranslationResult,
 };
 use bitchord_model::{
-    BrowseType, EntityType, HomeFeed, PlaybackSourceType, QueueTier, SearchFilter,
-    SearchHistoryEntity, SearchResult, Song, duration_millis,
+    BrowseType, EntityType, HomeFeed, PlaybackSourceType, SearchFilter, SearchHistoryEntity,
+    SearchResult, Song, duration_millis,
 };
 use bitchord_netstorage::{
     SmbClient, SmbConfig, WebDavClient, WebDavConfig, remote_song::extension_lower,
 };
-use bitchord_queue::{QueueSource, QueueTimeline};
+use bitchord_queue::QueueSource;
 use bitchord_storage::{
-    AppPaths, AppSettingsData, AudioOutputPreference, DbStats, KeyringSecretStore, LibraryDb,
+    AppPaths, AppSettingsData, AudioOutputPreference, CachedStream, DEFAULT_LYRICS_CACHE_TTL_MS,
+    DEFAULT_LYRICS_NOT_FOUND_TTL_MS, DEFAULT_STREAM_CACHE_TTL_MS, DbStats, KeyringSecretStore,
     LocalPlaylist, SavedSongMetadata, SecretKey, SecretStore, SettingsStore, SmbSettings,
-    WebDavSettings, read_local_audio_tags,
+    WebDavSettings, format_duration_ms, read_local_audio_tags,
 };
 use gpui::Global;
 use reqwest::Client;
 use tokio::runtime::Handle;
 
 use crate::artwork::{RemoteArtworkAuth, song_thumbnail_url};
+use crate::db_worker::DbWorker;
+use crate::queue_state::{PlayNextOutcome, QueueController, QueueRemoveOutcome};
 
 /// Selection of stream resolver mode (`ADR-004`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -118,6 +121,16 @@ pub struct LyricsPayload {
     pub translated_lang: Option<String>,
 }
 
+/// Serializable-in-memory lyrics state preserved across tray close/reopen.
+#[derive(Debug, Clone, Default)]
+pub enum LyricsSyncState {
+    #[default]
+    Idle,
+    Loading,
+    Ready(LyricsPayload),
+    Error(String),
+}
+
 /// Live search suggestions + matching tracks/albums/artists while typing (`notes.md` #7).
 #[derive(Debug, Clone, Default)]
 pub struct SearchSuggestionsPayload {
@@ -126,9 +139,35 @@ pub struct SearchSuggestionsPayload {
     pub items: Vec<SearchResult>,
 }
 
+/// Complete live backend snapshot delivered on [`BackendCommand::SyncFullState`]
+/// (initial mount and reopening the window from the Linux system tray).
+#[derive(Debug, Clone)]
+pub struct FullStateSnapshot {
+    pub pipewire_active: bool,
+    pub audio_banner: Option<String>,
+    pub audio_devices: Vec<AlsaDeviceInfo>,
+    pub playback: PlaybackSnapshot,
+    pub queue: QueueViewSnapshot,
+    pub lyrics: LyricsSyncState,
+    pub home: Option<HomeFeed>,
+    pub library: Option<LibrarySnapshot>,
+    pub party: ListenTogetherState,
+    pub eq_enabled: bool,
+    pub eq_preset: EqualizerPreset,
+    pub eq_bands_db: [f32; EqLayout::MANUAL_COUNT],
+    pub stream_backend: StreamBackendChoice,
+    pub audio_output_pref: AudioOutputPreference,
+    pub selected_alsa_device: String,
+    pub automix_mode: AutomixMode,
+    pub automix_phrase_bars: u32,
+    pub discord_rpc_enabled: bool,
+}
+
 /// Inbound command sent by GPUI views, shortcuts, or tray menu to the backend.
 #[derive(Debug, Clone)]
 pub enum BackendCommand {
+    /// Requests a full state sync snapshot (used on initial mount and tray reopen).
+    SyncFullState,
     LoadHome,
     Search {
         query: String,
@@ -237,6 +276,7 @@ pub enum BackendCommand {
 /// Outbound event pushed to GPUI views on discrete state transitions.
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
+    FullStateSynced(Box<FullStateSnapshot>),
     AudioBackendReady {
         pipewire_active: bool,
         message: String,
@@ -262,6 +302,11 @@ pub enum BackendEvent {
         result: Result<LyricsPayload, String>,
     },
     LibraryLoaded(LibrarySnapshot),
+    SearchHistoryUpdated(Vec<SearchHistoryEntity>),
+    LibraryTrackRecorded {
+        song: Box<Song>,
+        stats: DbStats,
+    },
     PartyServerProbed {
         server: String,
         online: bool,
@@ -270,6 +315,40 @@ pub enum BackendEvent {
     PartyUpdated(Box<ListenTogetherState>),
     StatusNotice(String),
     ErrorNotice(String),
+}
+
+/// Bounded outbound event ring that never blocks the backend loop when the window is
+/// closed to tray (evicts the oldest unread event instead of dropping the newest one).
+#[derive(Clone)]
+struct EventHub {
+    tx: Sender<BackendEvent>,
+    rx_evict: Receiver<BackendEvent>,
+}
+
+impl EventHub {
+    fn new(capacity: usize) -> (Self, Receiver<BackendEvent>) {
+        let (tx, rx) = async_channel::bounded(capacity.max(16));
+        (
+            Self {
+                tx,
+                rx_evict: rx.clone(),
+            },
+            rx,
+        )
+    }
+
+    fn emit(&self, mut evt: BackendEvent) {
+        for _ in 0..4 {
+            match self.tx.try_send(evt) {
+                Ok(()) => return,
+                Err(TrySendError::Full(returned)) => {
+                    let _ = self.rx_evict.try_recv();
+                    evt = returned;
+                }
+                Err(TrySendError::Closed(_)) => return,
+            }
+        }
+    }
 }
 
 /// Global handle stored inside GPUI `App` so windows can close/reopen without stopping playback.
@@ -309,8 +388,9 @@ impl AppBackend {
             ),
         }));
 
-        let (cmd_tx, cmd_rx) = async_channel::bounded::<BackendCommand>(128);
-        let (evt_tx, evt_rx) = async_channel::bounded::<BackendEvent>(128);
+        // Unbounded command channel guarantees UI/tray commands are never silently dropped.
+        let (cmd_tx, cmd_rx) = async_channel::unbounded::<BackendCommand>();
+        let (events, evt_rx) = EventHub::new(256);
 
         let worker_http = http.clone();
         let worker_paths = paths.clone();
@@ -328,7 +408,7 @@ impl AppBackend {
                     worker_settings,
                     worker_remote_auth,
                     cmd_rx,
-                    evt_tx,
+                    events,
                 );
             })
             .expect("spawn bitchord backend thread");
@@ -347,6 +427,12 @@ impl AppBackend {
     pub fn send(&self, cmd: BackendCommand) {
         let _ = self.cmd_tx.try_send(cmd);
     }
+
+    /// Discards stale queued events accumulated while the window was closed to tray,
+    /// right before the reopened window sends [`BackendCommand::SyncFullState`].
+    pub fn drain_stale_events(&self) {
+        while self.evt_rx.try_recv().is_ok() {}
+    }
 }
 
 struct PartyRuntime {
@@ -357,10 +443,92 @@ struct PartyRuntime {
 }
 
 /// Minimum decoded audio buffered off-thread before starting PipeWire playback
-/// so the opening notes play cleanly from exact sample 0 without skipping or stuttering.
-const INITIAL_PREBUFFER_MS: u64 = 600;
+/// so opening notes start quickly (~240ms) without stalling startup or clipping intros.
+const INITIAL_PREBUFFER_MS: u64 = 240;
+/// Short courtesy delay before hitting remote lyrics providers so opening audio chunks
+/// keep full network/CPU priority and rapid track skipping never spams lyrics APIs.
+const LYRICS_REMOTE_DELAY_MS: u64 = 350;
+/// Maximum automatic playback retries after transient mid-stream network errors.
+const MAX_PLAYBACK_AUTO_RETRIES: u8 = 3;
 
-enum InternalTrackMsg {
+#[derive(Debug, Default)]
+struct PlaybackErrorRetry {
+    video_id: Option<String>,
+    attempts: u8,
+    resume_ms: u64,
+    retry_at: Option<Instant>,
+}
+
+impl PlaybackErrorRetry {
+    fn reset(&mut self) {
+        self.video_id = None;
+        self.attempts = 0;
+        self.resume_ms = 0;
+        self.retry_at = None;
+    }
+
+    fn backoff_for_attempt(attempt: u8) -> Duration {
+        match attempt {
+            0 => Duration::from_millis(800),
+            1 => Duration::from_millis(2_000),
+            _ => Duration::from_millis(4_000),
+        }
+    }
+}
+
+/// Comparable key for MPRIS2 D-Bus properties so `publish_state` fires ONLY on real
+/// status/track/metadata/volume/rate/queue changes (never 10x/sec on position ticks).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MprisPublishKey {
+    status: u8,
+    video_id: Option<String>,
+    title: Option<String>,
+    artist: Option<String>,
+    duration_ms: u64,
+    rate_bits: u32,
+    volume_bits: u32,
+    shuffle: bool,
+    repeat_all: bool,
+    repeat_one: bool,
+    can_seek: bool,
+    can_go_next: bool,
+    can_go_previous: bool,
+}
+
+impl MprisPublishKey {
+    fn from_state(snap: &PlaybackSnapshot, queue: &QueueController) -> Self {
+        let status = match snap.state {
+            PlaybackState::Playing | PlaybackState::Buffering => 1,
+            PlaybackState::Paused => 2,
+            PlaybackState::Stopped | PlaybackState::Ended | PlaybackState::Error => 0,
+        };
+        let (video_id, title, artist) = match snap.current_song.as_ref() {
+            Some(s) => (
+                Some(s.video_id.clone()),
+                Some(s.title.clone()),
+                Some(s.artist.clone()),
+            ),
+            None => (None, None, None),
+        };
+        Self {
+            status,
+            video_id,
+            title,
+            artist,
+            duration_ms: snap.duration_ms,
+            rate_bits: snap.speed.to_bits(),
+            volume_bits: snap.volume.to_bits(),
+            shuffle: queue.shuffle(),
+            repeat_all: queue.repeat_all(),
+            repeat_one: queue.repeat_one(),
+            can_seek: snap.duration_ms > 0,
+            can_go_next: queue.next_index(false).is_some(),
+            can_go_previous: !queue.is_empty(),
+        }
+    }
+}
+
+enum InternalMsg {
     Ready {
         generation: u64,
         song: Song,
@@ -368,6 +536,8 @@ enum InternalTrackMsg {
         prebuffered: Vec<DecodedPacket>,
         loudness_db: Option<f64>,
         source_label: String,
+        resolved_duration_ms: Option<u64>,
+        resume_position_ms: u64,
     },
     Failed {
         generation: u64,
@@ -376,15 +546,38 @@ enum InternalTrackMsg {
     },
     PreloadReady {
         generation: u64,
+        preload_generation: u64,
         song: Song,
         decoder: Box<AudioDecoder>,
         prebuffered: Vec<DecodedPacket>,
         loudness_db: Option<f64>,
         source_label: String,
+        resolved_duration_ms: Option<u64>,
     },
     AutomixPlanned {
         generation: u64,
+        preload_generation: u64,
         plan: TransitionPlan,
+    },
+    LocalFolderScanned {
+        folder: PathBuf,
+        count: usize,
+    },
+    PartyConnected {
+        generation: u64,
+        runtime: PartyRuntime,
+        message: String,
+    },
+    HomeCached(HomeFeed),
+    LibraryCached(LibrarySnapshot),
+    SearchHistoryCached(Vec<SearchHistoryEntity>),
+    LibraryTrackUpdated {
+        song: Box<Song>,
+        stats: DbStats,
+    },
+    LyricsStateUpdated {
+        video_id: String,
+        state: LyricsSyncState,
     },
 }
 
@@ -407,33 +600,44 @@ fn build_stream_resolver(
     http: &Arc<Client>,
     innertube: &Arc<InnertubeClient>,
     uploads: &Arc<UploadedTracks>,
+    cipher_sandbox: &Arc<CipherSandbox>,
     choice: StreamBackendChoice,
 ) -> Arc<StreamResolver> {
+    let make_native = || {
+        NativeStreamBackend::new(Arc::clone(innertube))
+            .with_cipher_sandbox(Arc::clone(cipher_sandbox))
+    };
     let backend: Arc<dyn StreamBackend> = match choice {
-        StreamBackendChoice::NativeOnly => {
-            Arc::new(NativeStreamBackend::new(Arc::clone(innertube)))
-        }
+        StreamBackendChoice::NativeOnly => Arc::new(make_native()),
         #[cfg(feature = "ytdlp-bridge")]
         StreamBackendChoice::YtDlpOnly => Arc::new(YtDlpStreamBackend::new()),
         StreamBackendChoice::Auto => {
             #[cfg(feature = "ytdlp-bridge")]
             {
                 Arc::new(FallbackStreamBackend::new(
-                    NativeStreamBackend::new(Arc::clone(innertube)),
+                    make_native(),
                     YtDlpStreamBackend::new(),
                 ))
             }
             #[cfg(not(feature = "ytdlp-bridge"))]
             {
-                Arc::new(NativeStreamBackend::new(Arc::clone(innertube)))
+                Arc::new(make_native())
             }
         }
     };
-    Arc::new(StreamResolver::new(
-        Arc::clone(http),
-        backend,
-        Arc::clone(uploads),
-    ))
+    Arc::new(
+        StreamResolver::new(Arc::clone(http), backend, Arc::clone(uploads))
+            .with_probe_policy(ProbePolicy::Optimistic),
+    )
+}
+
+fn save_settings_async(rt: &Handle, settings_path: &Path, settings: &AppSettingsData) {
+    let path = settings_path.to_path_buf();
+    let data = settings.clone();
+    rt.spawn_blocking(move || {
+        let store = SettingsStore::new(path);
+        let _ = store.save(&data);
+    });
 }
 
 fn run_backend_thread(
@@ -443,8 +647,11 @@ fn run_backend_thread(
     mut settings: AppSettingsData,
     remote_auth: Arc<RwLock<RemoteArtworkAuth>>,
     cmd_rx: Receiver<BackendCommand>,
-    evt_tx: Sender<BackendEvent>,
+    events: EventHub,
 ) {
+    // Dedicated persistent SQLite worker (single connection, WAL, auto-pruned caches).
+    let db_worker = DbWorker::start(paths.db_file());
+
     let desired_mode =
         to_engine_output_mode(settings.audio_output_mode, &settings.alsa_exclusive_device);
     let (mut engine, pipewire_active, audio_msg) =
@@ -470,14 +677,25 @@ fn run_backend_thread(
     engine.set_muted(settings.muted);
     engine.set_crossfade_seconds(settings.crossfade_seconds);
 
-    let _ = evt_tx.send_blocking(BackendEvent::AudioBackendReady {
+    let audio_banner = (!pipewire_active).then(|| audio_msg.clone());
+    let mut cached_audio_devices = enumerate_alsa_devices();
+
+    events.emit(BackendEvent::AudioBackendReady {
         pipewire_active,
         message: audio_msg,
     });
-    let _ = evt_tx.send_blocking(BackendEvent::AudioDevicesLoaded(enumerate_alsa_devices()));
+    events.emit(BackendEvent::AudioDevicesLoaded(
+        cached_audio_devices.clone(),
+    ));
 
     let http_arc = Arc::new(http.clone());
     let innertube = Arc::new(InnertubeClient::with_http_client(Arc::clone(&http_arc)));
+    // Pre-warm visitorData in the background so the first play avoids `/sw.js_data` latency.
+    {
+        let _rt_guard = rt.enter();
+        std::mem::drop(innertube.spawn_prewarm_visitor_data());
+    }
+
     let parser = Arc::new(InnertubeParser::default());
     let yt_repo = Arc::new(YtMusicRepository::new(
         Arc::clone(&innertube),
@@ -489,77 +707,118 @@ fn run_backend_thread(
         paths.cache_dir.join("lyrics_translations"),
     )));
     let uploads = Arc::new(UploadedTracks::default());
-    let settings_store = SettingsStore::new(paths.settings_file());
+    let cipher_sandbox = Arc::new(CipherSandbox::new(Some(paths.cache_dir.join("cipher"))));
+    let settings_path = paths.settings_file();
 
-    // Persistent StreamResolver keeps the 20-minute URL cache & refused-profile exclusions warm!
-    let mut resolver =
-        build_stream_resolver(&http_arc, &innertube, &uploads, StreamBackendChoice::Auto);
+    let mut stream_backend_choice = StreamBackendChoice::Auto;
+    let mut resolver = build_stream_resolver(
+        &http_arc,
+        &innertube,
+        &uploads,
+        &cipher_sandbox,
+        stream_backend_choice,
+    );
 
-    // Load saved credentials from Linux Secret Service (best-effort).
-    let secret_store = rt.block_on(KeyringSecretStore::open()).ok();
+    // Best-effort initial Secret Service load with bounded timeout so locked/headless
+    // desktops never hang startup; all subsequent keyring writes run asynchronously.
+    let secret_store: Option<Arc<KeyringSecretStore>> = rt
+        .block_on(async {
+            tokio::time::timeout(Duration::from_millis(800), KeyringSecretStore::open())
+                .await
+                .ok()
+                .and_then(Result::ok)
+        })
+        .map(Arc::new);
     if let Some(ref store) = secret_store {
-        if let Ok(Some(cookie)) = rt.block_on(store.get(SecretKey::YoutubeCookie)) {
-            innertube.set_cookie(Some(cookie.expose().to_owned()));
-        }
-        let webdav_pw = rt
-            .block_on(store.get(SecretKey::WebDavPassword))
-            .ok()
-            .flatten()
-            .map(|s| s.expose().to_owned())
-            .unwrap_or_default();
-        let smb_pw = rt
-            .block_on(store.get(SecretKey::SmbPassword))
-            .ok()
-            .flatten()
-            .map(|s| s.expose().to_owned())
-            .unwrap_or_default();
-        if let Ok(mut guard) = remote_auth.write() {
-            guard.webdav.password = webdav_pw;
-            guard.smb.password = smb_pw;
-        }
+        let store_c = Arc::clone(store);
+        let innertube_c = Arc::clone(&innertube);
+        let remote_auth_c = Arc::clone(&remote_auth);
+        let _ = rt.block_on(tokio::time::timeout(Duration::from_millis(800), async move {
+            if let Ok(Some(cookie)) = store_c.get(SecretKey::YoutubeCookie).await {
+                innertube_c.set_cookie(Some(cookie.expose().to_owned()));
+            }
+            let webdav_pw = store_c
+                .get(SecretKey::WebDavPassword)
+                .await
+                .ok()
+                .flatten()
+                .map(|s| s.expose().to_owned())
+                .unwrap_or_default();
+            let smb_pw = store_c
+                .get(SecretKey::SmbPassword)
+                .await
+                .ok()
+                .flatten()
+                .map(|s| s.expose().to_owned())
+                .unwrap_or_default();
+            if let Ok(mut guard) = remote_auth_c.write() {
+                guard.webdav.password = webdav_pw;
+                guard.smb.password = smb_pw;
+            }
+        }));
     }
 
     // Start MPRIS2 D-Bus server (`org.mpris.MediaPlayer2.bitchord`).
-    let mpris_state = rt.block_on(async { MprisService::start().await.ok() });
+    let mpris_state = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), MprisService::start())
+            .await
+            .ok()
+            .and_then(Result::ok)
+    });
     let (mpris_svc, mut mpris_rx) = match mpris_state {
         Some((svc, rx)) => (Some(Arc::new(svc)), Some(rx)),
         None => (None, None),
     };
 
-    let (track_tx, track_rx) = async_channel::bounded::<InternalTrackMsg>(16);
+    let (internal_tx, internal_rx) = async_channel::unbounded::<InternalMsg>();
     let load_gen = Arc::new(AtomicU64::new(0));
+    let preload_gen = Arc::new(AtomicU64::new(0));
+    let party_gen = Arc::new(AtomicU64::new(0));
     let analysis_sem = Arc::new(tokio::sync::Semaphore::new(1));
     let onnx_paths = Arc::new(OnnxModelPaths::discover(&paths.models_dir()));
 
-    let mut queue_items: Vec<Song> = Vec::new();
-    let mut current_index: Option<usize> = None;
+    let mut active_load_cancel: Option<StreamCancelToken> = None;
+    let mut preload_cancel: Option<StreamCancelToken> = None;
+
+    let mut queue = QueueController::default();
     let mut current_playing_song: Option<Song> = None;
     let mut preloaded_next_song: Option<Song> = None;
-    let mut shuffle = false;
-    let mut repeat_all = false;
-    let mut repeat_one = false;
     let current_lyrics: Arc<Mutex<Option<LyricsPayload>>> = Arc::new(Mutex::new(None));
+    let mut lyrics_sync_state = LyricsSyncState::Idle;
+    let mut cached_home: Option<HomeFeed> = None;
+    let mut cached_library: Option<LibrarySnapshot> = None;
+    let mut home_fetch_in_flight = false;
+
+    let mut eq_enabled = false;
+    let mut eq_preset = EqualizerPreset::Flat;
+    let mut eq_bands_db = [0.0_f32; EqLayout::MANUAL_COUNT];
+
     let mut party_runtime: Option<PartyRuntime> = None;
     let party_state_shared: Arc<Mutex<ListenTogetherState>> =
         Arc::new(Mutex::new(ListenTogetherState::default()));
 
-    // Initial SQLite library load.
-    emit_library_snapshot(&paths, &evt_tx);
+    let mut error_retry = PlaybackErrorRetry::default();
+    let mut last_output_error: Option<String> = None;
+    let mut last_reconnect_attempt: Option<Instant> = None;
+    let mut last_mpris_key: Option<MprisPublishKey> = None;
 
-    let mut last_tick = std::time::Instant::now();
+    // Initial asynchronous SQLite library snapshot load (never blocks backend startup).
+    spawn_library_refresh(&rt, &db_worker, &internal_tx, &events);
+
+    let mut last_tick = Instant::now();
     let mut last_state = PlaybackState::Stopped;
     let mut last_song_vid: Option<String> = None;
     let mut last_published_pos_ms = 0u64;
 
     loop {
-        // 1. Wait reactively for either an inbound UI command or an off-thread track load completion.
+        // 1. Wait reactively for an inbound UI command or an async internal completion.
         let wait_ms = if engine.snapshot().state == PlaybackState::Playing {
             35
         } else {
             90
         };
         let mut cmds = Vec::new();
-        let mut track_msgs = Vec::new();
+        let mut internal_msgs = Vec::new();
 
         rt.block_on(async {
             tokio::select! {
@@ -568,9 +827,9 @@ fn run_backend_thread(
                         cmds.push(c);
                     }
                 }
-                res = track_rx.recv() => {
+                res = internal_rx.recv() => {
                     if let Ok(m) = res {
-                        track_msgs.push(m);
+                        internal_msgs.push(m);
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => {}
@@ -579,25 +838,70 @@ fn run_backend_thread(
         while let Ok(c) = cmd_rx.try_recv() {
             cmds.push(c);
         }
-        while let Ok(m) = track_rx.try_recv() {
-            track_msgs.push(m);
+        while let Ok(m) = internal_rx.try_recv() {
+            internal_msgs.push(m);
         }
 
         // 2. Drain inbound MPRIS2 D-Bus commands.
         if let Some(ref mut rx) = mpris_rx {
             while let Ok(mcmd) = rx.try_recv() {
                 match mcmd {
-                    MprisCommand::Play => engine.play(),
-                    MprisCommand::Pause => engine.pause(),
-                    MprisCommand::PlayPause => engine.toggle_play_pause(),
+                    MprisCommand::Play => {
+                        if engine.snapshot().state != PlaybackState::Playing {
+                            cmds.push(BackendCommand::PlayPause);
+                        }
+                    }
+                    MprisCommand::Pause => {
+                        engine.pause();
+                        error_retry.reset();
+                    }
+                    MprisCommand::PlayPause => cmds.push(BackendCommand::PlayPause),
                     MprisCommand::Stop => {
-                        load_gen.fetch_add(1, Ordering::AcqRel);
+                        cancel_all_loads(
+                            &load_gen,
+                            &preload_gen,
+                            &mut active_load_cancel,
+                            &mut preload_cancel,
+                        );
+                        error_retry.reset();
                         engine.stop();
                     }
                     MprisCommand::Next => cmds.push(BackendCommand::NextTrack),
                     MprisCommand::Previous => cmds.push(BackendCommand::PrevTrack),
                     MprisCommand::SetVolume(v) => cmds.push(BackendCommand::SetVolume(v as f32)),
                     MprisCommand::SetRate(r) => cmds.push(BackendCommand::SetSpeed(r as f32)),
+                    MprisCommand::SetShuffle(want) => {
+                        if queue.shuffle() != want {
+                            cmds.push(BackendCommand::ToggleShuffle);
+                        }
+                    }
+                    MprisCommand::SetLoopStatus(status) => {
+                        let target = match status {
+                            LoopStatus::None => (false, false),
+                            LoopStatus::Playlist => (true, false),
+                            LoopStatus::Track => (false, true),
+                        };
+                        let mut guard = 0;
+                        while (queue.repeat_all(), queue.repeat_one()) != target && guard < 3 {
+                            queue.cycle_repeat();
+                            guard += 1;
+                        }
+                        emit_queue(&queue, &events);
+                        invalidate_and_repreload(
+                            &mut engine,
+                            &queue,
+                            &load_gen,
+                            &preload_gen,
+                            &mut preload_cancel,
+                            &mut preloaded_next_song,
+                            &rt,
+                            &http_arc,
+                            &resolver,
+                            &remote_auth,
+                            &db_worker,
+                            &internal_tx,
+                        );
+                    }
                     MprisCommand::SeekRelativeUs(us) => {
                         cmds.push(BackendCommand::SeekDeltaMs(us / 1_000));
                     }
@@ -609,26 +913,43 @@ fn run_backend_thread(
             }
         }
 
-        // 3. Apply completed off-thread track loads / preloads.
-        for msg in track_msgs {
+        // 3. Apply completed off-thread track loads, preloads, and async background results.
+        for msg in internal_msgs {
             match msg {
-                InternalTrackMsg::Ready {
+                InternalMsg::Ready {
                     generation,
                     mut song,
                     decoder,
                     prebuffered,
                     loudness_db,
                     source_label,
+                    resolved_duration_ms,
+                    resume_position_ms,
                 } => {
                     if load_gen.load(Ordering::Acquire) != generation {
                         continue; // Superseded by a newer user click!
                     }
-                    if song.duration_text.as_deref().is_none_or(str::is_empty)
-                        && let Some(dur_ms) = decoder.info().duration_ms.filter(|&d| d > 0)
-                    {
-                        let secs = dur_ms / 1_000;
-                        song.duration_text = Some(format!("{}:{:02}", secs / 60, secs % 60));
+                    let effective_dur_ms = decoder
+                        .info()
+                        .duration_ms
+                        .filter(|&d| d > 0)
+                        .or(resolved_duration_ms.filter(|&d| d > 0))
+                        .unwrap_or_else(|| duration_millis(song.duration_text.as_deref()));
+                    if effective_dur_ms > 0 {
+                        let dur_text = format_duration_ms(effective_dur_ms);
+                        if song.duration_text.as_deref().is_none_or(str::is_empty) {
+                            song.duration_text = Some(dur_text.clone());
+                        }
+                        if queue.update_duration_text(&song.video_id, &dur_text) {
+                            emit_queue(&queue, &events);
+                        }
+                        db_worker.update_song_duration(
+                            song.video_id.clone(),
+                            effective_dur_ms,
+                            song.duration_text.clone(),
+                        );
                     }
+
                     match engine.load_prepared_decoder(
                         *decoder,
                         prebuffered,
@@ -637,9 +958,12 @@ fn run_backend_thread(
                         Some(&source_label),
                     ) {
                         Ok(info) => {
-                            // Confirm pre-decoded opening frames are committed to rtrb
-                            // (after RT FlushDeck ack!) before unpausing PipeWire.
-                            engine.wait_prebuffer(500, Duration::from_millis(600));
+                            if resume_position_ms > 0 {
+                                let _ = engine.seek_ms(resume_position_ms);
+                            }
+                            // Pre-decoded packets are pushed immediately by the worker; wait
+                            // only briefly for the ring commit without stalling the 35ms loop.
+                            engine.wait_prebuffer(200, Duration::from_millis(80));
                             engine.play();
                             let snap = engine.snapshot();
                             last_state = snap.state;
@@ -647,54 +971,81 @@ fn run_backend_thread(
                             current_playing_song = Some(song.clone());
                             preloaded_next_song = None;
                             last_published_pos_ms = snap.position_ms;
-                            let _ = evt_tx
-                                .try_send(BackendEvent::PlaybackUpdated(Box::new(snap.clone())));
-                            let _ = evt_tx.try_send(BackendEvent::StatusNotice(format!(
+                            if error_retry.video_id.as_deref() != Some(song.video_id.as_str()) {
+                                error_retry.reset();
+                            } else {
+                                error_retry.retry_at = None;
+                            }
+
+                            events.emit(BackendEvent::PlaybackUpdated(Box::new(snap.clone())));
+                            events.emit(BackendEvent::StatusNotice(format!(
                                 "Playing {} - {}",
                                 song.title, song.artist
                             )));
 
-                            record_track_started(
+                            sync_mpris_if_changed(
                                 &rt,
-                                &paths,
-                                &song,
-                                info.duration_ms,
-                                settings.discord_rpc_enabled,
+                                mpris_svc.as_ref(),
+                                &mut last_mpris_key,
                                 &snap,
-                                &evt_tx,
+                                &queue,
                             );
 
-                            // Quietly pre-resolve & preload the next track in the queue onto standby deck.
-                            if let Some(next_idx) = compute_next_index(
-                                current_index,
-                                queue_items.len(),
-                                repeat_all,
-                                repeat_one,
-                                true,
-                            ) && Some(next_idx) != current_index
-                                && let Some(next_song) = queue_items.get(next_idx).cloned()
-                            {
-                                spawn_preload_next(
-                                    generation,
-                                    Arc::clone(&load_gen),
-                                    &rt,
-                                    Arc::clone(&http_arc),
-                                    Arc::clone(&resolver),
-                                    Arc::clone(&remote_auth),
-                                    next_song,
-                                    track_tx.clone(),
-                                );
-                            }
+                            let track_dur_ms = info
+                                .duration_ms
+                                .filter(|&d| d > 0)
+                                .or((effective_dur_ms > 0).then_some(effective_dur_ms));
+                            record_track_started_async(
+                                &rt,
+                                &db_worker,
+                                &song,
+                                track_dur_ms,
+                                settings.discord_rpc_enabled,
+                                &snap,
+                                &internal_tx,
+                                &events,
+                            );
+
+                            // Start cache-first, delayed lyrics lookup now that playback started
+                            // and accurate duration is known.
+                            lyrics_sync_state = LyricsSyncState::Loading;
+                            spawn_lyrics_lookup(
+                                generation,
+                                Arc::clone(&load_gen),
+                                &rt,
+                                &db_worker,
+                                &lyrics_repo,
+                                &current_lyrics,
+                                song.clone(),
+                                track_dur_ms.unwrap_or(snap.duration_ms),
+                                &internal_tx,
+                                &events,
+                            );
+
+                            // Quietly pre-resolve & preload the next track onto standby deck.
+                            spawn_standby_preload_for_queue(
+                                generation,
+                                &load_gen,
+                                &preload_gen,
+                                &mut preload_cancel,
+                                &queue,
+                                &rt,
+                                &http_arc,
+                                &resolver,
+                                &remote_auth,
+                                &db_worker,
+                                &internal_tx,
+                            );
                         }
                         Err(err) => {
-                            let _ = evt_tx.try_send(BackendEvent::ErrorNotice(format!(
+                            events.emit(BackendEvent::ErrorNotice(format!(
                                 "Playback failed for \"{}\": {err}",
                                 song.title
                             )));
                         }
                     }
                 }
-                InternalTrackMsg::Failed {
+                InternalMsg::Failed {
                     generation,
                     song_title,
                     error,
@@ -702,22 +1053,50 @@ fn run_backend_thread(
                     if load_gen.load(Ordering::Acquire) != generation {
                         continue;
                     }
-                    let _ = evt_tx.try_send(BackendEvent::ErrorNotice(format!(
+                    events.emit(BackendEvent::ErrorNotice(format!(
                         "Playback failed for \"{song_title}\": {error}"
                     )));
-                    let _ =
-                        evt_tx.try_send(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                    events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                 }
-                InternalTrackMsg::PreloadReady {
+                InternalMsg::PreloadReady {
                     generation,
-                    song,
+                    preload_generation,
+                    mut song,
                     decoder,
                     prebuffered,
                     loudness_db,
                     source_label,
+                    resolved_duration_ms,
                 } => {
-                    if load_gen.load(Ordering::Acquire) != generation {
+                    if load_gen.load(Ordering::Acquire) != generation
+                        || preload_gen.load(Ordering::Acquire) != preload_generation
+                    {
                         continue;
+                    }
+                    // Verify queue didn't shift underneath this preload before committing standby.
+                    let expected_vid = queue.preload_candidate().map(|s| s.video_id);
+                    if expected_vid.as_deref() != Some(song.video_id.as_str()) {
+                        continue;
+                    }
+                    let effective_dur_ms = decoder
+                        .info()
+                        .duration_ms
+                        .filter(|&d| d > 0)
+                        .or(resolved_duration_ms.filter(|&d| d > 0))
+                        .unwrap_or(0);
+                    if effective_dur_ms > 0 {
+                        let dur_text = format_duration_ms(effective_dur_ms);
+                        if song.duration_text.as_deref().is_none_or(str::is_empty) {
+                            song.duration_text = Some(dur_text.clone());
+                        }
+                        if queue.update_duration_text(&song.video_id, &dur_text) {
+                            emit_queue(&queue, &events);
+                        }
+                        db_worker.update_song_duration(
+                            song.video_id.clone(),
+                            effective_dur_ms,
+                            song.duration_text.clone(),
+                        );
                     }
                     let next_for_plan = song.clone();
                     if engine
@@ -736,65 +1115,163 @@ fn run_backend_thread(
                         {
                             spawn_automix_planning(
                                 generation,
+                                preload_generation,
                                 Arc::clone(&load_gen),
+                                Arc::clone(&preload_gen),
                                 &rt,
                                 Arc::clone(&analysis_sem),
-                                paths.clone(),
+                                db_worker.clone(),
                                 Arc::clone(&onnx_paths),
                                 settings.automix_mode,
                                 settings.automix_phrase_bars,
                                 settings.crossfade_seconds,
                                 cur_song.clone(),
                                 next_for_plan,
-                                track_tx.clone(),
+                                internal_tx.clone(),
                             );
                         }
                     }
                 }
-                InternalTrackMsg::AutomixPlanned { generation, plan } => {
-                    if load_gen.load(Ordering::Acquire) != generation {
+                InternalMsg::AutomixPlanned {
+                    generation,
+                    preload_generation,
+                    plan,
+                } => {
+                    if load_gen.load(Ordering::Acquire) != generation
+                        || preload_gen.load(Ordering::Acquire) != preload_generation
+                    {
                         continue;
                     }
                     if plan.is_active() {
                         engine.set_transition_plan(Some(plan));
-                        let _ = evt_tx
-                            .try_send(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                        events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                    }
+                }
+                InternalMsg::LocalFolderScanned { folder, count } => {
+                    if !settings.local_music_folders.contains(&folder) {
+                        settings.local_music_folders.push(folder.clone());
+                        save_settings_async(&rt, &settings_path, &settings);
+                    }
+                    spawn_library_refresh(&rt, &db_worker, &internal_tx, &events);
+                    events.emit(BackendEvent::StatusNotice(format!(
+                        "Scanned {count} audio file(s) from {}",
+                        folder.display()
+                    )));
+                }
+                InternalMsg::PartyConnected {
+                    generation,
+                    runtime,
+                    message,
+                } => {
+                    if party_gen.load(Ordering::Acquire) != generation {
+                        runtime.stop_flag.store(true, Ordering::Release);
+                        continue;
+                    }
+                    if let Some(prev) = party_runtime.replace(runtime) {
+                        prev.stop_flag.store(true, Ordering::Release);
+                    }
+                    events.emit(BackendEvent::StatusNotice(message));
+                }
+                InternalMsg::HomeCached(feed) => {
+                    home_fetch_in_flight = false;
+                    cached_home = Some(feed);
+                }
+                InternalMsg::LibraryCached(lib) => {
+                    cached_library = Some(lib);
+                }
+                InternalMsg::SearchHistoryCached(history) => {
+                    if let Some(ref mut lib) = cached_library {
+                        lib.stats.search_history = history.len();
+                        lib.search_history = history;
+                    }
+                }
+                InternalMsg::LibraryTrackUpdated { song, stats } => {
+                    if let Some(ref mut lib) = cached_library {
+                        lib.stats = stats;
+                        lib.songs.retain(|s| s.video_id != song.video_id);
+                        lib.songs.insert(0, *song);
+                        lib.songs.truncate(200);
+                    }
+                }
+                InternalMsg::LyricsStateUpdated { video_id, state } => {
+                    if current_playing_song
+                        .as_ref()
+                        .is_none_or(|s| s.video_id == video_id)
+                    {
+                        lyrics_sync_state = state;
                     }
                 }
             }
         }
 
-        // 4. Process all queued commands.
+        // 4. Process all queued commands (zero blocking I/O inside this loop!).
         for cmd in cmds {
             match cmd {
                 BackendCommand::Shutdown => {
-                    load_gen.fetch_add(1, Ordering::AcqRel);
+                    cancel_all_loads(
+                        &load_gen,
+                        &preload_gen,
+                        &mut active_load_cancel,
+                        &mut preload_cancel,
+                    );
                     engine.stop();
                     if let Some(pr) = party_runtime.take() {
                         pr.stop_flag.store(true, Ordering::Release);
                     }
+                    db_worker.shutdown_blocking();
                     return;
                 }
+                BackendCommand::SyncFullState => {
+                    let party_snap = party_state_shared
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    let full = FullStateSnapshot {
+                        pipewire_active,
+                        audio_banner: audio_banner.clone(),
+                        audio_devices: cached_audio_devices.clone(),
+                        playback: engine.snapshot(),
+                        queue: queue.snapshot(),
+                        lyrics: lyrics_sync_state.clone(),
+                        home: cached_home.clone(),
+                        library: cached_library.clone(),
+                        party: party_snap,
+                        eq_enabled,
+                        eq_preset,
+                        eq_bands_db,
+                        stream_backend: stream_backend_choice,
+                        audio_output_pref: settings.audio_output_mode,
+                        selected_alsa_device: settings.alsa_exclusive_device.clone(),
+                        automix_mode: settings.automix_mode,
+                        automix_phrase_bars: settings.automix_phrase_bars,
+                        discord_rpc_enabled: settings.discord_rpc_enabled,
+                    };
+                    events.emit(BackendEvent::FullStateSynced(Box::new(full)));
+
+                    if cached_home.is_none() && !home_fetch_in_flight {
+                        home_fetch_in_flight = true;
+                        spawn_load_home(&rt, &yt_repo, &internal_tx, &events);
+                    }
+                    if cached_library.is_none() {
+                        spawn_library_refresh(&rt, &db_worker, &internal_tx, &events);
+                    }
+                }
                 BackendCommand::LoadHome => {
-                    let _ = evt_tx.try_send(BackendEvent::HomeLoading);
-                    let repo = Arc::clone(&yt_repo);
-                    let tx = evt_tx.clone();
-                    rt.spawn(async move {
-                        let res = repo.home().await.map_err(|e| e.to_string());
-                        let _ = tx.send(BackendEvent::HomeLoaded(res)).await;
-                    });
+                    home_fetch_in_flight = true;
+                    spawn_load_home(&rt, &yt_repo, &internal_tx, &events);
                 }
                 BackendCommand::Search { query, filter } => {
                     let trimmed = query.trim().to_owned();
                     if trimmed.is_empty() {
                         continue;
                     }
-                    let _ = evt_tx.try_send(BackendEvent::SearchLoading {
+                    events.emit(BackendEvent::SearchLoading {
                         query: trimmed.clone(),
                     });
                     let repo = Arc::clone(&yt_repo);
-                    let tx = evt_tx.clone();
-                    let paths_c = paths.clone();
+                    let events_c = events.clone();
+                    let db_c = db_worker.clone();
+                    let itx = internal_tx.clone();
                     rt.spawn(async move {
                         let res = repo
                             .search(&trimmed, filter, false)
@@ -802,7 +1279,6 @@ fn run_backend_thread(
                             .map(|p| p.rows)
                             .map_err(|e| e.to_string());
 
-                        // Record query search enriched with top result's artwork & metadata when available!
                         if let Ok(ref rows) = res {
                             let (art_url, subtitle) = match rows.first() {
                                 Some(SearchResult::TopTrack { song })
@@ -816,37 +1292,38 @@ fn run_backend_thread(
                                 ),
                                 None => (None, "Search query".to_owned()),
                             };
-                            if let Ok(db) = LibraryDb::open(&paths_c.db_file()) {
-                                let _ = db.record_search_history(&SearchHistoryEntity {
+                            let history = db_c
+                                .record_search_history(SearchHistoryEntity {
                                     id: format!("q:{trimmed}"),
                                     title: trimmed.clone(),
                                     subtitle,
                                     artwork_url: art_url,
                                     entity_type: EntityType::Other,
                                     timestamp: unix_now_ms(),
-                                });
-                            }
-                            emit_library_snapshot(&paths_c, &tx);
+                                })
+                                .await;
+                            let _ = itx
+                                .send(InternalMsg::SearchHistoryCached(history.clone()))
+                                .await;
+                            events_c.emit(BackendEvent::SearchHistoryUpdated(history));
                         }
 
-                        let _ = tx
-                            .send(BackendEvent::SearchLoaded {
-                                query: trimmed,
-                                result: res,
-                            })
-                            .await;
+                        events_c.emit(BackendEvent::SearchLoaded {
+                            query: trimmed,
+                            result: res,
+                        });
                     });
                 }
                 BackendCommand::SearchSuggest(query) => {
                     let trimmed = query.trim().to_owned();
                     if trimmed.len() < 2 {
-                        let _ = evt_tx.try_send(BackendEvent::SearchSuggestionsLoaded(
+                        events.emit(BackendEvent::SearchSuggestionsLoaded(
                             SearchSuggestionsPayload::default(),
                         ));
                         continue;
                     }
                     let repo = Arc::clone(&yt_repo);
-                    let tx = evt_tx.clone();
+                    let events_c = events.clone();
                     rt.spawn(async move {
                         let (queries_res, typeahead_res) = tokio::join!(
                             repo.search_suggestions(&trimmed),
@@ -855,44 +1332,60 @@ fn run_backend_thread(
                         let queries = queries_res.unwrap_or_default();
                         let mut items = typeahead_res.map(|p| p.rows).unwrap_or_default();
                         items.truncate(6);
-                        let _ = tx
-                            .send(BackendEvent::SearchSuggestionsLoaded(
-                                SearchSuggestionsPayload {
-                                    query: trimmed,
-                                    queries,
-                                    items,
-                                },
-                            ))
-                            .await;
+                        events_c.emit(BackendEvent::SearchSuggestionsLoaded(
+                            SearchSuggestionsPayload {
+                                query: trimmed,
+                                queries,
+                                items,
+                            },
+                        ));
                     });
                 }
                 BackendCommand::RecordSearchSelection(mut entity) => {
                     entity.timestamp = unix_now_ms();
-                    if let Ok(db) = LibraryDb::open(&paths.db_file()) {
-                        let _ = db.record_search_history(&entity);
-                    }
-                    emit_library_snapshot(&paths, &evt_tx);
+                    let db_c = db_worker.clone();
+                    let itx = internal_tx.clone();
+                    let events_c = events.clone();
+                    rt.spawn(async move {
+                        let history = db_c.record_search_history(entity).await;
+                        let _ = itx
+                            .send(InternalMsg::SearchHistoryCached(history.clone()))
+                            .await;
+                        events_c.emit(BackendEvent::SearchHistoryUpdated(history));
+                    });
                 }
                 BackendCommand::RemoveSearchHistory(id) => {
-                    if let Ok(db) = LibraryDb::open(&paths.db_file()) {
-                        let _ = db.remove_search_history(&id);
-                    }
-                    emit_library_snapshot(&paths, &evt_tx);
+                    let db_c = db_worker.clone();
+                    let itx = internal_tx.clone();
+                    let events_c = events.clone();
+                    rt.spawn(async move {
+                        let history = db_c.remove_search_history(id).await;
+                        let _ = itx
+                            .send(InternalMsg::SearchHistoryCached(history.clone()))
+                            .await;
+                        events_c.emit(BackendEvent::SearchHistoryUpdated(history));
+                    });
                 }
                 BackendCommand::ClearSearchHistory => {
-                    if let Ok(db) = LibraryDb::open(&paths.db_file()) {
-                        let _ = db.clear_search_history();
-                    }
-                    emit_library_snapshot(&paths, &evt_tx);
+                    let db_c = db_worker.clone();
+                    let itx = internal_tx.clone();
+                    let events_c = events.clone();
+                    rt.spawn(async move {
+                        let history = db_c.clear_search_history().await;
+                        let _ = itx
+                            .send(InternalMsg::SearchHistoryCached(history.clone()))
+                            .await;
+                        events_c.emit(BackendEvent::SearchHistoryUpdated(history));
+                    });
                 }
                 BackendCommand::LoadDetail {
                     browse_id,
                     kind,
                     fallback_title,
                 } => {
-                    let _ = evt_tx.try_send(BackendEvent::DetailLoading);
+                    events.emit(BackendEvent::DetailLoading);
                     let repo = Arc::clone(&yt_repo);
-                    let tx = evt_tx.clone();
+                    let events_c = events.clone();
                     rt.spawn(async move {
                         let res = if kind == BrowseType::Artist {
                             repo.artist_page(&browse_id).await.map(|page| {
@@ -927,9 +1420,7 @@ fn run_backend_thread(
                                     }
                                 })
                         };
-                        let _ = tx
-                            .send(BackendEvent::DetailLoaded(res.map_err(|e| e.to_string())))
-                            .await;
+                        events_c.emit(BackendEvent::DetailLoaded(res.map_err(|e| e.to_string())));
                     });
                 }
                 BackendCommand::PlayContext {
@@ -939,354 +1430,478 @@ fn run_backend_thread(
                     source_type,
                     source_id,
                 } => {
-                    if songs.is_empty() {
-                        continue;
-                    }
-                    let clamped_start = start_index.min(songs.len() - 1);
                     let source = QueueSource {
                         title: source_title,
                         r#type: source_type,
                         id: source_id,
                     };
-                    let ctx = QueueTimeline::build_context_queue(
-                        &queue_items,
-                        current_index.map_or(-1, |i| i as isize),
-                        &songs,
-                        clamped_start,
-                        &source,
-                    );
-                    queue_items = ctx.timeline;
-                    current_index = Some(ctx.start_index);
-                    emit_queue(
-                        &queue_items,
-                        current_index,
-                        shuffle,
-                        repeat_all,
-                        repeat_one,
-                        &evt_tx,
-                    );
-                    if let Some(song) = current_index.and_then(|i| queue_items.get(i)).cloned() {
-                        start_async_song_load(
+                    if let Some(song) =
+                        queue.play_context(&songs, start_index, &source, unix_now_ms() as u64)
+                    {
+                        error_retry.reset();
+                        emit_queue(&queue, &events);
+                        lyrics_sync_state = LyricsSyncState::Loading;
+                        start_async_song_load_at(
                             &mut engine,
                             &load_gen,
+                            &preload_gen,
+                            &mut active_load_cancel,
+                            &mut preload_cancel,
+                            &mut preloaded_next_song,
                             &rt,
                             &http_arc,
                             &resolver,
                             &remote_auth,
-                            &lyrics_repo,
+                            &db_worker,
                             &current_lyrics,
                             song,
-                            &track_tx,
-                            &evt_tx,
+                            0,
+                            false,
+                            &internal_tx,
+                            &events,
                         );
                     }
                 }
-                BackendCommand::PlayNext(song) => {
-                    let entry = QueueTimeline::as_queue_entry(*song, QueueTier::UserQueue);
-                    if queue_items.is_empty() {
-                        queue_items.push(entry);
-                        current_index = Some(0);
-                        emit_queue(
-                            &queue_items,
-                            current_index,
-                            shuffle,
-                            repeat_all,
-                            repeat_one,
-                            &evt_tx,
+                BackendCommand::PlayNext(song) => match queue.play_next(*song) {
+                    PlayNextOutcome::StartedImmediately(s) => {
+                        error_retry.reset();
+                        emit_queue(&queue, &events);
+                        lyrics_sync_state = LyricsSyncState::Loading;
+                        start_async_song_load_at(
+                            &mut engine,
+                            &load_gen,
+                            &preload_gen,
+                            &mut active_load_cancel,
+                            &mut preload_cancel,
+                            &mut preloaded_next_song,
+                            &rt,
+                            &http_arc,
+                            &resolver,
+                            &remote_auth,
+                            &db_worker,
+                            &current_lyrics,
+                            *s,
+                            0,
+                            false,
+                            &internal_tx,
+                            &events,
                         );
-                        if let Some(s) = queue_items.first().cloned() {
-                            start_async_song_load(
+                    }
+                    PlayNextOutcome::InsertedNext => {
+                        emit_queue(&queue, &events);
+                        invalidate_and_repreload(
+                            &mut engine,
+                            &queue,
+                            &load_gen,
+                            &preload_gen,
+                            &mut preload_cancel,
+                            &mut preloaded_next_song,
+                            &rt,
+                            &http_arc,
+                            &resolver,
+                            &remote_auth,
+                            &db_worker,
+                            &internal_tx,
+                        );
+                        events.emit(BackendEvent::StatusNotice("Added to Play Next".to_owned()));
+                    }
+                },
+                BackendCommand::QueueJump(idx) => {
+                    if let Some(song) = queue.jump(idx) {
+                        error_retry.reset();
+                        emit_queue(&queue, &events);
+                        lyrics_sync_state = LyricsSyncState::Loading;
+                        start_async_song_load_at(
+                            &mut engine,
+                            &load_gen,
+                            &preload_gen,
+                            &mut active_load_cancel,
+                            &mut preload_cancel,
+                            &mut preloaded_next_song,
+                            &rt,
+                            &http_arc,
+                            &resolver,
+                            &remote_auth,
+                            &db_worker,
+                            &current_lyrics,
+                            song,
+                            0,
+                            false,
+                            &internal_tx,
+                            &events,
+                        );
+                    }
+                }
+                BackendCommand::QueueRemove(idx) => match queue.remove(idx) {
+                    QueueRemoveOutcome::OutOfBounds => {}
+                    QueueRemoveOutcome::Emptied => {
+                        cancel_all_loads(
+                            &load_gen,
+                            &preload_gen,
+                            &mut active_load_cancel,
+                            &mut preload_cancel,
+                        );
+                        error_retry.reset();
+                        preloaded_next_song = None;
+                        current_playing_song = None;
+                        engine.stop();
+                        emit_queue(&queue, &events);
+                        events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                    }
+                    QueueRemoveOutcome::ActiveReplaced(song) => {
+                        error_retry.reset();
+                        emit_queue(&queue, &events);
+                        lyrics_sync_state = LyricsSyncState::Loading;
+                        start_async_song_load_at(
+                            &mut engine,
+                            &load_gen,
+                            &preload_gen,
+                            &mut active_load_cancel,
+                            &mut preload_cancel,
+                            &mut preloaded_next_song,
+                            &rt,
+                            &http_arc,
+                            &resolver,
+                            &remote_auth,
+                            &db_worker,
+                            &current_lyrics,
+                            *song,
+                            0,
+                            false,
+                            &internal_tx,
+                            &events,
+                        );
+                    }
+                    QueueRemoveOutcome::Updated => {
+                        emit_queue(&queue, &events);
+                        invalidate_and_repreload(
+                            &mut engine,
+                            &queue,
+                            &load_gen,
+                            &preload_gen,
+                            &mut preload_cancel,
+                            &mut preloaded_next_song,
+                            &rt,
+                            &http_arc,
+                            &resolver,
+                            &remote_auth,
+                            &db_worker,
+                            &internal_tx,
+                        );
+                    }
+                },
+                BackendCommand::QueueClear => {
+                    queue.clear();
+                    cancel_all_loads(
+                        &load_gen,
+                        &preload_gen,
+                        &mut active_load_cancel,
+                        &mut preload_cancel,
+                    );
+                    error_retry.reset();
+                    preloaded_next_song = None;
+                    current_playing_song = None;
+                    engine.stop();
+                    emit_queue(&queue, &events);
+                    events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                }
+                BackendCommand::ToggleShuffle => {
+                    let _ = queue.toggle_shuffle(unix_now_ms() as u64);
+                    emit_queue(&queue, &events);
+                    invalidate_and_repreload(
+                        &mut engine,
+                        &queue,
+                        &load_gen,
+                        &preload_gen,
+                        &mut preload_cancel,
+                        &mut preloaded_next_song,
+                        &rt,
+                        &http_arc,
+                        &resolver,
+                        &remote_auth,
+                        &db_worker,
+                        &internal_tx,
+                    );
+                }
+                BackendCommand::CycleRepeat => {
+                    queue.cycle_repeat();
+                    emit_queue(&queue, &events);
+                    invalidate_and_repreload(
+                        &mut engine,
+                        &queue,
+                        &load_gen,
+                        &preload_gen,
+                        &mut preload_cancel,
+                        &mut preloaded_next_song,
+                        &rt,
+                        &http_arc,
+                        &resolver,
+                        &remote_auth,
+                        &db_worker,
+                        &internal_tx,
+                    );
+                }
+                BackendCommand::PlayPause => {
+                    let snap_before = engine.snapshot();
+                    if snap_before.state == PlaybackState::Error {
+                        error_retry.reset();
+                        let err_msg = snap_before.last_error.as_deref().unwrap_or("");
+                        let resume_ms = snap_before.position_ms;
+                        let needs_fresh_resolve = snap_before.current_song.is_none()
+                            || err_msg.contains("HTTP 403")
+                            || err_msg.contains("HTTP 404")
+                            || err_msg.contains("HTTP 410");
+                        if needs_fresh_resolve
+                            && let Some(song) = current_playing_song
+                                .clone()
+                                .or_else(|| queue.current_song().cloned())
+                        {
+                            db_worker.delete_stream_cache_for_video(song.video_id.clone());
+                            start_async_song_load_at(
                                 &mut engine,
                                 &load_gen,
+                                &preload_gen,
+                                &mut active_load_cancel,
+                                &mut preload_cancel,
+                                &mut preloaded_next_song,
                                 &rt,
                                 &http_arc,
                                 &resolver,
                                 &remote_auth,
-                                &lyrics_repo,
+                                &db_worker,
                                 &current_lyrics,
-                                s,
-                                &track_tx,
-                                &evt_tx,
+                                song,
+                                resume_ms,
+                                true,
+                                &internal_tx,
+                                &events,
                             );
+                        } else {
+                            engine.play();
+                            events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                         }
-                    } else {
-                        let insert_at = QueueTimeline::find_user_queue_insertion_index(
-                            &queue_items,
-                            current_index.map_or(-1, |i| i as isize),
-                            true,
-                        );
-                        queue_items.insert(insert_at, entry);
-                        emit_queue(
-                            &queue_items,
-                            current_index,
-                            shuffle,
-                            repeat_all,
-                            repeat_one,
-                            &evt_tx,
-                        );
-                        let _ = evt_tx
-                            .try_send(BackendEvent::StatusNotice("Added to Play Next".to_owned()));
-                    }
-                }
-                BackendCommand::QueueJump(idx) => {
-                    if idx < queue_items.len() {
-                        current_index = Some(idx);
-                        emit_queue(
-                            &queue_items,
-                            current_index,
-                            shuffle,
-                            repeat_all,
-                            repeat_one,
-                            &evt_tx,
-                        );
-                        let song = queue_items[idx].clone();
-                        start_async_song_load(
+                    } else if snap_before.current_song.is_none()
+                        && let Some(song) = current_playing_song
+                            .clone()
+                            .or_else(|| queue.current_song().cloned())
+                    {
+                        // e.g. after ALSA USB DAC fallback cleared deck workers.
+                        start_async_song_load_at(
                             &mut engine,
                             &load_gen,
+                            &preload_gen,
+                            &mut active_load_cancel,
+                            &mut preload_cancel,
+                            &mut preloaded_next_song,
                             &rt,
                             &http_arc,
                             &resolver,
                             &remote_auth,
-                            &lyrics_repo,
+                            &db_worker,
                             &current_lyrics,
                             song,
-                            &track_tx,
-                            &evt_tx,
+                            last_published_pos_ms,
+                            false,
+                            &internal_tx,
+                            &events,
                         );
+                    } else {
+                        engine.toggle_play_pause();
+                        events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                     }
-                }
-                BackendCommand::QueueRemove(idx) => {
-                    if idx < queue_items.len() {
-                        queue_items.remove(idx);
-                        if let Some(cur) = current_index {
-                            if queue_items.is_empty() {
-                                current_index = None;
-                                load_gen.fetch_add(1, Ordering::AcqRel);
-                                engine.stop();
-                            } else if idx < cur {
-                                current_index = Some(cur - 1);
-                            } else if idx == cur {
-                                let next_i = cur.min(queue_items.len() - 1);
-                                current_index = Some(next_i);
-                                let song = queue_items[next_i].clone();
-                                start_async_song_load(
-                                    &mut engine,
-                                    &load_gen,
-                                    &rt,
-                                    &http_arc,
-                                    &resolver,
-                                    &remote_auth,
-                                    &lyrics_repo,
-                                    &current_lyrics,
-                                    song,
-                                    &track_tx,
-                                    &evt_tx,
-                                );
-                            }
-                        }
-                        emit_queue(
-                            &queue_items,
-                            current_index,
-                            shuffle,
-                            repeat_all,
-                            repeat_one,
-                            &evt_tx,
-                        );
-                    }
-                }
-                BackendCommand::QueueClear => {
-                    queue_items.clear();
-                    current_index = None;
-                    load_gen.fetch_add(1, Ordering::AcqRel);
-                    engine.stop();
-                    emit_queue(
-                        &queue_items,
-                        current_index,
-                        shuffle,
-                        repeat_all,
-                        repeat_one,
-                        &evt_tx,
-                    );
-                }
-                BackendCommand::ToggleShuffle => {
-                    shuffle = !shuffle;
-                    if shuffle && queue_items.len() > 2 {
-                        let cur = current_index.unwrap_or(0);
-                        let seed = unix_now_ms() as u64;
-                        queue_items =
-                            QueueTimeline::shuffled_starting_order(&queue_items, cur, seed);
-                        current_index = Some(0);
-                    }
-                    emit_queue(
-                        &queue_items,
-                        current_index,
-                        shuffle,
-                        repeat_all,
-                        repeat_one,
-                        &evt_tx,
-                    );
-                }
-                BackendCommand::CycleRepeat => {
-                    match (repeat_all, repeat_one) {
-                        (false, false) => {
-                            repeat_all = true;
-                            repeat_one = false;
-                        }
-                        (true, false) => {
-                            repeat_all = false;
-                            repeat_one = true;
-                        }
-                        _ => {
-                            repeat_all = false;
-                            repeat_one = false;
-                        }
-                    }
-                    emit_queue(
-                        &queue_items,
-                        current_index,
-                        shuffle,
-                        repeat_all,
-                        repeat_one,
-                        &evt_tx,
-                    );
-                }
-                BackendCommand::PlayPause => {
-                    engine.toggle_play_pause();
-                    let _ =
-                        evt_tx.try_send(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                 }
                 BackendCommand::NextTrack => {
-                    if let Some(next_idx) = compute_next_index(
-                        current_index,
-                        queue_items.len(),
-                        repeat_all,
-                        repeat_one,
-                        false,
-                    ) {
-                        current_index = Some(next_idx);
-                        emit_queue(
-                            &queue_items,
-                            current_index,
-                            shuffle,
-                            repeat_all,
-                            repeat_one,
-                            &evt_tx,
-                        );
-                        let song = queue_items[next_idx].clone();
-                        start_async_song_load(
-                            &mut engine,
-                            &load_gen,
-                            &rt,
-                            &http_arc,
-                            &resolver,
-                            &remote_auth,
-                            &lyrics_repo,
-                            &current_lyrics,
-                            song,
-                            &track_tx,
-                            &evt_tx,
-                        );
+                    if let Some(next_idx) = queue.next_index(false)
+                        && let Some(next_song) = queue.song_at(next_idx).cloned()
+                    {
+                        error_retry.reset();
+                        let _ = queue.jump(next_idx);
+                        emit_queue(&queue, &events);
+
+                        // Fast path: promote already-preloaded standby deck instantly without
+                        // tearing down audio or re-resolving the stream!
+                        if engine.has_standby_for(&next_song.video_id)
+                            && engine.activate_standby_now()
+                        {
+                            let new_gen = cancel_all_loads(
+                                &load_gen,
+                                &preload_gen,
+                                &mut active_load_cancel,
+                                &mut preload_cancel,
+                            );
+                            let snap = engine.snapshot();
+                            let mut promoted =
+                                snap.current_song.clone().unwrap_or_else(|| next_song.clone());
+                            if snap.duration_ms > 0 {
+                                let dur_text = format_duration_ms(snap.duration_ms);
+                                if promoted.duration_text.as_deref().is_none_or(str::is_empty) {
+                                    promoted.duration_text = Some(dur_text.clone());
+                                }
+                                if queue.update_duration_text(&promoted.video_id, &dur_text) {
+                                    emit_queue(&queue, &events);
+                                }
+                                db_worker.update_song_duration(
+                                    promoted.video_id.clone(),
+                                    snap.duration_ms,
+                                    promoted.duration_text.clone(),
+                                );
+                            }
+                            last_state = snap.state;
+                            last_song_vid = Some(promoted.video_id.clone());
+                            current_playing_song = Some(promoted.clone());
+                            preloaded_next_song = None;
+                            last_published_pos_ms = snap.position_ms;
+
+                            events.emit(BackendEvent::PlaybackUpdated(Box::new(snap.clone())));
+                            events.emit(BackendEvent::StatusNotice(format!(
+                                "Playing {} - {}",
+                                promoted.title, promoted.artist
+                            )));
+                            sync_mpris_if_changed(
+                                &rt,
+                                mpris_svc.as_ref(),
+                                &mut last_mpris_key,
+                                &snap,
+                                &queue,
+                            );
+
+                            record_track_started_async(
+                                &rt,
+                                &db_worker,
+                                &promoted,
+                                (snap.duration_ms > 0).then_some(snap.duration_ms),
+                                settings.discord_rpc_enabled,
+                                &snap,
+                                &internal_tx,
+                                &events,
+                            );
+                            lyrics_sync_state = LyricsSyncState::Loading;
+                            spawn_lyrics_lookup(
+                                new_gen,
+                                Arc::clone(&load_gen),
+                                &rt,
+                                &db_worker,
+                                &lyrics_repo,
+                                &current_lyrics,
+                                promoted,
+                                snap.duration_ms,
+                                &internal_tx,
+                                &events,
+                            );
+                            spawn_standby_preload_for_queue(
+                                new_gen,
+                                &load_gen,
+                                &preload_gen,
+                                &mut preload_cancel,
+                                &queue,
+                                &rt,
+                                &http_arc,
+                                &resolver,
+                                &remote_auth,
+                                &db_worker,
+                                &internal_tx,
+                            );
+                        } else {
+                            lyrics_sync_state = LyricsSyncState::Loading;
+                            start_async_song_load_at(
+                                &mut engine,
+                                &load_gen,
+                                &preload_gen,
+                                &mut active_load_cancel,
+                                &mut preload_cancel,
+                                &mut preloaded_next_song,
+                                &rt,
+                                &http_arc,
+                                &resolver,
+                                &remote_auth,
+                                &db_worker,
+                                &current_lyrics,
+                                next_song,
+                                0,
+                                false,
+                                &internal_tx,
+                                &events,
+                            );
+                        }
                     }
                 }
                 BackendCommand::PrevTrack => {
                     if engine.position_ms() > 3_500 {
-                        let _ = engine.seek_ms(0);
-                    } else if let Some(cur) = current_index {
-                        let prev = if cur > 0 {
-                            cur - 1
-                        } else if repeat_all && !queue_items.is_empty() {
-                            queue_items.len() - 1
-                        } else {
-                            0
-                        };
-                        current_index = Some(prev);
-                        emit_queue(
-                            &queue_items,
-                            current_index,
-                            shuffle,
-                            repeat_all,
-                            repeat_one,
-                            &evt_tx,
-                        );
-                        if let Some(song) = queue_items.get(prev).cloned() {
-                            start_async_song_load(
-                                &mut engine,
-                                &load_gen,
-                                &rt,
-                                &http_arc,
-                                &resolver,
-                                &remote_auth,
-                                &lyrics_repo,
-                                &current_lyrics,
-                                song,
-                                &track_tx,
-                                &evt_tx,
-                            );
+                        if let Ok(actual) = engine.seek_ms(0) {
+                            notify_mpris_seeked(&rt, mpris_svc.as_ref(), actual);
+                            events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                         }
+                    } else if let Some(prev_idx) = queue.prev_index()
+                        && let Some(song) = queue.jump(prev_idx)
+                    {
+                        error_retry.reset();
+                        emit_queue(&queue, &events);
+                        lyrics_sync_state = LyricsSyncState::Loading;
+                        start_async_song_load_at(
+                            &mut engine,
+                            &load_gen,
+                            &preload_gen,
+                            &mut active_load_cancel,
+                            &mut preload_cancel,
+                            &mut preloaded_next_song,
+                            &rt,
+                            &http_arc,
+                            &resolver,
+                            &remote_auth,
+                            &db_worker,
+                            &current_lyrics,
+                            song,
+                            0,
+                            false,
+                            &internal_tx,
+                            &events,
+                        );
                     }
                 }
                 BackendCommand::SeekMs(ms) => {
                     if let Ok(actual) = engine.seek_ms(ms) {
-                        if let Some(ref svc) = mpris_svc {
-                            let s = Arc::clone(svc);
-                            rt.spawn(async move {
-                                let _ = s.notify_seeked(actual).await;
-                            });
-                        }
-                        let _ = evt_tx
-                            .try_send(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                        notify_mpris_seeked(&rt, mpris_svc.as_ref(), actual);
+                        events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                     }
                 }
                 BackendCommand::SeekDeltaMs(delta) => {
                     let cur = engine.position_ms() as i64;
                     let target = (cur + delta).max(0) as u64;
                     if let Ok(actual) = engine.seek_ms(target) {
-                        if let Some(ref svc) = mpris_svc {
-                            let s = Arc::clone(svc);
-                            rt.spawn(async move {
-                                let _ = s.notify_seeked(actual).await;
-                            });
-                        }
-                        let _ = evt_tx
-                            .try_send(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                        notify_mpris_seeked(&rt, mpris_svc.as_ref(), actual);
+                        events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                     }
                 }
                 BackendCommand::SetVolume(vol) => {
                     engine.set_volume(vol);
                     settings.volume = vol.clamp(0.0, 1.0);
-                    let _ = settings_store.save(&settings);
-                    let _ =
-                        evt_tx.try_send(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                    save_settings_async(&rt, &settings_path, &settings);
+                    events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                 }
                 BackendCommand::ToggleMute => {
                     let next_mute = !engine.snapshot().muted;
                     engine.set_muted(next_mute);
                     settings.muted = next_mute;
-                    let _ = settings_store.save(&settings);
-                    let _ =
-                        evt_tx.try_send(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                    save_settings_async(&rt, &settings_path, &settings);
+                    events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                 }
                 BackendCommand::SetSpeed(speed) => {
                     engine.set_speed(speed);
-                    let _ =
-                        evt_tx.try_send(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                    events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                 }
                 BackendCommand::SetSkipSilence(on) => {
                     engine.set_skip_silence(on);
-                    let _ =
-                        evt_tx.try_send(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                    events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                 }
                 BackendCommand::SetSpatial(on) => {
                     engine.set_spatial_audio(on);
-                    let _ =
-                        evt_tx.try_send(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                    events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                 }
                 BackendCommand::SetCrossfadeSeconds(secs) => {
                     engine.set_crossfade_seconds(secs);
                     settings.crossfade_seconds = secs;
-                    let _ = settings_store.save(&settings);
-                    let _ =
-                        evt_tx.try_send(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                    save_settings_async(&rt, &settings_path, &settings);
+                    events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                 }
                 BackendCommand::SetAutomix { mode, phrase_bars } => {
                     let bars = match phrase_bars {
@@ -1295,92 +1910,101 @@ fn run_backend_thread(
                     };
                     settings.automix_mode = mode;
                     settings.automix_phrase_bars = bars;
-                    let _ = settings_store.save(&settings);
+                    save_settings_async(&rt, &settings_path, &settings);
                     if mode == AutomixMode::Off {
                         engine.set_transition_plan(None);
                     } else if let (Some(cur_song), Some(next_song)) =
                         (current_playing_song.clone(), preloaded_next_song.clone())
                     {
                         let generation = load_gen.load(Ordering::Acquire);
+                        let pgen = preload_gen.load(Ordering::Acquire);
                         spawn_automix_planning(
                             generation,
+                            pgen,
                             Arc::clone(&load_gen),
+                            Arc::clone(&preload_gen),
                             &rt,
                             Arc::clone(&analysis_sem),
-                            paths.clone(),
+                            db_worker.clone(),
                             Arc::clone(&onnx_paths),
                             mode,
                             bars,
                             settings.crossfade_seconds,
                             cur_song,
                             next_song,
-                            track_tx.clone(),
+                            internal_tx.clone(),
                         );
                     }
-                    let _ = evt_tx.try_send(BackendEvent::StatusNotice(format!(
+                    events.emit(BackendEvent::StatusNotice(format!(
                         "Automix mode: {}",
                         mode.label()
                     )));
-                    let _ =
-                        evt_tx.try_send(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                    events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                 }
                 BackendCommand::SetEq {
                     enabled,
                     preset,
                     bands_db,
                 } => {
+                    eq_enabled = enabled;
+                    eq_preset = preset;
+                    eq_bands_db = bands_db;
                     let curve: EqCurve = if preset == EqualizerPreset::Custom {
                         manual_curve(&bands_db)
                     } else {
                         manual_curve(preset.bands_db())
                     };
                     engine.set_eq(EqTuningSnapshot::from_curve(enabled, &curve, 0.0));
-                    let _ =
-                        evt_tx.try_send(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                    events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                 }
                 BackendCommand::StartSleepTimerMinutes(mins) => {
                     engine.sleep_timer_mut().start(mins);
-                    let _ = evt_tx.try_send(BackendEvent::StatusNotice(format!(
+                    events.emit(BackendEvent::StatusNotice(format!(
                         "Sleep timer armed for {mins} min"
                     )));
-                    let _ =
-                        evt_tx.try_send(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                    events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                 }
                 BackendCommand::StartSleepAfterTrack => {
                     engine.sleep_timer_mut().start_after_track();
-                    let _ = evt_tx.try_send(BackendEvent::StatusNotice(
+                    events.emit(BackendEvent::StatusNotice(
                         "Sleep timer armed: pause after current track".to_owned(),
                     ));
-                    let _ =
-                        evt_tx.try_send(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                    events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                 }
                 BackendCommand::CancelSleepTimer => {
                     engine.sleep_timer_mut().cancel();
-                    let _ =
-                        evt_tx.try_send(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                    events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                 }
                 BackendCommand::RefreshLibrary => {
-                    emit_library_snapshot(&paths, &evt_tx);
+                    spawn_library_refresh(&rt, &db_worker, &internal_tx, &events);
                 }
                 BackendCommand::ScanLocalFolder(folder) => {
-                    let count = scan_local_folder_into_db(&folder, &paths);
-                    match count {
-                        Ok(n) => {
-                            if !settings.local_music_folders.contains(&folder) {
-                                settings.local_music_folders.push(folder.clone());
-                                let _ = settings_store.save(&settings);
-                            }
-                            emit_library_snapshot(&paths, &evt_tx);
-                            let _ = evt_tx.try_send(BackendEvent::StatusNotice(format!(
-                                "Scanned {} audio file(s) from {}",
-                                n,
-                                folder.display()
-                            )));
+                    let db_c = db_worker.clone();
+                    let itx = internal_tx.clone();
+                    let events_c = events.clone();
+                    events.emit(BackendEvent::StatusNotice(format!(
+                        "Scanning {}...",
+                        folder.display()
+                    )));
+                    rt.spawn(async move {
+                        let scan_dir = folder.clone();
+                        let scanned =
+                            tokio::task::spawn_blocking(move || scan_local_folder_songs(&scan_dir))
+                                .await
+                                .map_err(|e| format!("Local folder scan failed: {e}"))
+                                .and_then(|r| r);
+                        match scanned {
+                            Ok(songs) => match db_c.upsert_songs_batch(songs).await {
+                                Ok(count) => {
+                                    let _ = itx
+                                        .send(InternalMsg::LocalFolderScanned { folder, count })
+                                        .await;
+                                }
+                                Err(err) => events_c.emit(BackendEvent::ErrorNotice(err)),
+                            },
+                            Err(err) => events_c.emit(BackendEvent::ErrorNotice(err)),
                         }
-                        Err(err) => {
-                            let _ = evt_tx.try_send(BackendEvent::ErrorNotice(err));
-                        }
-                    }
+                    });
                 }
                 BackendCommand::TranslateLyrics { target_lang } => {
                     let current = current_lyrics
@@ -1389,8 +2013,9 @@ fn run_backend_thread(
                         .clone();
                     if let Some(payload) = current {
                         let translator = Arc::clone(&lyrics_translator);
-                        let tx = evt_tx.clone();
+                        let events_c = events.clone();
                         let lyrics_slot = Arc::clone(&current_lyrics);
+                        let itx = internal_tx.clone();
                         rt.spawn(async move {
                             match translator
                                 .translate(&payload.video_id, &payload.lines, &target_lang)
@@ -1404,27 +2029,26 @@ fn run_backend_thread(
                                     };
                                     *lyrics_slot.lock().unwrap_or_else(|e| e.into_inner()) =
                                         Some(updated.clone());
-                                    let _ = tx
-                                        .send(BackendEvent::LyricsLoaded {
+                                    let _ = itx
+                                        .send(InternalMsg::LyricsStateUpdated {
                                             video_id: updated.video_id.clone(),
-                                            result: Ok(updated),
+                                            state: LyricsSyncState::Ready(updated.clone()),
                                         })
                                         .await;
+                                    events_c.emit(BackendEvent::LyricsLoaded {
+                                        video_id: updated.video_id.clone(),
+                                        result: Ok(updated),
+                                    });
                                 }
                                 TranslationResult::SameLanguage { language } => {
-                                    let _ = tx
-                                        .send(BackendEvent::StatusNotice(format!(
-                                            "Lyrics are already in {language}"
-                                        )))
-                                        .await;
+                                    events_c.emit(BackendEvent::StatusNotice(format!(
+                                        "Lyrics are already in {language}"
+                                    )));
                                 }
                                 TranslationResult::Unavailable => {
-                                    let _ = tx
-                                        .send(BackendEvent::ErrorNotice(
-                                            "Lyrics translation unavailable for this track."
-                                                .to_owned(),
-                                        ))
-                                        .await;
+                                    events_c.emit(BackendEvent::ErrorNotice(
+                                        "Lyrics translation unavailable for this track.".to_owned(),
+                                    ));
                                 }
                             }
                         });
@@ -1436,33 +2060,42 @@ fn run_backend_thread(
                         continue;
                     }
                     innertube.set_cookie(Some(trimmed.clone()));
-                    let res = match secret_store {
-                        Some(ref store) => {
-                            rt.block_on(store.set(SecretKey::YoutubeCookie, &trimmed))
+                    resolver.on_session_changed();
+                    db_worker.clear_stream_cache();
+
+                    let store_opt = secret_store.clone();
+                    let events_c = events.clone();
+                    rt.spawn(async move {
+                        let res = match store_opt {
+                            Some(store) => store.set(SecretKey::YoutubeCookie, &trimmed).await,
+                            None => Err(bitchord_storage::SecretError::Keyring(
+                                "Secret Service daemon unavailable".to_owned(),
+                            )),
+                        };
+                        match res {
+                            Ok(()) => {
+                                events_c.emit(BackendEvent::StatusNotice(
+                                    "YouTube Music cookie saved in Linux Secret Service".to_owned(),
+                                ));
+                            }
+                            Err(err) => {
+                                events_c.emit(BackendEvent::StatusNotice(format!(
+                                    "Cookie active for this session (keyring unavailable: {err})"
+                                )));
+                            }
                         }
-                        None => Err(bitchord_storage::SecretError::Keyring(
-                            "Secret Service daemon unavailable".to_owned(),
-                        )),
-                    };
-                    match res {
-                        Ok(()) => {
-                            let _ = evt_tx.try_send(BackendEvent::StatusNotice(
-                                "YouTube Music cookie saved in Linux Secret Service".to_owned(),
-                            ));
-                        }
-                        Err(err) => {
-                            let _ = evt_tx.try_send(BackendEvent::StatusNotice(format!(
-                                "Cookie active for this session (keyring unavailable: {err})"
-                            )));
-                        }
-                    }
+                    });
                 }
                 BackendCommand::ClearYoutubeCookie => {
                     innertube.set_cookie(None);
-                    if let Some(ref store) = secret_store {
-                        let _ = rt.block_on(store.delete(SecretKey::YoutubeCookie));
+                    resolver.on_session_changed();
+                    db_worker.clear_stream_cache();
+                    if let Some(store) = secret_store.clone() {
+                        rt.spawn(async move {
+                            let _ = store.delete(SecretKey::YoutubeCookie).await;
+                        });
                     }
-                    let _ = evt_tx.try_send(BackendEvent::StatusNotice(
+                    events.emit(BackendEvent::StatusNotice(
                         "YouTube Music session cleared".to_owned(),
                     ));
                 }
@@ -1477,22 +2110,25 @@ fn run_backend_thread(
                         url: norm_url.clone(),
                         username: user_trimmed.clone(),
                     };
-                    let _ = settings_store.save(&settings);
+                    save_settings_async(&rt, &settings_path, &settings);
                     let effective_pw = if password.is_empty() {
                         remote_auth
                             .read()
                             .map(|g| g.webdav.password.clone())
                             .unwrap_or_default()
                     } else {
-                        if let Some(ref store) = secret_store {
-                            let _ = rt.block_on(store.set(SecretKey::WebDavPassword, &password));
+                        if let Some(store) = secret_store.clone() {
+                            let pw_c = password.clone();
+                            rt.spawn(async move {
+                                let _ = store.set(SecretKey::WebDavPassword, &pw_c).await;
+                            });
                         }
                         password
                     };
                     if let Ok(mut guard) = remote_auth.write() {
                         guard.webdav = WebDavConfig::new(norm_url, user_trimmed, effective_pw);
                     }
-                    let _ = evt_tx.try_send(BackendEvent::StatusNotice(
+                    events.emit(BackendEvent::StatusNotice(
                         "WebDAV configuration saved (password stored in Secret Service)".to_owned(),
                     ));
                 }
@@ -1511,24 +2147,20 @@ fn run_backend_thread(
                     };
                     let cfg = WebDavConfig::new(url, username.trim(), effective_pw);
                     let http_c = http.clone();
-                    let tx = evt_tx.clone();
+                    let events_c = events.clone();
                     rt.spawn(async move {
                         let client = WebDavClient::with_http(http_c);
                         match client.test_connection(&cfg).await {
                             Ok(()) => {
-                                let _ = tx
-                                    .send(BackendEvent::StatusNotice(format!(
-                                        "WebDAV connected: {}",
-                                        WebDavConfig::normalize_url(&cfg.url)
-                                    )))
-                                    .await;
+                                events_c.emit(BackendEvent::StatusNotice(format!(
+                                    "WebDAV connected: {}",
+                                    WebDavConfig::normalize_url(&cfg.url)
+                                )));
                             }
                             Err(err) => {
-                                let _ = tx
-                                    .send(BackendEvent::ErrorNotice(format!(
-                                        "WebDAV test failed: {err}"
-                                    )))
-                                    .await;
+                                events_c.emit(BackendEvent::ErrorNotice(format!(
+                                    "WebDAV test failed: {err}"
+                                )));
                             }
                         }
                     });
@@ -1539,39 +2171,34 @@ fn run_backend_thread(
                         .map(|g| g.webdav.clone())
                         .unwrap_or_default();
                     let http_c = http.clone();
-                    let paths_c = paths.clone();
-                    let tx = evt_tx.clone();
+                    let db_c = db_worker.clone();
+                    let itx = internal_tx.clone();
+                    let events_c = events.clone();
                     rt.spawn(async move {
-                        let _ = tx
-                            .send(BackendEvent::StatusNotice(
-                                "Syncing WebDAV music library...".to_owned(),
-                            ))
-                            .await;
+                        events_c.emit(BackendEvent::StatusNotice(
+                            "Syncing WebDAV music library...".to_owned(),
+                        ));
                         let client = WebDavClient::with_http(http_c);
                         match client
                             .list_songs(&cfg, bitchord_netstorage::webdav::DEFAULT_MAX_FILES)
                             .await
                         {
                             Ok(songs) => {
-                                let count = match LibraryDb::open(&paths_c.db_file()) {
-                                    Ok(db) => {
-                                        db.replace_prefixed_songs("webdav:", &songs).unwrap_or(0)
-                                    }
-                                    Err(_) => 0,
-                                };
-                                emit_library_snapshot(&paths_c, &tx);
-                                let _ = tx
-                                    .send(BackendEvent::StatusNotice(format!(
-                                        "Synced {count} WebDAV track(s) into Library"
-                                    )))
-                                    .await;
+                                let count = db_c
+                                    .replace_prefixed_songs("webdav:".to_owned(), songs)
+                                    .await
+                                    .unwrap_or(0);
+                                let lib = db_c.fetch_library_snapshot().await;
+                                let _ = itx.send(InternalMsg::LibraryCached(lib.clone())).await;
+                                events_c.emit(BackendEvent::LibraryLoaded(lib));
+                                events_c.emit(BackendEvent::StatusNotice(format!(
+                                    "Synced {count} WebDAV track(s) into Library"
+                                )));
                             }
                             Err(err) => {
-                                let _ = tx
-                                    .send(BackendEvent::ErrorNotice(format!(
-                                        "WebDAV sync failed: {err}"
-                                    )))
-                                    .await;
+                                events_c.emit(BackendEvent::ErrorNotice(format!(
+                                    "WebDAV sync failed: {err}"
+                                )));
                             }
                         }
                     });
@@ -1597,22 +2224,25 @@ fn run_backend_thread(
                         base_path: base_t.clone(),
                         username: user_t.clone(),
                     };
-                    let _ = settings_store.save(&settings);
+                    save_settings_async(&rt, &settings_path, &settings);
                     let effective_pw = if password.is_empty() {
                         remote_auth
                             .read()
                             .map(|g| g.smb.password.clone())
                             .unwrap_or_default()
                     } else {
-                        if let Some(ref store) = secret_store {
-                            let _ = rt.block_on(store.set(SecretKey::SmbPassword, &password));
+                        if let Some(store) = secret_store.clone() {
+                            let pw_c = password.clone();
+                            rt.spawn(async move {
+                                let _ = store.set(SecretKey::SmbPassword, &pw_c).await;
+                            });
                         }
                         password
                     };
                     if let Ok(mut guard) = remote_auth.write() {
                         guard.smb = SmbConfig::new(host_t, share_t, base_t, user_t, effective_pw);
                     }
-                    let _ = evt_tx.try_send(BackendEvent::StatusNotice(
+                    events.emit(BackendEvent::StatusNotice(
                         "SMB configuration saved (password stored in Secret Service)".to_owned(),
                     ));
                 }
@@ -1632,24 +2262,20 @@ fn run_backend_thread(
                         password
                     };
                     let cfg = SmbConfig::new(host, share, base_path, username.trim(), effective_pw);
-                    let tx = evt_tx.clone();
+                    let events_c = events.clone();
                     rt.spawn(async move {
                         match SmbClient::new().test_connection(&cfg).await {
                             Ok(()) => {
-                                let _ = tx
-                                    .send(BackendEvent::StatusNotice(format!(
-                                        "SMB connected: //{}/{}",
-                                        SmbConfig::normalize_host(&cfg.host),
-                                        cfg.normalized_share()
-                                    )))
-                                    .await;
+                                events_c.emit(BackendEvent::StatusNotice(format!(
+                                    "SMB connected: //{}/{}",
+                                    SmbConfig::normalize_host(&cfg.host),
+                                    cfg.normalized_share()
+                                )));
                             }
                             Err(err) => {
-                                let _ = tx
-                                    .send(BackendEvent::ErrorNotice(format!(
-                                        "SMB test failed: {err}"
-                                    )))
-                                    .await;
+                                events_c.emit(BackendEvent::ErrorNotice(format!(
+                                    "SMB test failed: {err}"
+                                )));
                             }
                         }
                     });
@@ -1659,45 +2285,47 @@ fn run_backend_thread(
                         .read()
                         .map(|g| g.smb.clone())
                         .unwrap_or_default();
-                    let paths_c = paths.clone();
-                    let tx = evt_tx.clone();
+                    let db_c = db_worker.clone();
+                    let itx = internal_tx.clone();
+                    let events_c = events.clone();
                     rt.spawn(async move {
-                        let _ = tx
-                            .send(BackendEvent::StatusNotice(
-                                "Syncing SMB2/3 music share...".to_owned(),
-                            ))
-                            .await;
+                        events_c.emit(BackendEvent::StatusNotice(
+                            "Syncing SMB2/3 music share...".to_owned(),
+                        ));
                         match SmbClient::new()
                             .list_songs(&cfg, bitchord_netstorage::smb::SMB_DEFAULT_MAX_FILES)
                             .await
                         {
                             Ok(songs) => {
-                                let count = match LibraryDb::open(&paths_c.db_file()) {
-                                    Ok(db) => {
-                                        db.replace_prefixed_songs("smb:", &songs).unwrap_or(0)
-                                    }
-                                    Err(_) => 0,
-                                };
-                                emit_library_snapshot(&paths_c, &tx);
-                                let _ = tx
-                                    .send(BackendEvent::StatusNotice(format!(
-                                        "Synced {count} SMB track(s) into Library"
-                                    )))
-                                    .await;
+                                let count = db_c
+                                    .replace_prefixed_songs("smb:".to_owned(), songs)
+                                    .await
+                                    .unwrap_or(0);
+                                let lib = db_c.fetch_library_snapshot().await;
+                                let _ = itx.send(InternalMsg::LibraryCached(lib.clone())).await;
+                                events_c.emit(BackendEvent::LibraryLoaded(lib));
+                                events_c.emit(BackendEvent::StatusNotice(format!(
+                                    "Synced {count} SMB track(s) into Library"
+                                )));
                             }
                             Err(err) => {
-                                let _ = tx
-                                    .send(BackendEvent::ErrorNotice(format!(
-                                        "SMB sync failed: {err}"
-                                    )))
-                                    .await;
+                                events_c.emit(BackendEvent::ErrorNotice(format!(
+                                    "SMB sync failed: {err}"
+                                )));
                             }
                         }
                     });
                 }
                 BackendCommand::SetStreamBackend(choice) => {
-                    resolver = build_stream_resolver(&http_arc, &innertube, &uploads, choice);
-                    let _ = evt_tx.try_send(BackendEvent::StatusNotice(format!(
+                    stream_backend_choice = choice;
+                    resolver = build_stream_resolver(
+                        &http_arc,
+                        &innertube,
+                        &uploads,
+                        &cipher_sandbox,
+                        choice,
+                    );
+                    events.emit(BackendEvent::StatusNotice(format!(
                         "Stream resolver set to {}",
                         choice.label()
                     )));
@@ -1711,17 +2339,15 @@ fn run_backend_thread(
                             if !clean_dev.is_empty() {
                                 settings.alsa_exclusive_device = clean_dev;
                             }
-                            let _ = settings_store.save(&settings);
-                            let _ = evt_tx.try_send(BackendEvent::StatusNotice(format!(
+                            save_settings_async(&rt, &settings_path, &settings);
+                            events.emit(BackendEvent::StatusNotice(format!(
                                 "Audio output switched to {}",
                                 engine_mode.label()
                             )));
-                            let _ = evt_tx.try_send(BackendEvent::PlaybackUpdated(Box::new(
-                                engine.snapshot(),
-                            )));
+                            events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                         }
                         Err(err) => {
-                            let _ = evt_tx.try_send(BackendEvent::ErrorNotice(format!(
+                            events.emit(BackendEvent::ErrorNotice(format!(
                                 "Cannot switch output to {}: {err}",
                                 engine_mode.label()
                             )));
@@ -1731,14 +2357,15 @@ fn run_backend_thread(
                 BackendCommand::RefreshAudioDevices => {
                     let devices = enumerate_alsa_devices();
                     let count = devices.len();
-                    let _ = evt_tx.try_send(BackendEvent::AudioDevicesLoaded(devices));
-                    let _ = evt_tx.try_send(BackendEvent::StatusNotice(format!(
+                    cached_audio_devices = devices.clone();
+                    events.emit(BackendEvent::AudioDevicesLoaded(devices));
+                    events.emit(BackendEvent::StatusNotice(format!(
                         "Detected {count} ALSA hardware playback endpoint(s)"
                     )));
                 }
                 BackendCommand::SetDiscordRpc(enabled) => {
                     settings.discord_rpc_enabled = enabled;
-                    let _ = settings_store.save(&settings);
+                    save_settings_async(&rt, &settings_path, &settings);
                     if !enabled {
                         rt.spawn(async {
                             if let Ok(mut client) = DiscordIpcClient::connect_default().await {
@@ -1749,72 +2376,66 @@ fn run_backend_thread(
                 }
                 BackendCommand::ImportSpotifyPlaylist(url_or_id) => {
                     let http_c = http.clone();
-                    let db_path = paths.db_file();
-                    let paths_c = paths.clone();
-                    let tx = evt_tx.clone();
+                    let db_c = db_worker.clone();
+                    let itx = internal_tx.clone();
+                    let events_c = events.clone();
                     rt.spawn(async move {
                         let pid = SpotifyImporter::extract_playlist_id(&url_or_id)
                             .unwrap_or_else(|| url_or_id.trim().to_owned());
                         match SpotifyImporter::fetch_playlist_tracks(&http_c, &pid).await {
                             Ok((title, tracks)) => {
                                 let imported_count = tracks.len();
-                                if let Ok(mut db) = LibraryDb::open(&db_path) {
-                                    let now = unix_now_ms();
-                                    let pl_id = format!("spotify:{pid}");
-                                    let _ = db.upsert_playlist(&LocalPlaylist {
-                                        id: pl_id.clone(),
-                                        title: title.clone(),
-                                        description: format!(
-                                            "Imported from Spotify ({imported_count} tracks)"
-                                        ),
-                                        thumbnail_url: None,
-                                        source: "spotify".to_owned(),
-                                        created_at: now,
-                                        updated_at: now,
-                                    });
-                                    let mut ids = Vec::with_capacity(tracks.len());
-                                    for (idx, tr) in tracks.into_iter().enumerate() {
-                                        let vid = format!("sp:{pid}:{idx}");
-                                        let song = Song::new(&vid, tr.title, tr.artist, None);
-                                        let _ = db.upsert_song(&song);
-                                        ids.push(vid);
-                                    }
-                                    let _ = db.set_playlist_tracks(&pl_id, &ids);
+                                let now = unix_now_ms();
+                                let pl_id = format!("spotify:{pid}");
+                                let playlist = LocalPlaylist {
+                                    id: pl_id,
+                                    title: title.clone(),
+                                    description: format!(
+                                        "Imported from Spotify ({imported_count} tracks)"
+                                    ),
+                                    thumbnail_url: None,
+                                    source: "spotify".to_owned(),
+                                    created_at: now,
+                                    updated_at: now,
+                                };
+                                let mut songs = Vec::with_capacity(tracks.len());
+                                let mut ids = Vec::with_capacity(tracks.len());
+                                for (idx, tr) in tracks.into_iter().enumerate() {
+                                    let vid = format!("sp:{pid}:{idx}");
+                                    songs.push(Song::new(&vid, tr.title, tr.artist, None));
+                                    ids.push(vid);
                                 }
-                                emit_library_snapshot(&paths_c, &tx);
-                                let _ = tx
-                                    .send(BackendEvent::StatusNotice(format!(
-                                        "Imported Spotify playlist \"{title}\" ({imported_count} tracks)"
-                                    )))
-                                    .await;
+                                let _ = db_c.import_spotify_playlist(playlist, songs, ids).await;
+                                let lib = db_c.fetch_library_snapshot().await;
+                                let _ = itx.send(InternalMsg::LibraryCached(lib.clone())).await;
+                                events_c.emit(BackendEvent::LibraryLoaded(lib));
+                                events_c.emit(BackendEvent::StatusNotice(format!(
+                                    "Imported Spotify playlist \"{title}\" ({imported_count} tracks)"
+                                )));
                             }
                             Err(err) => {
-                                let _ = tx
-                                    .send(BackendEvent::ErrorNotice(format!(
-                                        "Spotify import failed: {err}"
-                                    )))
-                                    .await;
+                                events_c.emit(BackendEvent::ErrorNotice(format!(
+                                    "Spotify import failed: {err}"
+                                )));
                             }
                         }
                     });
                 }
                 BackendCommand::PartyProbeServer(server_url) => {
                     let http_c = http.clone();
-                    let tx = evt_tx.clone();
+                    let events_c = events.clone();
                     rt.spawn(async move {
                         match ListenTogetherClient::new(http_c, &server_url) {
                             Ok(client) => {
                                 let probe = client.healthz(Duration::from_secs(6)).await;
-                                let _ = tx
-                                    .send(BackendEvent::PartyServerProbed {
-                                        server: client.base_url().to_owned(),
-                                        online: probe.is_online,
-                                        latency_ms: probe.latency_ms,
-                                    })
-                                    .await;
+                                events_c.emit(BackendEvent::PartyServerProbed {
+                                    server: client.base_url().to_owned(),
+                                    online: probe.is_online,
+                                    latency_ms: probe.latency_ms,
+                                });
                             }
                             Err(err) => {
-                                let _ = tx.send(BackendEvent::ErrorNotice(err.to_string())).await;
+                                events_c.emit(BackendEvent::ErrorNotice(err.to_string()));
                             }
                         }
                     });
@@ -1823,12 +2444,13 @@ fn run_backend_thread(
                     server_url,
                     nickname,
                 } => {
+                    let pgen = party_gen.fetch_add(1, Ordering::AcqRel) + 1;
                     if let Some(prev) = party_runtime.take() {
                         prev.stop_flag.store(true, Ordering::Release);
                     }
                     settings.listen_together_server = server_url.clone();
                     settings.listen_together_nickname = nickname.clone();
-                    let _ = settings_store.save(&settings);
+                    save_settings_async(&rt, &settings_path, &settings);
 
                     let req = JoinRequest {
                         user_id: settings.device_id.clone(),
@@ -1842,36 +2464,52 @@ fn run_backend_thread(
                         max_members: None,
                         autoplay_enabled: None,
                     };
-                    match ListenTogetherClient::new(http.clone(), &server_url) {
-                        Ok(client) => match rt.block_on(client.create_party(&req)) {
-                            Ok(membership) => {
-                                party_runtime = Some(spawn_party_ws_loop(
-                                    &rt,
-                                    client,
-                                    membership.party.code.clone(),
-                                    membership.token.clone(),
-                                    Arc::clone(&party_state_shared),
-                                    evt_tx.clone(),
-                                ));
-                                let _ = evt_tx.try_send(BackendEvent::StatusNotice(format!(
-                                    "Created Listen Together party {}",
-                                    membership.party.code
-                                )));
-                            }
+                    let http_c = http.clone();
+                    let rt_c = rt.clone();
+                    let shared_c = Arc::clone(&party_state_shared);
+                    let events_c = events.clone();
+                    let itx = internal_tx.clone();
+                    let pgen_ref = Arc::clone(&party_gen);
+                    rt.spawn(async move {
+                        match ListenTogetherClient::new(http_c, &server_url) {
+                            Ok(client) => match client.create_party(&req).await {
+                                Ok(membership) => {
+                                    if pgen_ref.load(Ordering::Acquire) != pgen {
+                                        return;
+                                    }
+                                    let code = membership.party.code.clone();
+                                    let runtime = spawn_party_ws_loop(
+                                        &rt_c,
+                                        client,
+                                        code.clone(),
+                                        membership.token.clone(),
+                                        shared_c,
+                                        events_c,
+                                    );
+                                    let _ = itx
+                                        .send(InternalMsg::PartyConnected {
+                                            generation: pgen,
+                                            runtime,
+                                            message: format!("Created Listen Together party {code}"),
+                                        })
+                                        .await;
+                                }
+                                Err(err) => {
+                                    events_c.emit(BackendEvent::ErrorNotice(err.to_string()));
+                                }
+                            },
                             Err(err) => {
-                                let _ = evt_tx.try_send(BackendEvent::ErrorNotice(err.to_string()));
+                                events_c.emit(BackendEvent::ErrorNotice(err.to_string()));
                             }
-                        },
-                        Err(err) => {
-                            let _ = evt_tx.try_send(BackendEvent::ErrorNotice(err.to_string()));
                         }
-                    }
+                    });
                 }
                 BackendCommand::PartyJoin {
                     server_url,
                     code_or_url,
                     nickname,
                 } => {
+                    let pgen = party_gen.fetch_add(1, Ordering::AcqRel) + 1;
                     let code = parse_invite_url(Some(&code_or_url))
                         .unwrap_or_else(|| code_or_url.trim().to_uppercase());
                     if let Some(prev) = party_runtime.take() {
@@ -1879,7 +2517,7 @@ fn run_backend_thread(
                     }
                     settings.listen_together_server = server_url.clone();
                     settings.listen_together_nickname = nickname.clone();
-                    let _ = settings_store.save(&settings);
+                    save_settings_async(&rt, &settings_path, &settings);
 
                     let req = JoinRequest {
                         user_id: settings.device_id.clone(),
@@ -1893,244 +2531,572 @@ fn run_backend_thread(
                         max_members: None,
                         autoplay_enabled: None,
                     };
-                    match ListenTogetherClient::new(http.clone(), &server_url) {
-                        Ok(client) => match rt.block_on(client.join_party(&code, &req)) {
-                            Ok(membership) => {
-                                party_runtime = Some(spawn_party_ws_loop(
-                                    &rt,
-                                    client,
-                                    membership.party.code.clone(),
-                                    membership.token.clone(),
-                                    Arc::clone(&party_state_shared),
-                                    evt_tx.clone(),
-                                ));
-                                let _ = evt_tx.try_send(BackendEvent::StatusNotice(format!(
-                                    "Joined Listen Together party {}",
-                                    membership.party.code
-                                )));
-                            }
+                    let http_c = http.clone();
+                    let rt_c = rt.clone();
+                    let shared_c = Arc::clone(&party_state_shared);
+                    let events_c = events.clone();
+                    let itx = internal_tx.clone();
+                    let pgen_ref = Arc::clone(&party_gen);
+                    rt.spawn(async move {
+                        match ListenTogetherClient::new(http_c, &server_url) {
+                            Ok(client) => match client.join_party(&code, &req).await {
+                                Ok(membership) => {
+                                    if pgen_ref.load(Ordering::Acquire) != pgen {
+                                        return;
+                                    }
+                                    let joined_code = membership.party.code.clone();
+                                    let runtime = spawn_party_ws_loop(
+                                        &rt_c,
+                                        client,
+                                        joined_code.clone(),
+                                        membership.token.clone(),
+                                        shared_c,
+                                        events_c,
+                                    );
+                                    let _ = itx
+                                        .send(InternalMsg::PartyConnected {
+                                            generation: pgen,
+                                            runtime,
+                                            message: format!(
+                                                "Joined Listen Together party {joined_code}"
+                                            ),
+                                        })
+                                        .await;
+                                }
+                                Err(err) => {
+                                    events_c.emit(BackendEvent::ErrorNotice(err.to_string()));
+                                }
+                            },
                             Err(err) => {
-                                let _ = evt_tx.try_send(BackendEvent::ErrorNotice(err.to_string()));
+                                events_c.emit(BackendEvent::ErrorNotice(err.to_string()));
                             }
-                        },
-                        Err(err) => {
-                            let _ = evt_tx.try_send(BackendEvent::ErrorNotice(err.to_string()));
                         }
-                    }
+                    });
                 }
                 BackendCommand::PartyLeave => {
+                    party_gen.fetch_add(1, Ordering::AcqRel);
                     if let Some(pr) = party_runtime.take() {
                         pr.stop_flag.store(true, Ordering::Release);
-                        let _ = rt.block_on(pr.client.leave_party(&pr.code, &pr.token));
+                        rt.spawn(async move {
+                            let _ = pr.client.leave_party(&pr.code, &pr.token).await;
+                        });
                     }
                     let cleared = ListenTogetherState::default();
                     *party_state_shared.lock().unwrap_or_else(|e| e.into_inner()) = cleared.clone();
-                    let _ = evt_tx.try_send(BackendEvent::PartyUpdated(Box::new(cleared)));
-                    let _ = evt_tx.try_send(BackendEvent::StatusNotice(
+                    events.emit(BackendEvent::PartyUpdated(Box::new(cleared)));
+                    events.emit(BackendEvent::StatusNotice(
                         "Left Listen Together party".to_owned(),
                     ));
                 }
             }
         }
 
-        // 5. Advance audio engine clock (crossfade, gapless, sleep timer).
+        // 5. Advance audio engine clock (crossfade, gapless, sleep timer, ALSA fallback).
         let elapsed_ms = last_tick.elapsed().as_millis().min(250) as u64;
-        last_tick = std::time::Instant::now();
+        last_tick = Instant::now();
         engine.tick(elapsed_ms.max(1));
 
-        let snap = engine.snapshot();
+        let mut snap = engine.snapshot();
 
-        // Detect gapless/crossfade automatic deck handoff to the preloaded standby song!
+        // 5a. Surface output backend disconnect / ALSA->PipeWire fallback notices once.
+        if snap.output_error != last_output_error {
+            last_output_error = snap.output_error.clone();
+            if let Some(ref msg) = snap.output_error {
+                events.emit(BackendEvent::StatusNotice(msg.clone()));
+            }
+        }
+
+        // 5b. Auto-recover PipeWire/TWS disconnect or audio output fault (rate-limited).
+        if engine.needs_output_reconnect()
+            && last_reconnect_attempt.is_none_or(|t| t.elapsed() >= Duration::from_secs(2))
+        {
+            last_reconnect_attempt = Some(Instant::now());
+            let was_playing = matches!(last_state, PlaybackState::Playing | PlaybackState::Buffering);
+            let resume_pos = snap.position_ms;
+            let active_song = snap
+                .current_song
+                .clone()
+                .or_else(|| current_playing_song.clone());
+            let was_alsa = matches!(engine.output_mode(), AudioOutputMode::AlsaExclusive { .. });
+
+            match engine.recover_output_backend() {
+                Ok(true) => {
+                    let notice = if was_alsa {
+                        "ALSA device disconnected; switched to PipeWire Auto".to_owned()
+                    } else {
+                        "Audio output reconnected".to_owned()
+                    };
+                    events.emit(BackendEvent::StatusNotice(notice));
+                    snap = engine.snapshot();
+                    events.emit(BackendEvent::PlaybackUpdated(Box::new(snap.clone())));
+                    if was_playing && let Some(song) = active_song {
+                        start_async_song_load_at(
+                            &mut engine,
+                            &load_gen,
+                            &preload_gen,
+                            &mut active_load_cancel,
+                            &mut preload_cancel,
+                            &mut preloaded_next_song,
+                            &rt,
+                            &http_arc,
+                            &resolver,
+                            &remote_auth,
+                            &db_worker,
+                            &current_lyrics,
+                            song,
+                            resume_pos,
+                            false,
+                            &internal_tx,
+                            &events,
+                        );
+                        snap = engine.snapshot();
+                    }
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    events.emit(BackendEvent::ErrorNotice(format!(
+                        "Audio output recovery failed: {err}"
+                    )));
+                }
+            }
+        }
+
+        // 5c. Auto-retry mid-stream network errors from the last known position (max 3x).
+        if snap.state == PlaybackState::Error {
+            if last_state != PlaybackState::Error
+                && let Some(ref song) = current_playing_song
+                && is_retryable_remote_song(song)
+            {
+                if error_retry.video_id.as_deref() != Some(song.video_id.as_str()) {
+                    error_retry.video_id = Some(song.video_id.clone());
+                    error_retry.attempts = 0;
+                }
+                if error_retry.attempts < MAX_PLAYBACK_AUTO_RETRIES {
+                    error_retry.resume_ms = snap.position_ms;
+                    let delay = PlaybackErrorRetry::backoff_for_attempt(error_retry.attempts);
+                    error_retry.retry_at = Some(Instant::now() + delay);
+                    events.emit(BackendEvent::StatusNotice(format!(
+                        "Connection interrupted — retrying playback ({}/{})...",
+                        error_retry.attempts + 1,
+                        MAX_PLAYBACK_AUTO_RETRIES
+                    )));
+                } else {
+                    let detail = snap
+                        .last_error
+                        .clone()
+                        .unwrap_or_else(|| "Stream interrupted".to_owned());
+                    events.emit(BackendEvent::ErrorNotice(format!(
+                        "Playback interrupted for \"{}\": {detail}",
+                        song.title
+                    )));
+                }
+            } else if error_retry
+                .retry_at
+                .is_some_and(|at| Instant::now() >= at)
+                && let Some(song) = current_playing_song.clone()
+            {
+                error_retry.retry_at = None;
+                error_retry.attempts = error_retry.attempts.saturating_add(1);
+                let resume_ms = error_retry.resume_ms;
+                let err_msg = snap.last_error.as_deref().unwrap_or("");
+                let bypass_cache = error_retry.attempts >= 2
+                    || err_msg.contains("HTTP 403")
+                    || err_msg.contains("HTTP 404")
+                    || err_msg.contains("HTTP 410");
+                if bypass_cache {
+                    db_worker.delete_stream_cache_for_video(song.video_id.clone());
+                }
+                start_async_song_load_at(
+                    &mut engine,
+                    &load_gen,
+                    &preload_gen,
+                    &mut active_load_cancel,
+                    &mut preload_cancel,
+                    &mut preloaded_next_song,
+                    &rt,
+                    &http_arc,
+                    &resolver,
+                    &remote_auth,
+                    &db_worker,
+                    &current_lyrics,
+                    song,
+                    resume_ms,
+                    bypass_cache,
+                    &internal_tx,
+                    &events,
+                );
+                snap = engine.snapshot();
+            }
+        } else if snap.state == PlaybackState::Playing
+            && error_retry.attempts > 0
+            && snap.position_ms >= error_retry.resume_ms.saturating_add(1_500)
+        {
+            error_retry.reset();
+        }
+
+        // 5d. Detect gapless/crossfade automatic deck handoff to the preloaded standby song!
         if snap.state == PlaybackState::Playing
             && let Some(ref active_song) = snap.current_song
             && last_song_vid.as_deref() != Some(active_song.video_id.as_str())
         {
             last_song_vid = Some(active_song.video_id.clone());
-            if let Some(next_idx) = compute_next_index(
-                current_index,
-                queue_items.len(),
-                repeat_all,
-                repeat_one,
-                true,
-            ) && queue_items
-                .get(next_idx)
-                .is_some_and(|s| s.video_id == active_song.video_id)
-            {
-                current_index = Some(next_idx);
-                emit_queue(
-                    &queue_items,
-                    current_index,
-                    shuffle,
-                    repeat_all,
-                    repeat_one,
-                    &evt_tx,
+            current_playing_song = Some(active_song.clone());
+            preloaded_next_song = None;
+            error_retry.reset();
+
+            if queue.advance_to_matching_next(&active_song.video_id) {
+                emit_queue(&queue, &events);
+            }
+            if snap.duration_ms > 0 {
+                let dur_text = format_duration_ms(snap.duration_ms);
+                if queue.update_duration_text(&active_song.video_id, &dur_text) {
+                    emit_queue(&queue, &events);
+                }
+                db_worker.update_song_duration(
+                    active_song.video_id.clone(),
+                    snap.duration_ms,
+                    Some(dur_text),
                 );
             }
-            record_track_started(
+            record_track_started_async(
                 &rt,
-                &paths,
+                &db_worker,
                 active_song,
                 (snap.duration_ms > 0).then_some(snap.duration_ms),
                 settings.discord_rpc_enabled,
                 &snap,
-                &evt_tx,
+                &internal_tx,
+                &events,
             );
+            let cur_gen = load_gen.load(Ordering::Acquire);
+            lyrics_sync_state = LyricsSyncState::Loading;
             spawn_lyrics_lookup(
+                cur_gen,
+                Arc::clone(&load_gen),
                 &rt,
+                &db_worker,
                 &lyrics_repo,
                 &current_lyrics,
                 active_song.clone(),
                 snap.duration_ms,
-                &evt_tx,
+                &internal_tx,
+                &events,
             );
-            let cur_gen = load_gen.load(Ordering::Acquire);
-            if let Some(upcoming_idx) = compute_next_index(
-                current_index,
-                queue_items.len(),
-                repeat_all,
-                repeat_one,
-                true,
-            ) && Some(upcoming_idx) != current_index
-                && let Some(next_song) = queue_items.get(upcoming_idx).cloned()
-            {
-                spawn_preload_next(
-                    cur_gen,
-                    Arc::clone(&load_gen),
-                    &rt,
-                    Arc::clone(&http_arc),
-                    Arc::clone(&resolver),
-                    Arc::clone(&remote_auth),
-                    next_song,
-                    track_tx.clone(),
-                );
-            }
-        }
-
-        // Auto-advance queue when track cleanly finishes without a preloaded standby deck.
-        if snap.state == PlaybackState::Ended
-            && last_state == PlaybackState::Playing
-            && let Some(next_idx) = compute_next_index(
-                current_index,
-                queue_items.len(),
-                repeat_all,
-                repeat_one,
-                true,
-            )
-        {
-            current_index = Some(next_idx);
-            emit_queue(
-                &queue_items,
-                current_index,
-                shuffle,
-                repeat_all,
-                repeat_one,
-                &evt_tx,
-            );
-            let song = queue_items[next_idx].clone();
-            start_async_song_load(
-                &mut engine,
+            spawn_standby_preload_for_queue(
+                cur_gen,
                 &load_gen,
+                &preload_gen,
+                &mut preload_cancel,
+                &queue,
                 &rt,
                 &http_arc,
                 &resolver,
                 &remote_auth,
-                &lyrics_repo,
-                &current_lyrics,
-                song,
-                &track_tx,
-                &evt_tx,
+                &db_worker,
+                &internal_tx,
             );
         }
 
-        let snap = engine.snapshot();
+        // 5e. Auto-advance queue when track cleanly finishes without a preloaded standby deck.
+        if snap.state == PlaybackState::Ended
+            && last_state == PlaybackState::Playing
+            && let Some(next_idx) = queue.next_index(true)
+            && let Some(song) = queue.jump(next_idx)
+        {
+            error_retry.reset();
+            emit_queue(&queue, &events);
+            lyrics_sync_state = LyricsSyncState::Loading;
+            start_async_song_load_at(
+                &mut engine,
+                &load_gen,
+                &preload_gen,
+                &mut active_load_cancel,
+                &mut preload_cancel,
+                &mut preloaded_next_song,
+                &rt,
+                &http_arc,
+                &resolver,
+                &remote_auth,
+                &db_worker,
+                &current_lyrics,
+                song,
+                0,
+                false,
+                &internal_tx,
+                &events,
+            );
+            snap = engine.snapshot();
+        }
+
         let state_changed = snap.state != last_state;
         let pos_changed = snap.position_ms.abs_diff(last_published_pos_ms) >= 100;
         if state_changed || (snap.state == PlaybackState::Playing && pos_changed) {
             last_state = snap.state;
             last_published_pos_ms = snap.position_ms;
-            let _ = evt_tx.try_send(BackendEvent::PlaybackUpdated(Box::new(snap.clone())));
-
-            if let Some(ref svc) = mpris_svc {
-                let s = Arc::clone(svc);
-                let snap_c = snap.clone();
-                rt.spawn(async move {
-                    let mut ms = MprisState {
-                        playback_status: match snap_c.state {
-                            PlaybackState::Playing | PlaybackState::Buffering => {
-                                PlaybackStatus::Playing
-                            }
-                            PlaybackState::Paused => PlaybackStatus::Paused,
-                            PlaybackState::Stopped
-                            | PlaybackState::Ended
-                            | PlaybackState::Error => PlaybackStatus::Stopped,
-                        },
-                        rate: f64::from(snap_c.speed),
-                        volume: f64::from(snap_c.volume),
-                        position_us: (snap_c.position_ms as i64).saturating_mul(1_000),
-                        can_seek: snap_c.duration_ms > 0,
-                        can_go_next: true,
-                        can_go_previous: true,
-                        ..MprisState::default()
-                    };
-                    if let Some(ref song) = snap_c.current_song {
-                        ms.metadata = build_mpris_metadata(song, snap_c.duration_ms, None);
-                    }
-                    let _ = s.publish_state(ms).await;
-                    s.set_position_ms(snap_c.position_ms);
-                });
-            }
+            events.emit(BackendEvent::PlaybackUpdated(Box::new(snap.clone())));
+            // Updates MPRIS cached position synchronously; only emits D-Bus PropertiesChanged
+            // when playback status, track/metadata, rate, volume, or queue flags actually change.
+            sync_mpris_if_changed(&rt, mpris_svc.as_ref(), &mut last_mpris_key, &snap, &queue);
         }
     }
 }
 
-/// Immediately updates UI to `Buffering` for `song`, starts parallel lyrics lookup,
-/// and resolves + opens the audio decoder asynchronously off the backend control loop.
-#[allow(clippy::too_many_arguments)]
-fn start_async_song_load(
-    engine: &mut AudioEngine,
+fn is_retryable_remote_song(song: &Song) -> bool {
+    song.local_path.is_none() && !Path::new(&song.video_id).exists()
+}
+
+fn cancel_preload_only(
+    preload_gen: &Arc<AtomicU64>,
+    preload_cancel: &mut Option<StreamCancelToken>,
+) -> u64 {
+    let next = preload_gen.fetch_add(1, Ordering::AcqRel) + 1;
+    if let Some(tok) = preload_cancel.take() {
+        tok.cancel();
+    }
+    next
+}
+
+fn cancel_all_loads(
     load_gen: &Arc<AtomicU64>,
+    preload_gen: &Arc<AtomicU64>,
+    active_load_cancel: &mut Option<StreamCancelToken>,
+    preload_cancel: &mut Option<StreamCancelToken>,
+) -> u64 {
+    let next = load_gen.fetch_add(1, Ordering::AcqRel) + 1;
+    if let Some(tok) = active_load_cancel.take() {
+        tok.cancel();
+    }
+    let _ = cancel_preload_only(preload_gen, preload_cancel);
+    next
+}
+
+#[allow(clippy::too_many_arguments)]
+fn invalidate_and_repreload(
+    engine: &mut AudioEngine,
+    queue: &QueueController,
+    load_gen: &Arc<AtomicU64>,
+    preload_gen: &Arc<AtomicU64>,
+    preload_cancel: &mut Option<StreamCancelToken>,
+    preloaded_next_song: &mut Option<Song>,
     rt: &Handle,
     http: &Arc<Client>,
     resolver: &Arc<StreamResolver>,
     remote_auth: &Arc<RwLock<RemoteArtworkAuth>>,
-    lyrics_repo: &Arc<LyricsRepository>,
+    db_worker: &DbWorker,
+    internal_tx: &Sender<InternalMsg>,
+) {
+    let _ = cancel_preload_only(preload_gen, preload_cancel);
+    engine.clear_standby();
+    *preloaded_next_song = None;
+
+    if matches!(
+        engine.snapshot().state,
+        PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Buffering
+    ) {
+        let cur_gen = load_gen.load(Ordering::Acquire);
+        spawn_standby_preload_for_queue(
+            cur_gen,
+            load_gen,
+            preload_gen,
+            preload_cancel,
+            queue,
+            rt,
+            http,
+            resolver,
+            remote_auth,
+            db_worker,
+            internal_tx,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_standby_preload_for_queue(
+    generation: u64,
+    load_gen: &Arc<AtomicU64>,
+    preload_gen: &Arc<AtomicU64>,
+    preload_cancel: &mut Option<StreamCancelToken>,
+    queue: &QueueController,
+    rt: &Handle,
+    http: &Arc<Client>,
+    resolver: &Arc<StreamResolver>,
+    remote_auth: &Arc<RwLock<RemoteArtworkAuth>>,
+    db_worker: &DbWorker,
+    internal_tx: &Sender<InternalMsg>,
+) {
+    let Some(next_song) = queue.preload_candidate() else {
+        return;
+    };
+    let pgen = cancel_preload_only(preload_gen, preload_cancel);
+    let cancel_tok = StreamCancelToken::new();
+    *preload_cancel = Some(cancel_tok.clone());
+
+    spawn_preload_next(
+        generation,
+        pgen,
+        Arc::clone(load_gen),
+        Arc::clone(preload_gen),
+        cancel_tok,
+        rt,
+        Arc::clone(http),
+        Arc::clone(resolver),
+        Arc::clone(remote_auth),
+        db_worker.clone(),
+        next_song,
+        internal_tx.clone(),
+    );
+}
+
+fn sync_mpris_if_changed(
+    rt: &Handle,
+    mpris_svc: Option<&Arc<MprisService>>,
+    last_key: &mut Option<MprisPublishKey>,
+    snap: &PlaybackSnapshot,
+    queue: &QueueController,
+) {
+    let Some(svc) = mpris_svc else {
+        return;
+    };
+    // Always keep cached D-Bus position up to date without emitting PropertiesChanged.
+    svc.set_position_ms(snap.position_ms);
+
+    let key = MprisPublishKey::from_state(snap, queue);
+    if last_key.as_ref() == Some(&key) {
+        return;
+    }
+    *last_key = Some(key);
+
+    let loop_status = if queue.repeat_one() {
+        LoopStatus::Track
+    } else if queue.repeat_all() {
+        LoopStatus::Playlist
+    } else {
+        LoopStatus::None
+    };
+    let mut ms = MprisState {
+        playback_status: match snap.state {
+            PlaybackState::Playing | PlaybackState::Buffering => PlaybackStatus::Playing,
+            PlaybackState::Paused => PlaybackStatus::Paused,
+            PlaybackState::Stopped | PlaybackState::Ended | PlaybackState::Error => {
+                PlaybackStatus::Stopped
+            }
+        },
+        loop_status,
+        shuffle: queue.shuffle(),
+        rate: f64::from(snap.speed),
+        volume: f64::from(snap.volume),
+        position_us: (snap.position_ms as i64).saturating_mul(1_000),
+        can_seek: snap.duration_ms > 0,
+        can_go_next: queue.next_index(false).is_some(),
+        can_go_previous: !queue.is_empty(),
+        ..MprisState::default()
+    };
+    if let Some(ref song) = snap.current_song {
+        ms.metadata = build_mpris_metadata(song, snap.duration_ms, None);
+    }
+
+    let svc_c = Arc::clone(svc);
+    rt.spawn(async move {
+        let _ = svc_c.publish_state(ms).await;
+    });
+}
+
+fn notify_mpris_seeked(rt: &Handle, mpris_svc: Option<&Arc<MprisService>>, position_ms: u64) {
+    if let Some(svc) = mpris_svc {
+        let s = Arc::clone(svc);
+        rt.spawn(async move {
+            let _ = s.notify_seeked(position_ms).await;
+        });
+    }
+}
+
+fn spawn_load_home(
+    rt: &Handle,
+    yt_repo: &Arc<YtMusicRepository>,
+    internal_tx: &Sender<InternalMsg>,
+    events: &EventHub,
+) {
+    events.emit(BackendEvent::HomeLoading);
+    let repo = Arc::clone(yt_repo);
+    let itx = internal_tx.clone();
+    let events_c = events.clone();
+    rt.spawn(async move {
+        let res = repo.home().await.map_err(|e| e.to_string());
+        if let Ok(ref feed) = res {
+            let _ = itx.send(InternalMsg::HomeCached(feed.clone())).await;
+        }
+        events_c.emit(BackendEvent::HomeLoaded(res));
+    });
+}
+
+fn spawn_library_refresh(
+    rt: &Handle,
+    db_worker: &DbWorker,
+    internal_tx: &Sender<InternalMsg>,
+    events: &EventHub,
+) {
+    let db_c = db_worker.clone();
+    let itx = internal_tx.clone();
+    let events_c = events.clone();
+    rt.spawn(async move {
+        let snap = db_c.fetch_library_snapshot().await;
+        let _ = itx.send(InternalMsg::LibraryCached(snap.clone())).await;
+        events_c.emit(BackendEvent::LibraryLoaded(snap));
+    });
+}
+
+/// Immediately updates UI to `Buffering` for `song` and resolves + opens the audio decoder
+/// asynchronously off the backend control loop (cancelling any prior stalled HTTP fetch).
+#[allow(clippy::too_many_arguments)]
+fn start_async_song_load_at(
+    engine: &mut AudioEngine,
+    load_gen: &Arc<AtomicU64>,
+    preload_gen: &Arc<AtomicU64>,
+    active_load_cancel: &mut Option<StreamCancelToken>,
+    preload_cancel: &mut Option<StreamCancelToken>,
+    preloaded_next_song: &mut Option<Song>,
+    rt: &Handle,
+    http: &Arc<Client>,
+    resolver: &Arc<StreamResolver>,
+    remote_auth: &Arc<RwLock<RemoteArtworkAuth>>,
+    db_worker: &DbWorker,
     current_lyrics: &Arc<Mutex<Option<LyricsPayload>>>,
     song: Song,
-    track_tx: &Sender<InternalTrackMsg>,
-    evt_tx: &Sender<BackendEvent>,
+    resume_position_ms: u64,
+    bypass_stream_cache: bool,
+    internal_tx: &Sender<InternalMsg>,
+    events: &EventHub,
 ) {
-    let generation = load_gen.fetch_add(1, Ordering::AcqRel) + 1;
+    let generation = cancel_all_loads(load_gen, preload_gen, active_load_cancel, preload_cancel);
+    *preloaded_next_song = None;
     engine.stop();
 
-    // Publish an instant Buffering snapshot so the bottom bar & Now Playing respond in <1 ms!
+    let cancel_tok = StreamCancelToken::new();
+    *active_load_cancel = Some(cancel_tok.clone());
+
+    // Clear stale lyrics immediately so the previous track's lines never linger while loading.
+    *current_lyrics.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    events.emit(BackendEvent::LyricsLoading);
+
+    // Publish an instant Buffering snapshot so the bottom bar & Now Playing respond in <1 ms.
     let mut buffering_snap = engine.snapshot();
     buffering_snap.state = PlaybackState::Buffering;
     buffering_snap.duration_ms = duration_millis(song.duration_text.as_deref());
-    buffering_snap.position_ms = 0;
+    buffering_snap.position_ms = resume_position_ms;
     buffering_snap.current_song = Some(song.clone());
-    let _ = evt_tx.try_send(BackendEvent::PlaybackUpdated(Box::new(buffering_snap)));
-    let _ = evt_tx.try_send(BackendEvent::StatusNotice(format!(
+    events.emit(BackendEvent::PlaybackUpdated(Box::new(buffering_snap)));
+    events.emit(BackendEvent::StatusNotice(format!(
         "Loading {} - {}",
         song.title, song.artist
     )));
-
-    // Start 17-source lyrics race immediately in parallel with stream loading!
-    let est_dur_ms = duration_millis(song.duration_text.as_deref());
-    spawn_lyrics_lookup(
-        rt,
-        lyrics_repo,
-        current_lyrics,
-        song.clone(),
-        est_dur_ms,
-        evt_tx,
-    );
 
     let gen_ref = Arc::clone(load_gen);
     let http_c = Arc::clone(http);
     let resolver_c = Arc::clone(resolver);
     let remote_c = Arc::clone(remote_auth);
+    let db_c = db_worker.clone();
     let rt_c = rt.clone();
-    let tx = track_tx.clone();
+    let tx = internal_tx.clone();
 
     rt.spawn(async move {
         let prepared = prepare_track_decoder(
@@ -2138,32 +3104,37 @@ fn start_async_song_load(
             &rt_c,
             &resolver_c,
             &remote_c,
-            &song,
+            &db_c,
+            song,
             &gen_ref,
             generation,
+            cancel_tok,
+            bypass_stream_cache,
         )
         .await;
         if gen_ref.load(Ordering::Acquire) != generation {
             return;
         }
         match prepared {
-            Ok((decoder, prebuffered, loudness_db, source_label)) => {
+            Ok((enriched_song, decoder, prebuffered, loudness_db, source_label, resolved_dur)) => {
                 let _ = tx
-                    .send(InternalTrackMsg::Ready {
+                    .send(InternalMsg::Ready {
                         generation,
-                        song,
+                        song: enriched_song,
                         decoder: Box::new(decoder),
                         prebuffered,
                         loudness_db,
                         source_label,
+                        resolved_duration_ms: resolved_dur,
+                        resume_position_ms,
                     })
                     .await;
             }
-            Err(error) => {
+            Err((song_title, error)) => {
                 let _ = tx
-                    .send(InternalTrackMsg::Failed {
+                    .send(InternalMsg::Failed {
                         generation,
-                        song_title: song.title,
+                        song_title,
                         error,
                     })
                     .await;
@@ -2175,41 +3146,56 @@ fn start_async_song_load(
 #[allow(clippy::too_many_arguments)]
 fn spawn_preload_next(
     generation: u64,
+    preload_generation: u64,
     load_gen: Arc<AtomicU64>,
+    preload_gen: Arc<AtomicU64>,
+    cancel_tok: StreamCancelToken,
     rt: &Handle,
     http: Arc<Client>,
     resolver: Arc<StreamResolver>,
     remote_auth: Arc<RwLock<RemoteArtworkAuth>>,
+    db_worker: DbWorker,
     next_song: Song,
-    track_tx: Sender<InternalTrackMsg>,
+    internal_tx: Sender<InternalMsg>,
 ) {
     let rt_c = rt.clone();
     rt.spawn(async move {
-        // Brief courtesy delay so the current track's initial chunks have full bandwidth priority.
+        // Brief courtesy delay so the active track's opening chunks keep full bandwidth priority.
         tokio::time::sleep(Duration::from_millis(900)).await;
-        if load_gen.load(Ordering::Acquire) != generation {
+        if cancel_tok.is_cancelled()
+            || load_gen.load(Ordering::Acquire) != generation
+            || preload_gen.load(Ordering::Acquire) != preload_generation
+        {
             return;
         }
-        if let Ok((decoder, prebuffered, loudness_db, source_label)) = prepare_track_decoder(
-            &http,
-            &rt_c,
-            &resolver,
-            &remote_auth,
-            &next_song,
-            &load_gen,
-            generation,
-        )
-        .await
+        if let Ok((enriched, decoder, prebuffered, loudness_db, source_label, resolved_dur)) =
+            prepare_track_decoder(
+                &http,
+                &rt_c,
+                &resolver,
+                &remote_auth,
+                &db_worker,
+                next_song,
+                &load_gen,
+                generation,
+                cancel_tok.clone(),
+                false,
+            )
+            .await
+            && !cancel_tok.is_cancelled()
             && load_gen.load(Ordering::Acquire) == generation
+            && preload_gen.load(Ordering::Acquire) == preload_generation
         {
-            let _ = track_tx
-                .send(InternalTrackMsg::PreloadReady {
+            let _ = internal_tx
+                .send(InternalMsg::PreloadReady {
                     generation,
-                    song: next_song,
+                    preload_generation,
+                    song: enriched,
                     decoder: Box::new(decoder),
                     prebuffered,
                     loudness_db,
                     source_label,
+                    resolved_duration_ms: resolved_dur,
                 })
                 .await;
         }
@@ -2217,85 +3203,89 @@ fn spawn_preload_next(
 }
 
 /// Runs throttled (max 1 concurrent job) Automix musical analysis for the outgoing and
-/// preloaded incoming tracks, consulting and populating SQLite's `track_analysis` cache,
-/// then plans a transition and sends it back to the dual-deck engine.
+/// preloaded incoming tracks, consulting and populating SQLite's `track_analysis` cache
+/// via [`DbWorker`], then plans a transition and sends it back to the dual-deck engine.
 #[allow(clippy::too_many_arguments)]
 fn spawn_automix_planning(
     generation: u64,
+    preload_generation: u64,
     load_gen: Arc<AtomicU64>,
+    preload_gen: Arc<AtomicU64>,
     rt: &Handle,
     sem: Arc<tokio::sync::Semaphore>,
-    paths: AppPaths,
+    db_worker: DbWorker,
     onnx_paths: Arc<OnnxModelPaths>,
     mode: AutomixMode,
     phrase_bars: u32,
     crossfade_seconds: u32,
     outgoing: Song,
     incoming: Song,
-    track_tx: Sender<InternalTrackMsg>,
+    internal_tx: Sender<InternalMsg>,
 ) {
     rt.spawn(async move {
         let Ok(_permit) = sem.acquire().await else {
             return;
         };
-        if load_gen.load(Ordering::Acquire) != generation {
+        if load_gen.load(Ordering::Acquire) != generation
+            || preload_gen.load(Ordering::Acquire) != preload_generation
+        {
             return;
         }
         let res = tokio::task::spawn_blocking(move || {
-            let out_a = load_or_analyze_song(&paths, &onnx_paths, &outgoing);
-            let in_a = load_or_analyze_song(&paths, &onnx_paths, &incoming);
+            let out_a = load_or_analyze_song(&db_worker, &onnx_paths, &outgoing);
+            let in_a = load_or_analyze_song(&db_worker, &onnx_paths, &incoming);
             plan_transition(mode, phrase_bars, crossfade_seconds, &out_a, &in_a)
         })
         .await;
-        if load_gen.load(Ordering::Acquire) != generation {
+        if load_gen.load(Ordering::Acquire) != generation
+            || preload_gen.load(Ordering::Acquire) != preload_generation
+        {
             return;
         }
         if let Ok(plan) = res
             && plan.is_active()
         {
-            let _ = track_tx
-                .send(InternalTrackMsg::AutomixPlanned { generation, plan })
+            let _ = internal_tx
+                .send(InternalMsg::AutomixPlanned {
+                    generation,
+                    preload_generation,
+                    plan,
+                })
                 .await;
         }
     });
 }
 
 fn load_or_analyze_song(
-    paths: &AppPaths,
+    db_worker: &DbWorker,
     onnx_paths: &OnnxModelPaths,
     song: &Song,
 ) -> TrackAnalysis {
-    let db = LibraryDb::open(&paths.db_file()).ok();
-    if let Some(ref db) = db
-        && let Ok(Some(cached)) = db.get_track_analysis(&song.video_id)
+    if let Some(cached) = db_worker.get_track_analysis_blocking(song.video_id.clone())
         && cached.duration > 1.0
     {
         return cached;
     }
 
-    // Resolve local file path from `song.local_path` or downloaded file URI in SQLite.
     let local_file: Option<PathBuf> = song
         .local_path
         .as_deref()
         .map(PathBuf::from)
         .filter(|p| p.is_file())
         .or_else(|| {
-            db.as_ref()
-                .and_then(|d| d.get_download(&song.video_id).ok().flatten())
-                .and_then(|meta| meta.uri.strip_prefix("file://").map(PathBuf::from))
+            db_worker
+                .get_download_blocking(song.video_id.clone())
+                .and_then(|meta| local_path_from_uri(&meta.uri))
                 .filter(|p| p.is_file())
         });
 
     if let Some(path) = local_file
         && let Ok(analysis) = analyze_audio_file(&path, Some(onnx_paths))
     {
-        if let Some(ref db) = db {
-            let _ = db.upsert_track_analysis(&song.video_id, &analysis);
-        }
+        db_worker.upsert_track_analysis(song.video_id.clone(), analysis.clone());
         return analysis;
     }
 
-    // Graceful duration-only fallback for uncached remote streams so smooth transitions remain safe.
     let dur_sec = (duration_millis(song.duration_text.as_deref()) as f64 / 1_000.0).max(0.0);
     TrackAnalysis {
         key: -1,
@@ -2306,58 +3296,172 @@ fn load_or_analyze_song(
     }
 }
 
-type PreparedDecoderResult = (AudioDecoder, Vec<DecodedPacket>, Option<f64>, String);
+fn local_path_from_uri(uri: &str) -> Option<PathBuf> {
+    let trimmed = uri.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path_str = trimmed.strip_prefix("file://").unwrap_or(trimmed);
+    Some(PathBuf::from(path_str))
+}
 
+fn parse_url_expire_ms(url: &str) -> Option<i64> {
+    let (_, query) = url.split_once('?')?;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=')
+            && k == "expire"
+            && let Ok(secs) = v.parse::<i64>()
+            && secs > 0
+        {
+            return Some(secs.saturating_mul(1_000));
+        }
+    }
+    None
+}
+
+fn resolved_to_cached_stream(cache_key: &str, stream: &ResolvedStream, now_ms: i64) -> CachedStream {
+    const SAFETY_MARGIN_MS: i64 = 5 * 60 * 1_000;
+    const MIN_CACHE_TTL_MS: i64 = 60 * 1_000;
+    const MAX_CACHE_TTL_MS: i64 = 6 * 60 * 60 * 1_000;
+
+    let expires_at = parse_url_expire_ms(&stream.url)
+        .map(|exp| exp.saturating_sub(SAFETY_MARGIN_MS))
+        .filter(|&exp| exp > now_ms.saturating_add(MIN_CACHE_TTL_MS))
+        .map(|exp| exp.min(now_ms.saturating_add(MAX_CACHE_TTL_MS)))
+        .unwrap_or_else(|| now_ms.saturating_add(DEFAULT_STREAM_CACHE_TTL_MS));
+
+    CachedStream {
+        cache_key: cache_key.to_owned(),
+        video_id: stream.video_id.clone(),
+        url: stream.url.clone(),
+        mime_type: stream.mime_type.clone(),
+        ext: stream.ext.clone(),
+        kbps: stream.kbps,
+        content_length: stream.content_length,
+        duration_ms: stream.duration_ms,
+        loudness_db: stream.loudness_db,
+        is_live_hls: stream.is_live_hls,
+        client_name: stream.client_name.clone(),
+        profile_id: stream.profile_id.clone(),
+        media_headers: stream.media_headers.clone(),
+        range_chunk_bytes: stream.range_chunk_bytes,
+        expires_at,
+        updated_at: now_ms,
+    }
+}
+
+fn cached_to_resolved_stream(cached: CachedStream) -> ResolvedStream {
+    ResolvedStream {
+        video_id: cached.video_id,
+        url: cached.url,
+        kbps: cached.kbps,
+        mime_type: cached.mime_type,
+        ext: cached.ext,
+        content_length: cached.content_length,
+        duration_ms: cached.duration_ms,
+        loudness_db: cached.loudness_db,
+        is_live_hls: cached.is_live_hls,
+        client_name: cached.client_name,
+        profile_id: cached.profile_id,
+        media_headers: cached.media_headers,
+        range_chunk_bytes: cached.range_chunk_bytes,
+    }
+}
+
+type PreparedDecoderResult = (
+    Song,
+    AudioDecoder,
+    Vec<DecodedPacket>,
+    Option<f64>,
+    String,
+    Option<u64>,
+);
+
+#[allow(clippy::too_many_arguments)]
 async fn prepare_track_decoder(
     http: &Arc<Client>,
     rt: &Handle,
     resolver: &Arc<StreamResolver>,
     remote_auth: &Arc<RwLock<RemoteArtworkAuth>>,
-    song: &Song,
+    db_worker: &DbWorker,
+    mut song: Song,
     load_gen: &Arc<AtomicU64>,
     generation: u64,
-) -> Result<PreparedDecoderResult, String> {
-    // 1. Local file path (instant, offline; pre-decode opening packets cleanly).
-    if let Some(ref local) = song.local_path
-        && Path::new(local).exists()
-    {
-        let p = PathBuf::from(local);
-        let gen_check = Arc::clone(load_gen);
-        let (dec, prebuf) = tokio::task::spawn_blocking(move || {
-            let mut dec = AudioDecoder::open_path(&p).map_err(|e| e.to_string())?;
-            let prebuf = dec
-                .prebuffer_ms(INITIAL_PREBUFFER_MS, || {
-                    gen_check.load(Ordering::Acquire) != generation
-                })
-                .map_err(|e| e.to_string())?;
-            Ok::<_, String>((dec, prebuf))
-        })
-        .await
-        .map_err(|e| format!("decode task join error: {e}"))??;
-        return Ok((dec, prebuf, None, "Local".to_owned()));
-    }
-    if Path::new(&song.video_id).exists() {
-        let p = PathBuf::from(&song.video_id);
-        let gen_check = Arc::clone(load_gen);
-        let (dec, prebuf) = tokio::task::spawn_blocking(move || {
-            let mut dec = AudioDecoder::open_path(&p).map_err(|e| e.to_string())?;
-            let prebuf = dec
-                .prebuffer_ms(INITIAL_PREBUFFER_MS, || {
-                    gen_check.load(Ordering::Acquire) != generation
-                })
-                .map_err(|e| e.to_string())?;
-            Ok::<_, String>((dec, prebuf))
-        })
-        .await
-        .map_err(|e| format!("decode task join error: {e}"))??;
-        return Ok((dec, prebuf, None, "Local".to_owned()));
+    cancel_tok: StreamCancelToken,
+    bypass_stream_cache: bool,
+) -> Result<PreparedDecoderResult, (String, String)> {
+    let title_for_err = song.title.clone();
+    let map_err = |msg: String| (title_for_err.clone(), msg);
+
+    if cancel_tok.is_cancelled() || load_gen.load(Ordering::Acquire) != generation {
+        return Err(map_err("cancelled".to_owned()));
     }
 
-    // 2. WebDAV stream (authenticated HTTP Range via ChunkedRangeSource).
+    // 1. Direct local file path (instant, offline).
+    if let Some(local_path) = song.local_path.as_deref().map(PathBuf::from)
+        && local_path.is_file()
+    {
+        return open_local_prepared(song, local_path, "Local", load_gen, generation, cancel_tok)
+            .await
+            .map_err(map_err);
+    }
+    if Path::new(&song.video_id).is_file() {
+        let p = PathBuf::from(&song.video_id);
+        return open_local_prepared(song, p, "Local", load_gen, generation, cancel_tok)
+            .await
+            .map_err(map_err);
+    }
+
+    // 2. Check offline downloads table in SQLite before touching network!
+    if let Some(dl) = db_worker.get_download(song.video_id.clone()).await {
+        if song.duration_text.as_deref().is_none_or(str::is_empty) {
+            song.duration_text = dl.duration_text.clone();
+        }
+        if song.thumbnail_url.as_deref().is_none_or(str::is_empty) {
+            song.thumbnail_url = dl.thumbnail_url.clone();
+        }
+        if let Some(dl_path) = local_path_from_uri(&dl.uri)
+            && dl_path.is_file()
+        {
+            return open_local_prepared(song, dl_path, "Offline", load_gen, generation, cancel_tok)
+                .await
+                .map_err(map_err);
+        }
+    }
+
+    // 3. Enrich missing duration/thumbnail/local_path from cached `songs` metadata.
+    if let Some(meta) = db_worker.get_song_metadata(song.video_id.clone()).await {
+        if song.duration_text.as_deref().is_none_or(str::is_empty) {
+            song.duration_text = meta.duration_text.clone();
+        }
+        if song.thumbnail_url.as_deref().is_none_or(str::is_empty) {
+            song.thumbnail_url = meta.thumbnail_url.clone();
+        }
+        if song.album_name.is_none() {
+            song.album_name = meta.album_name.clone();
+        }
+        if let Some(local_p) = meta.local_path
+            && Path::new(&local_p).is_file()
+        {
+            song.local_path = Some(local_p.clone());
+            return open_local_prepared(
+                song,
+                PathBuf::from(local_p),
+                "Local",
+                load_gen,
+                generation,
+                cancel_tok,
+            )
+            .await
+            .map_err(map_err);
+        }
+    }
+
+    // 4. WebDAV stream (authenticated cancelable HTTP Range via ChunkedRangeSource).
     if WebDavConfig::is_webdav_id(&song.video_id) {
         let file_url = WebDavConfig::file_url_of(&song.video_id)
             .or(song.local_uri.as_deref())
-            .ok_or_else(|| "WebDAV track missing stream URL".to_owned())?
+            .ok_or_else(|| map_err("WebDAV track missing stream URL".to_owned()))?
             .to_owned();
         let webdav_cfg = remote_auth
             .read()
@@ -2397,22 +3501,32 @@ async fn prepare_track_decoder(
         let http_clone = (**http).clone();
         let rt_clone = rt.clone();
         let gen_check = Arc::clone(load_gen);
+        let cancel_open = cancel_tok.clone();
+        let cancel_prebuf = cancel_tok.clone();
         let (dec, prebuf) = tokio::task::spawn_blocking(move || {
-            let mut dec = open_http_decoder(http_clone, rt_clone, &stream, None)
-                .map_err(|e| e.to_string())?;
+            let mut dec = open_http_decoder_with_cancel(
+                http_clone,
+                rt_clone,
+                &stream,
+                None,
+                cancel_open,
+            )
+            .map_err(|e| e.to_string())?;
             let prebuf = dec
                 .prebuffer_ms(INITIAL_PREBUFFER_MS, || {
-                    gen_check.load(Ordering::Acquire) != generation
+                    cancel_prebuf.is_cancelled() || gen_check.load(Ordering::Acquire) != generation
                 })
                 .map_err(|e| e.to_string())?;
             Ok::<_, String>((dec, prebuf))
         })
         .await
-        .map_err(|e| format!("WebDAV decode join error: {e}"))??;
-        return Ok((dec, prebuf, None, "WebDAV".to_owned()));
+        .map_err(|e| map_err(format!("WebDAV decode join error: {e}")))?
+        .map_err(map_err)?;
+        let dur = dec.info().duration_ms;
+        return Ok((song, dec, prebuf, None, "WebDAV".to_owned(), dur));
     }
 
-    // 3. SMB2/3 share stream (pure-Rust chunk-cached SmbRangeReader).
+    // 5. SMB2/3 share stream (pure-Rust chunk-cached SmbRangeReader).
     if SmbConfig::is_smb_id(&song.video_id)
         || song.local_uri.as_deref().is_some_and(SmbConfig::is_smb_url)
     {
@@ -2428,101 +3542,184 @@ async fn prepare_track_decoder(
         let reader = SmbClient::new()
             .open_range_reader(&smb_cfg, &uri, rt.clone())
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| map_err(e.to_string()))?;
         let byte_len = reader.byte_len();
         let ext = extension_lower(&uri);
         let gen_check = Arc::clone(load_gen);
+        let cancel_prebuf = cancel_tok.clone();
         let (dec, prebuf) = tokio::task::spawn_blocking(move || {
             let mut dec = AudioDecoder::open_seekable_reader(reader, Some(byte_len), Some(&ext))
                 .map_err(|e| e.to_string())?;
             let prebuf = dec
                 .prebuffer_ms(INITIAL_PREBUFFER_MS, || {
-                    gen_check.load(Ordering::Acquire) != generation
+                    cancel_prebuf.is_cancelled() || gen_check.load(Ordering::Acquire) != generation
                 })
                 .map_err(|e| e.to_string())?;
             Ok::<_, String>((dec, prebuf))
         })
         .await
-        .map_err(|e| format!("SMB decode join error: {e}"))??;
-        return Ok((dec, prebuf, None, "SMB".to_owned()));
+        .map_err(|e| map_err(format!("SMB decode join error: {e}")))?
+        .map_err(map_err)?;
+        let dur = dec.info().duration_ms;
+        return Ok((song, dec, prebuf, None, "SMB".to_owned(), dur));
     }
 
-    // 2. Remote YouTube Music stream with automatic 403/404/410 profile-refusal retry
-    //    and off-thread 600 ms opening prebuffer so playback never clips the intro.
+    // 6. Remote YouTube Music stream: SQLite persistent stream_cache -> StreamResolver
+    //    (with CipherSandbox & optimistic probing) -> cancelable ChunkedRangeSource.
     let mut last_err = String::new();
     for attempt in 0..2 {
-        if load_gen.load(Ordering::Acquire) != generation {
-            return Err("cancelled".to_owned());
+        if cancel_tok.is_cancelled() || load_gen.load(Ordering::Acquire) != generation {
+            return Err(map_err("cancelled".to_owned()));
         }
         let req = ResolveRequest::for_playback(&song.video_id, u32::MAX);
-        let stream = resolver.resolve(req).await.map_err(|e| e.to_string())?;
+        let cache_key = StreamResolver::cache_key_for(&req);
 
-        if load_gen.load(Ordering::Acquire) != generation {
-            return Err("cancelled".to_owned());
+        let mut seeded_from_db = false;
+        if attempt == 0
+            && !bypass_stream_cache
+            && let Some(cached) = db_worker.get_stream_cache(cache_key.clone()).await
+        {
+            resolver.seed_cached_stream(&req, cached_to_resolved_stream(cached));
+            seeded_from_db = true;
+        }
+
+        let stream = resolver
+            .resolve(req)
+            .await
+            .map_err(|e| map_err(e.to_string()))?;
+
+        if cancel_tok.is_cancelled() || load_gen.load(Ordering::Acquire) != generation {
+            return Err(map_err("cancelled".to_owned()));
+        }
+
+        if !seeded_from_db && !stream.is_live_hls {
+            db_worker.put_stream_cache(resolved_to_cached_stream(
+                &cache_key,
+                &stream,
+                unix_now_ms(),
+            ));
         }
 
         let refused_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let refused_cb_flag = Arc::clone(&refused_flag);
         let resolver_cb = Arc::clone(resolver);
+        let db_cb = db_worker.clone();
         let vid_cb = song.video_id.clone();
         let profile_cb = stream.profile_id.clone();
         let on_refused: RefusalCallback = Arc::new(move |url, _status| {
             refused_cb_flag.store(true, Ordering::Release);
             resolver_cb.on_playback_refused(&vid_cb, &profile_cb, url);
+            db_cb.delete_stream_cache_for_video(vid_cb.clone());
         });
 
         let http_clone = (**http).clone();
         let rt_clone = rt.clone();
         let loudness = stream.loudness_db;
         let label = stream.client_name.clone();
+        let stream_dur_ms = stream.duration_ms;
         let stream_clone = stream.clone();
         let gen_check = Arc::clone(load_gen);
+        let cancel_open = cancel_tok.clone();
+        let cancel_prebuf = cancel_tok.clone();
 
         let open_res = tokio::task::spawn_blocking(move || {
-            let mut dec = open_http_decoder(http_clone, rt_clone, &stream_clone, Some(on_refused))?;
+            let mut dec = open_http_decoder_with_cancel(
+                http_clone,
+                rt_clone,
+                &stream_clone,
+                Some(on_refused),
+                cancel_open,
+            )?;
             let prebuf = dec.prebuffer_ms(INITIAL_PREBUFFER_MS, || {
-                gen_check.load(Ordering::Acquire) != generation
+                cancel_prebuf.is_cancelled() || gen_check.load(Ordering::Acquire) != generation
             })?;
             Ok::<_, bitchord_audio::EngineError>((dec, prebuf))
         })
         .await
-        .map_err(|e| format!("decoder open join error: {e}"))?;
+        .map_err(|e| map_err(format!("decoder open join error: {e}")))?;
 
         match open_res {
-            Ok((dec, prebuf)) => return Ok((dec, prebuf, loudness, label)),
+            Ok((dec, prebuf)) => {
+                let dur = dec.info().duration_ms.filter(|&d| d > 0).or(stream_dur_ms);
+                return Ok((song, dec, prebuf, loudness, label, dur));
+            }
             Err(err) => {
                 last_err = err.to_string();
+                if cancel_tok.is_cancelled() {
+                    return Err(map_err("cancelled".to_owned()));
+                }
                 let was_refused = refused_flag.load(Ordering::Acquire)
                     || last_err.contains("HTTP 403")
                     || last_err.contains("HTTP 404")
                     || last_err.contains("HTTP 410");
                 if was_refused && attempt == 0 {
                     resolver.on_playback_refused(&song.video_id, &stream.profile_id, &stream.url);
+                    db_worker.delete_stream_cache_for_video(song.video_id.clone());
                     continue;
                 }
-                return Err(last_err);
+                return Err(map_err(last_err));
             }
         }
     }
-    Err(last_err)
+    Err(map_err(last_err))
 }
 
-fn record_track_started(
+async fn open_local_prepared(
+    song: Song,
+    path: PathBuf,
+    source_label: &str,
+    load_gen: &Arc<AtomicU64>,
+    generation: u64,
+    cancel_tok: StreamCancelToken,
+) -> Result<PreparedDecoderResult, String> {
+    let gen_check = Arc::clone(load_gen);
+    let (dec, prebuf) = tokio::task::spawn_blocking(move || {
+        let mut dec = AudioDecoder::open_path(&path).map_err(|e| e.to_string())?;
+        let prebuf = dec
+            .prebuffer_ms(INITIAL_PREBUFFER_MS, || {
+                cancel_tok.is_cancelled() || gen_check.load(Ordering::Acquire) != generation
+            })
+            .map_err(|e| e.to_string())?;
+        Ok::<_, String>((dec, prebuf))
+    })
+    .await
+    .map_err(|e| format!("decode task join error: {e}"))??;
+    let dur = dec.info().duration_ms;
+    Ok((song, dec, prebuf, None, source_label.to_owned(), dur))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_track_started_async(
     rt: &Handle,
-    paths: &AppPaths,
+    db_worker: &DbWorker,
     song: &Song,
     duration_ms: Option<u64>,
     discord_enabled: bool,
     snap: &PlaybackSnapshot,
-    evt_tx: &Sender<BackendEvent>,
+    internal_tx: &Sender<InternalMsg>,
+    events: &EventHub,
 ) {
-    if let Ok(db) = LibraryDb::open(&paths.db_file()) {
-        let _ = db.upsert_song(song);
-        let dur =
-            duration_ms.unwrap_or_else(|| duration_millis(song.duration_text.as_deref())) as i64;
-        let _ = db.record_play(&song.video_id, unix_now_ms(), dur);
-    }
-    emit_library_snapshot(paths, evt_tx);
+    let song_c = song.clone();
+    let dur = duration_ms.unwrap_or_else(|| duration_millis(song.duration_text.as_deref())) as i64;
+    let db_c = db_worker.clone();
+    let itx = internal_tx.clone();
+    let events_c = events.clone();
+
+    rt.spawn(async move {
+        let stats = db_c
+            .record_track_play(song_c.clone(), unix_now_ms(), dur)
+            .await;
+        let _ = itx
+            .send(InternalMsg::LibraryTrackUpdated {
+                song: Box::new(song_c.clone()),
+                stats,
+            })
+            .await;
+        events_c.emit(BackendEvent::LibraryTrackRecorded {
+            song: Box::new(song_c),
+            stats,
+        });
+    });
 
     if discord_enabled {
         let quality_line = discord_audio_quality_line(snap.nerd_stats.as_ref());
@@ -2539,28 +3736,90 @@ fn record_track_started(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_lyrics_lookup(
+    generation: u64,
+    load_gen: Arc<AtomicU64>,
     rt: &Handle,
+    db_worker: &DbWorker,
     lyrics_repo: &Arc<LyricsRepository>,
     current_lyrics: &Arc<Mutex<Option<LyricsPayload>>>,
     song: Song,
     duration_ms: u64,
-    evt_tx: &Sender<BackendEvent>,
+    internal_tx: &Sender<InternalMsg>,
+    events: &EventHub,
 ) {
     *current_lyrics.lock().unwrap_or_else(|e| e.into_inner()) = None;
     let vid = song.video_id.clone();
-    let _ = evt_tx.try_send(BackendEvent::LyricsLoading);
+    events.emit(BackendEvent::LyricsLoading);
+
     let repo = Arc::clone(lyrics_repo);
-    let tx = evt_tx.clone();
+    let db_c = db_worker.clone();
+    let events_c = events.clone();
     let lyrics_slot = Arc::clone(current_lyrics);
+    let itx = internal_tx.clone();
     let dur_ms = duration_ms as i64;
 
     rt.spawn(async move {
+        // 1. Check persistent SQLite lyrics cache first (instant hit, zero network).
+        if let Some(cached) = db_c.get_lyrics_cache(vid.clone()).await {
+            if load_gen.load(Ordering::Acquire) != generation {
+                return;
+            }
+            if cached.not_found {
+                let err_msg = "No synced or plain lyrics available for this track.".to_owned();
+                let _ = itx
+                    .send(InternalMsg::LyricsStateUpdated {
+                        video_id: vid.clone(),
+                        state: LyricsSyncState::Error(err_msg.clone()),
+                    })
+                    .await;
+                events_c.emit(BackendEvent::LyricsLoaded {
+                    video_id: vid,
+                    result: Err(err_msg),
+                });
+                return;
+            }
+            if let Some(source) = cached.source {
+                let payload = LyricsPayload {
+                    video_id: vid.clone(),
+                    source,
+                    lines: cached.lines,
+                    translated_lines: None,
+                    translated_lang: None,
+                };
+                *lyrics_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(payload.clone());
+                let _ = itx
+                    .send(InternalMsg::LyricsStateUpdated {
+                        video_id: vid.clone(),
+                        state: LyricsSyncState::Ready(payload.clone()),
+                    })
+                    .await;
+                events_c.emit(BackendEvent::LyricsLoaded {
+                    video_id: vid,
+                    result: Ok(payload),
+                });
+                return;
+            }
+        }
+
+        // 2. Cache miss: brief delay so initial audio streaming stays uncontested.
+        tokio::time::sleep(Duration::from_millis(LYRICS_REMOTE_DELAY_MS)).await;
+        if load_gen.load(Ordering::Acquire) != generation {
+            return;
+        }
+
         let mut req = LyricsRequest::new(&song.video_id, &song.title, &song.artist, dur_ms);
         req.album = song.album_name.as_deref();
         req.prioritize_syllable_sync = true;
         let res = match repo.lyrics(&req, &LyricsCallbacks::default()).await {
             Some(found) => {
+                db_c.put_lyrics_found(
+                    vid.clone(),
+                    found.source,
+                    found.lines.clone(),
+                    DEFAULT_LYRICS_CACHE_TTL_MS,
+                );
                 let payload = LyricsPayload {
                     video_id: vid.clone(),
                     source: found.source,
@@ -2568,17 +3827,35 @@ fn spawn_lyrics_lookup(
                     translated_lines: None,
                     translated_lang: None,
                 };
-                *lyrics_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(payload.clone());
                 Ok(payload)
             }
-            None => Err("No synced or plain lyrics available for this track.".to_owned()),
+            None => {
+                db_c.put_lyrics_not_found(vid.clone(), DEFAULT_LYRICS_NOT_FOUND_TTL_MS);
+                Err("No synced or plain lyrics available for this track.".to_owned())
+            }
         };
-        let _ = tx
-            .send(BackendEvent::LyricsLoaded {
-                video_id: vid,
-                result: res,
+
+        if load_gen.load(Ordering::Acquire) != generation {
+            return;
+        }
+
+        let sync_state = match &res {
+            Ok(payload) => {
+                *lyrics_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(payload.clone());
+                LyricsSyncState::Ready(payload.clone())
+            }
+            Err(err) => LyricsSyncState::Error(err.clone()),
+        };
+        let _ = itx
+            .send(InternalMsg::LyricsStateUpdated {
+                video_id: vid.clone(),
+                state: sync_state,
             })
             .await;
+        events_c.emit(BackendEvent::LyricsLoaded {
+            video_id: vid,
+            result: res,
+        });
     });
 }
 
@@ -2588,7 +3865,7 @@ fn spawn_party_ws_loop(
     code: String,
     token: String,
     shared_state: Arc<Mutex<ListenTogetherState>>,
-    evt_tx: Sender<BackendEvent>,
+    events: EventHub,
 ) -> PartyRuntime {
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_c = Arc::clone(&stop_flag);
@@ -2601,9 +3878,7 @@ fn spawn_party_ws_loop(
         session.state.code = Some(code_c.clone());
         session.state.connection = Connection::Connecting;
         *shared_state.lock().unwrap_or_else(|e| e.into_inner()) = session.state.clone();
-        let _ = evt_tx
-            .send(BackendEvent::PartyUpdated(Box::new(session.state.clone())))
-            .await;
+        events.emit(BackendEvent::PartyUpdated(Box::new(session.state.clone())));
 
         match client_c.connect_ws(&code_c, &token_c).await {
             Ok(mut ws) => {
@@ -2613,26 +3888,30 @@ fn spawn_party_ws_loop(
                             let effects = session.apply_server_frame(frame, unix_now_ms());
                             *shared_state.lock().unwrap_or_else(|e| e.into_inner()) =
                                 session.state.clone();
-                            let _ = evt_tx
-                                .send(BackendEvent::PartyUpdated(Box::new(session.state.clone())))
-                                .await;
+                            events.emit(BackendEvent::PartyUpdated(Box::new(
+                                session.state.clone(),
+                            )));
                             if effects.leave_party {
                                 break;
                             }
                         }
                         Ok(Ok(None)) => {
                             session.on_socket_dropped();
-                            let _ = evt_tx
-                                .send(BackendEvent::PartyUpdated(Box::new(session.state.clone())))
-                                .await;
+                            *shared_state.lock().unwrap_or_else(|e| e.into_inner()) =
+                                session.state.clone();
+                            events.emit(BackendEvent::PartyUpdated(Box::new(
+                                session.state.clone(),
+                            )));
                             break;
                         }
                         Ok(Err(err)) => {
                             session.state.error = Some(err.to_string());
                             session.state.connection = Connection::Offline;
-                            let _ = evt_tx
-                                .send(BackendEvent::PartyUpdated(Box::new(session.state.clone())))
-                                .await;
+                            *shared_state.lock().unwrap_or_else(|e| e.into_inner()) =
+                                session.state.clone();
+                            events.emit(BackendEvent::PartyUpdated(Box::new(
+                                session.state.clone(),
+                            )));
                             break;
                         }
                         Err(_) => {}
@@ -2642,9 +3921,8 @@ fn spawn_party_ws_loop(
             Err(err) => {
                 session.state.error = Some(err.to_string());
                 session.state.connection = Connection::Offline;
-                let _ = evt_tx
-                    .send(BackendEvent::PartyUpdated(Box::new(session.state.clone())))
-                    .await;
+                *shared_state.lock().unwrap_or_else(|e| e.into_inner()) = session.state.clone();
+                events.emit(BackendEvent::PartyUpdated(Box::new(session.state.clone())));
             }
         }
     });
@@ -2657,16 +3935,17 @@ fn spawn_party_ws_loop(
     }
 }
 
-fn scan_local_folder_into_db(folder: &Path, paths: &AppPaths) -> Result<usize, String> {
+/// Scans a local folder on a blocking thread and collects tagged [`Song`] entries
+/// ready for a single transactional `upsert_songs_batch` call.
+fn scan_local_folder_songs(folder: &Path) -> Result<Vec<Song>, String> {
     if !folder.exists() || !folder.is_dir() {
         return Err(format!(
             "Folder does not exist or is not a directory: {}",
             folder.display()
         ));
     }
-    let db = LibraryDb::open(&paths.db_file()).map_err(|e| e.to_string())?;
     let mut stack = vec![folder.to_path_buf()];
-    let mut imported = 0usize;
+    let mut songs = Vec::new();
 
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -2709,74 +3988,17 @@ fn scan_local_folder_into_db(folder: &Path, paths: &AppPaths) -> Result<usize, S
             if let Some(ref t) = tags {
                 song.album_name = t.album.clone();
                 if t.duration_ms > 0 {
-                    let secs = t.duration_ms / 1_000;
-                    song.duration_text = Some(format!("{}:{:02}", secs / 60, secs % 60));
+                    song.duration_text = Some(format_duration_ms(t.duration_ms));
                 }
             }
-            if db.upsert_song(&song).is_ok() {
-                imported += 1;
-            }
+            songs.push(song);
         }
     }
-    Ok(imported)
+    Ok(songs)
 }
 
-fn emit_library_snapshot(paths: &AppPaths, evt_tx: &Sender<BackendEvent>) {
-    let Ok(db) = LibraryDb::open(&paths.db_file()) else {
-        return;
-    };
-    let stats = db.stats().unwrap_or_default();
-    let songs = db.search_cached_songs("", 200).unwrap_or_default();
-    let downloads = db.list_downloads().unwrap_or_default();
-    let playlists = db.list_playlists().unwrap_or_default();
-    let search_history = db.list_search_history().unwrap_or_default();
-    let _ = evt_tx.try_send(BackendEvent::LibraryLoaded(LibrarySnapshot {
-        stats,
-        songs,
-        downloads,
-        playlists,
-        search_history,
-    }));
-}
-
-fn emit_queue(
-    items: &[Song],
-    current_index: Option<usize>,
-    shuffle: bool,
-    repeat_all: bool,
-    repeat_one: bool,
-    evt_tx: &Sender<BackendEvent>,
-) {
-    let _ = evt_tx.try_send(BackendEvent::QueueUpdated(QueueViewSnapshot {
-        items: items.to_vec(),
-        current_index,
-        shuffle,
-        repeat_all,
-        repeat_one,
-    }));
-}
-
-fn compute_next_index(
-    current: Option<usize>,
-    len: usize,
-    repeat_all: bool,
-    repeat_one: bool,
-    natural_eof: bool,
-) -> Option<usize> {
-    if len == 0 {
-        return None;
-    }
-    let cur = current?;
-    if natural_eof && repeat_one {
-        return Some(cur);
-    }
-    if cur + 1 < len {
-        Some(cur + 1)
-    } else if repeat_all {
-        Some(0)
-    } else {
-        None
-    }
+fn emit_queue(queue: &QueueController, events: &EventHub) {
+    events.emit(BackendEvent::QueueUpdated(queue.snapshot()));
 }
 
 fn unix_now_ms() -> i64 {
@@ -2788,6 +4010,21 @@ fn unix_now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::queue_state::compute_next_index;
+
+    fn sample_songs(count: usize) -> Vec<Song> {
+        (0..count)
+            .map(|i| Song::new(format!("vid_{i}"), format!("Track {i}"), "Artist", None))
+            .collect()
+    }
+
+    fn test_source() -> QueueSource {
+        QueueSource {
+            title: "Test".to_owned(),
+            r#type: PlaybackSourceType::Browse,
+            id: None,
+        }
+    }
 
     #[test]
     fn queue_advancement_respects_repeat_one_repeat_all_and_bounds() {
@@ -2797,5 +4034,282 @@ mod tests {
         assert_eq!(compute_next_index(Some(1), 3, false, true, true), Some(1));
         assert_eq!(compute_next_index(Some(1), 3, false, true, false), Some(2));
         assert_eq!(compute_next_index(None, 0, true, true, true), None);
+    }
+
+    #[test]
+    fn shuffle_and_unshuffle_preserves_original_order_and_active_track() {
+        let mut q = QueueController::default();
+        let songs = sample_songs(6);
+        let original_ids: Vec<String> = songs.iter().map(|s| s.video_id.clone()).collect();
+        let started = q.play_context(&songs, 2, &test_source(), 42);
+        assert_eq!(started.as_ref().map(|s| s.video_id.as_str()), Some("vid_2"));
+        assert_eq!(q.current_index(), Some(2));
+
+        assert!(q.toggle_shuffle(999));
+        assert_eq!(q.current_index(), Some(0));
+        assert_eq!(q.current_song().map(|s| s.video_id.as_str()), Some("vid_2"));
+
+        // Move to a different track while shuffled, then unshuffle: active track stays anchored.
+        let jumped = q.jump(3).expect("valid jump");
+        let jumped_id = jumped.video_id.clone();
+
+        assert!(!q.toggle_shuffle(999));
+        let restored_ids: Vec<String> = q
+            .snapshot()
+            .items
+            .iter()
+            .map(|s| s.video_id.clone())
+            .collect();
+        assert_eq!(restored_ids, original_ids);
+        assert_eq!(
+            q.current_song().map(|s| s.video_id.as_str()),
+            Some(jumped_id.as_str())
+        );
+    }
+
+    #[test]
+    fn queue_mutations_update_preload_candidate_and_are_bounds_safe() {
+        let mut q = QueueController::default();
+        let songs = sample_songs(3);
+        q.play_context(&songs, 0, &test_source(), 1);
+        assert_eq!(
+            q.preload_candidate().map(|s| s.video_id),
+            Some("vid_1".to_owned())
+        );
+
+        // PlayNext inserts right after active item -> standby candidate changes immediately.
+        let inserted = Song::new("vid_next", "Up Next", "Artist", None);
+        assert_eq!(q.play_next(inserted), PlayNextOutcome::InsertedNext);
+        assert_eq!(
+            q.preload_candidate().map(|s| s.video_id),
+            Some("vid_next".to_owned())
+        );
+
+        // Removing the queued item shifts preload candidate back to vid_1 without panicking.
+        assert_eq!(q.remove(1), QueueRemoveOutcome::Updated);
+        assert_eq!(
+            q.preload_candidate().map(|s| s.video_id),
+            Some("vid_1".to_owned())
+        );
+
+        // Out-of-bounds removal and jump never panic.
+        assert_eq!(q.remove(99), QueueRemoveOutcome::OutOfBounds);
+        assert!(q.jump(99).is_none());
+
+        // Repeat One suppresses standby preload of another song on natural EOF.
+        q.cycle_repeat(); // repeat_all
+        assert!(q.repeat_all());
+        q.cycle_repeat(); // repeat_one
+        assert!(q.repeat_one());
+        assert!(q.preload_candidate().is_none());
+    }
+
+    #[test]
+    fn gapless_advance_and_duration_enrichment_stay_in_sync() {
+        let mut q = QueueController::default();
+        let songs = sample_songs(3);
+        q.play_context(&songs, 0, &test_source(), 7);
+
+        assert!(!q.advance_to_matching_next("wrong_vid"));
+        assert_eq!(q.current_index(), Some(0));
+
+        assert!(q.advance_to_matching_next("vid_1"));
+        assert_eq!(q.current_index(), Some(1));
+
+        assert!(q.update_duration_text("vid_1", "1:02:05"));
+        assert_eq!(
+            q.current_song().and_then(|s| s.duration_text.as_deref()),
+            Some("1:02:05")
+        );
+    }
+
+    #[test]
+    fn event_hub_evicts_oldest_when_full_without_blocking() {
+        let (hub, rx) = EventHub::new(16);
+        for i in 0..40 {
+            hub.emit(BackendEvent::StatusNotice(format!("notice-{i}")));
+        }
+        let mut received = Vec::new();
+        while let Ok(evt) = rx.try_recv() {
+            if let BackendEvent::StatusNotice(msg) = evt {
+                received.push(msg);
+            }
+        }
+        assert_eq!(received.len(), 16);
+        assert_eq!(received.last().map(String::as_str), Some("notice-39"));
+    }
+
+    #[test]
+    fn mpris_publish_key_ignores_position_ticks_and_detects_real_changes() {
+        let mut q = QueueController::default();
+        let songs = sample_songs(2);
+        q.play_context(&songs, 0, &test_source(), 1);
+
+        let engine = AudioEngine::with_null_sink();
+        let mut snap_a = engine.snapshot();
+        snap_a.state = PlaybackState::Playing;
+        snap_a.current_song = Some(songs[0].clone());
+        snap_a.duration_ms = 180_000;
+        snap_a.position_ms = 1_000;
+
+        let mut snap_b = snap_a.clone();
+        snap_b.position_ms = 15_500; // Position tick only -> identical publish key!
+
+        assert_eq!(
+            MprisPublishKey::from_state(&snap_a, &q),
+            MprisPublishKey::from_state(&snap_b, &q)
+        );
+
+        let mut snap_paused = snap_b.clone();
+        snap_paused.state = PlaybackState::Paused;
+        assert_ne!(
+            MprisPublishKey::from_state(&snap_b, &q),
+            MprisPublishKey::from_state(&snap_paused, &q)
+        );
+    }
+
+    #[test]
+    fn sync_full_state_restores_queue_playback_and_lyrics_snapshot() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test tokio runtime");
+
+        let engine = AudioEngine::with_null_sink();
+        let mut q = QueueController::default();
+        let songs = sample_songs(2);
+        q.play_context(&songs, 0, &test_source(), 1);
+
+        let lyrics_payload = LyricsPayload {
+            video_id: "vid_0".to_owned(),
+            source: LyricsSource::LrcLib,
+            lines: vec![LyricLine {
+                time_ms: 1_000,
+                text: "hello world".to_owned(),
+                words: Vec::new(),
+                sung_until_ms: None,
+                background: None,
+                alignment: Default::default(),
+                timing_source: None,
+            }],
+            translated_lines: None,
+            translated_lang: None,
+        };
+        let mut snap = engine.snapshot();
+        snap.state = PlaybackState::Playing;
+        snap.current_song = Some(songs[0].clone());
+        snap.position_ms = 42_000;
+        snap.duration_ms = 210_000;
+
+        let full = FullStateSnapshot {
+            pipewire_active: true,
+            audio_banner: None,
+            audio_devices: Vec::new(),
+            playback: snap,
+            queue: q.snapshot(),
+            lyrics: LyricsSyncState::Ready(lyrics_payload),
+            home: None,
+            library: Some(LibrarySnapshot::default()),
+            party: ListenTogetherState::default(),
+            eq_enabled: true,
+            eq_preset: EqualizerPreset::BassBoost,
+            eq_bands_db: [0.0; EqLayout::MANUAL_COUNT],
+            stream_backend: StreamBackendChoice::Auto,
+            audio_output_pref: AudioOutputPreference::PipeWireAuto,
+            selected_alsa_device: "hw:0,0".to_owned(),
+            automix_mode: AutomixMode::Off,
+            automix_phrase_bars: 0,
+            discord_rpc_enabled: false,
+        };
+
+        let (hub, rx) = EventHub::new(16);
+        hub.emit(BackendEvent::FullStateSynced(Box::new(full)));
+
+        rt.block_on(async {
+            let evt = rx.recv().await.expect("receive SyncFullState event");
+            match evt {
+                BackendEvent::FullStateSynced(restored) => {
+                    assert_eq!(restored.playback.state, PlaybackState::Playing);
+                    assert_eq!(restored.playback.position_ms, 42_000);
+                    assert_eq!(restored.queue.items.len(), 2);
+                    assert_eq!(restored.queue.current_index, Some(0));
+                    assert!(matches!(restored.lyrics, LyricsSyncState::Ready(_)));
+                    assert!(restored.eq_enabled);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn resolved_stream_cache_conversion_respects_url_expire_and_fallback() {
+        let now_ms = 1_700_000_000_000_i64;
+        let expire_secs = (now_ms / 1_000) + 3_600;
+        let stream = ResolvedStream {
+            video_id: "abc12345678".to_owned(),
+            url: format!("https://rr1.googlevideo.com/videoplayback?expire={expire_secs}&itag=251"),
+            kbps: 160,
+            mime_type: "audio/webm".to_owned(),
+            ext: "webm".to_owned(),
+            content_length: Some(4_000_000),
+            duration_ms: Some(200_000),
+            loudness_db: Some(-12.5),
+            is_live_hls: false,
+            client_name: "VISIONOS".to_owned(),
+            profile_id: "native:VISIONOS".to_owned(),
+            media_headers: Default::default(),
+            range_chunk_bytes: Some(131_072),
+        };
+        let cached = resolved_to_cached_stream("abc12345678:max:Any", &stream, now_ms);
+        assert_eq!(cached.expires_at, expire_secs * 1_000 - 300_000);
+
+        let no_expire = ResolvedStream {
+            url: "https://rr1.googlevideo.com/videoplayback?itag=251".to_owned(),
+            ..stream
+        };
+        let fallback = resolved_to_cached_stream("abc12345678:max:Any", &no_expire, now_ms);
+        assert_eq!(fallback.expires_at, now_ms + DEFAULT_STREAM_CACHE_TTL_MS);
+    }
+
+    #[test]
+    fn db_worker_round_trips_caches_batch_upsert_and_shutdown() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test tokio runtime");
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "bitchord_db_worker_test_{}_{}",
+            std::process::id(),
+            unix_now_ms()
+        ));
+        let db_path = tmp_dir.join("library.db");
+        let worker = DbWorker::start(db_path);
+
+        rt.block_on(async {
+            let count = worker
+                .upsert_songs_batch(sample_songs(4))
+                .await
+                .expect("batch upsert");
+            assert_eq!(count, 4);
+
+            worker.update_song_duration("vid_0".to_owned(), 3_723_000, None);
+            let meta = worker
+                .get_song_metadata("vid_0".to_owned())
+                .await
+                .expect("metadata hit");
+            assert_eq!(meta.duration_ms, Some(3_723_000));
+            assert_eq!(meta.duration_text.as_deref(), Some("1:02:03"));
+
+            worker.put_lyrics_not_found("vid_1".to_owned(), DEFAULT_LYRICS_NOT_FOUND_TTL_MS);
+            let lyr = worker
+                .get_lyrics_cache("vid_1".to_owned())
+                .await
+                .expect("negative lyrics cache hit");
+            assert!(lyr.not_found);
+        });
+
+        worker.shutdown_blocking();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
