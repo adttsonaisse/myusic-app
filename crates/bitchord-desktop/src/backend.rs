@@ -15,9 +15,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_channel::{Receiver, Sender, TrySendError};
 use bitchord_audio::{
     AlsaDeviceInfo, AudioDecoder, AudioEngine, AudioOutputMode, DecodedPacket, EqTuningSnapshot,
-    LoopStatus, MprisCommand, MprisService, MprisState, OUTPUT_SAMPLE_RATE, PlaybackSnapshot,
-    PlaybackState, PlaybackStatus, RefusalCallback, StreamCancelToken, analyze_audio_file,
-    build_mpris_metadata, enumerate_alsa_devices, open_http_decoder_with_cancel,
+    FallbackResumeState, LoopStatus, MprisCommand, MprisService, MprisState, OUTPUT_SAMPLE_RATE,
+    PlaybackSnapshot, PlaybackState, PlaybackStatus, RefusalCallback, StreamCancelToken,
+    analyze_audio_file, build_mpris_metadata, enumerate_alsa_devices, open_http_decoder_with_cancel,
 };
 use bitchord_automix::{
     AutomixMode, OnnxAutomixStatus, OnnxModelPaths, TrackAnalysis, TransitionPlan, plan_transition,
@@ -451,12 +451,31 @@ const LYRICS_REMOTE_DELAY_MS: u64 = 350;
 /// Maximum automatic playback retries after transient mid-stream network errors.
 const MAX_PLAYBACK_AUTO_RETRIES: u8 = 3;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct PlaybackErrorRetry {
     video_id: Option<String>,
     attempts: u8,
     resume_ms: u64,
     retry_at: Option<Instant>,
+    active: bool,
+    exhausted: bool,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RetryScheduleOutcome {
+    Scheduled { attempt_number: u8, max_attempts: u8 },
+    Exhausted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RetryAttemptPlan {
+    resume_ms: u64,
+    bypass_cache: bool,
+}
+
+fn is_refusal_error(err_msg: &str) -> bool {
+    err_msg.contains("HTTP 403") || err_msg.contains("HTTP 404") || err_msg.contains("HTTP 410")
 }
 
 impl PlaybackErrorRetry {
@@ -465,6 +484,9 @@ impl PlaybackErrorRetry {
         self.attempts = 0;
         self.resume_ms = 0;
         self.retry_at = None;
+        self.active = false;
+        self.exhausted = false;
+        self.last_error = None;
     }
 
     fn backoff_for_attempt(attempt: u8) -> Duration {
@@ -474,6 +496,286 @@ impl PlaybackErrorRetry {
             _ => Duration::from_millis(4_000),
         }
     }
+
+    fn is_waiting_for_retry(&self) -> bool {
+        self.active && self.retry_at.is_some()
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    fn resume_ms_for(&self, video_id: &str) -> Option<u64> {
+        (self.video_id.as_deref() == Some(video_id)).then_some(self.resume_ms)
+    }
+
+    fn had_failure_for(&self, video_id: &str) -> bool {
+        self.video_id.as_deref() == Some(video_id)
+            && (self.attempts > 0 || self.active || self.exhausted)
+    }
+
+    fn on_engine_error(
+        &mut self,
+        video_id: &str,
+        position_ms: u64,
+        err_msg: Option<&str>,
+        now: Instant,
+    ) -> RetryScheduleOutcome {
+        if self.video_id.as_deref() != Some(video_id) {
+            self.video_id = Some(video_id.to_owned());
+            self.attempts = 0;
+            self.resume_ms = position_ms;
+        } else if position_ms > 0 {
+            self.resume_ms = position_ms;
+        }
+        self.last_error = err_msg.map(ToOwned::to_owned);
+        self.exhausted = false;
+        if self.attempts < MAX_PLAYBACK_AUTO_RETRIES {
+            self.active = true;
+            self.retry_at = Some(now + Self::backoff_for_attempt(self.attempts));
+            RetryScheduleOutcome::Scheduled {
+                attempt_number: self.attempts + 1,
+                max_attempts: MAX_PLAYBACK_AUTO_RETRIES,
+            }
+        } else {
+            self.active = false;
+            self.retry_at = None;
+            self.exhausted = true;
+            RetryScheduleOutcome::Exhausted
+        }
+    }
+
+    fn take_due_attempt(
+        &mut self,
+        now: Instant,
+        current_error: Option<&str>,
+    ) -> Option<RetryAttemptPlan> {
+        if !self.active || !self.retry_at.is_some_and(|at| now >= at) {
+            return None;
+        }
+        self.retry_at = None;
+        self.attempts = self.attempts.saturating_add(1);
+        let err_ref = current_error
+            .or(self.last_error.as_deref())
+            .unwrap_or("");
+        let bypass_cache = self.attempts >= 2 || is_refusal_error(err_ref);
+        Some(RetryAttemptPlan {
+            resume_ms: self.resume_ms,
+            bypass_cache,
+        })
+    }
+
+    fn on_async_load_failed(
+        &mut self,
+        video_id: &str,
+        err_msg: &str,
+        now: Instant,
+    ) -> Option<RetryScheduleOutcome> {
+        if !self.active || self.video_id.as_deref() != Some(video_id) {
+            return None;
+        }
+        self.last_error = Some(err_msg.to_owned());
+        if self.attempts < MAX_PLAYBACK_AUTO_RETRIES {
+            self.retry_at = Some(now + Self::backoff_for_attempt(self.attempts));
+            Some(RetryScheduleOutcome::Scheduled {
+                attempt_number: self.attempts + 1,
+                max_attempts: MAX_PLAYBACK_AUTO_RETRIES,
+            })
+        } else {
+            self.active = false;
+            self.retry_at = None;
+            self.exhausted = true;
+            Some(RetryScheduleOutcome::Exhausted)
+        }
+    }
+
+    fn on_load_succeeded(&mut self, video_id: &str) {
+        if self.video_id.as_deref() != Some(video_id) {
+            self.reset();
+        } else {
+            self.retry_at = None;
+            self.exhausted = false;
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct InFlightTrackLoad {
+    generation: u64,
+    song: Song,
+    resume_position_ms: u64,
+}
+
+#[derive(Debug)]
+struct PlaybackLoopState {
+    last_state: PlaybackState,
+    last_song_vid: Option<String>,
+    last_published_pos_ms: u64,
+    in_flight: Option<InFlightTrackLoad>,
+}
+
+impl Default for PlaybackLoopState {
+    fn default() -> Self {
+        Self {
+            last_state: PlaybackState::Stopped,
+            last_song_vid: None,
+            last_published_pos_ms: 0,
+            in_flight: None,
+        }
+    }
+}
+
+impl PlaybackLoopState {
+    fn begin_async_load(&mut self, generation: u64, song: Song, resume_position_ms: u64) {
+        self.in_flight = Some(InFlightTrackLoad {
+            generation,
+            song,
+            resume_position_ms,
+        });
+        self.last_state = PlaybackState::Buffering;
+        self.last_published_pos_ms = resume_position_ms;
+    }
+
+    fn clear_in_flight(&mut self) {
+        self.in_flight = None;
+    }
+
+    fn finish_in_flight_if_matches(&mut self, generation: u64) -> Option<InFlightTrackLoad> {
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|load| load.generation == generation)
+        {
+            self.in_flight.take()
+        } else {
+            None
+        }
+    }
+
+    fn sync_stopped(&mut self) {
+        self.in_flight = None;
+        self.last_state = PlaybackState::Stopped;
+        self.last_song_vid = None;
+        self.last_published_pos_ms = 0;
+    }
+
+    /// Returns whether the periodic loop tick should emit `snap` to the UI.
+    /// Suppresses intermediate `Stopped` snapshots while a non-standby async track load
+    /// or auto-retry cycle owns the player bar so the UI never blanks out or resets
+    /// `last_published_pos_ms` to `0`.
+    fn should_publish_tick_snapshot(
+        &mut self,
+        snap: &PlaybackSnapshot,
+        retry: &PlaybackErrorRetry,
+    ) -> bool {
+        if snap.state == PlaybackState::Stopped
+            && (self.in_flight.is_some() || retry.is_waiting_for_retry() || retry.is_exhausted())
+        {
+            return false;
+        }
+        let state_changed = snap.state != self.last_state;
+        let pos_changed = snap.position_ms.abs_diff(self.last_published_pos_ms) >= 100;
+        if state_changed || (snap.state == PlaybackState::Playing && pos_changed) {
+            self.last_state = snap.state;
+            self.last_published_pos_ms = snap.position_ms;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Projects the observable playback snapshot for `SyncFullState` so reopening from
+    /// tray during an in-flight track load or auto-retry cycle restores `Buffering`/`Error`
+    /// with the active song and resume position instead of a blank `Stopped` snapshot.
+    fn effective_snapshot(
+        &self,
+        mut engine_snap: PlaybackSnapshot,
+        retry: &PlaybackErrorRetry,
+        current_song: Option<&Song>,
+    ) -> PlaybackSnapshot {
+        if engine_snap.state == PlaybackState::Stopped {
+            if let Some(ref load) = self.in_flight {
+                engine_snap.state = PlaybackState::Buffering;
+                engine_snap.current_song = Some(load.song.clone());
+                engine_snap.position_ms = load.resume_position_ms;
+                engine_snap.duration_ms = duration_millis(load.song.duration_text.as_deref());
+            } else if retry.is_waiting_for_retry()
+                && let Some(song) = current_song
+                && retry.video_id.as_deref() == Some(song.video_id.as_str())
+            {
+                engine_snap.state = PlaybackState::Buffering;
+                engine_snap.current_song = Some(song.clone());
+                engine_snap.position_ms = retry.resume_ms;
+                engine_snap.duration_ms = duration_millis(song.duration_text.as_deref());
+                engine_snap.last_error = retry.last_error.clone();
+            } else if retry.is_exhausted()
+                && let Some(song) = current_song
+                && retry.video_id.as_deref() == Some(song.video_id.as_str())
+            {
+                engine_snap.state = PlaybackState::Error;
+                engine_snap.current_song = Some(song.clone());
+                engine_snap.position_ms = retry.resume_ms;
+                engine_snap.duration_ms = duration_millis(song.duration_text.as_deref());
+                engine_snap.last_error = retry.last_error.clone();
+            }
+        }
+        engine_snap
+    }
+}
+
+#[derive(Debug, Default)]
+struct HomeFetchState {
+    in_flight: bool,
+    cached: Option<HomeFeed>,
+}
+
+impl HomeFetchState {
+    fn should_start_on_sync(&self) -> bool {
+        self.cached.is_none() && !self.in_flight
+    }
+
+    fn mark_started(&mut self) {
+        self.in_flight = true;
+    }
+
+    fn mark_finished(&mut self, feed: Option<HomeFeed>) {
+        self.in_flight = false;
+        if let Some(feed) = feed {
+            self.cached = Some(feed);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManualResumeTarget {
+    song: Song,
+    resume_ms: u64,
+    bypass_cache: bool,
+}
+
+fn resolve_manual_resume_target(
+    fallback_resume: Option<FallbackResumeState>,
+    active_song: Option<Song>,
+    retry: &PlaybackErrorRetry,
+    last_published_pos_ms: u64,
+) -> Option<ManualResumeTarget> {
+    if let Some(fb) = fallback_resume {
+        return Some(ManualResumeTarget {
+            song: fb.song,
+            resume_ms: fb.position_ms,
+            bypass_cache: false,
+        });
+    }
+    let song = active_song?;
+    let resume_ms = retry
+        .resume_ms_for(&song.video_id)
+        .unwrap_or(last_published_pos_ms);
+    let bypass_cache = retry.had_failure_for(&song.video_id);
+    Some(ManualResumeTarget {
+        song,
+        resume_ms,
+        bypass_cache,
+    })
 }
 
 /// Comparable key for MPRIS2 D-Bus properties so `publish_state` fires ONLY on real
@@ -541,7 +843,7 @@ enum InternalMsg {
     },
     Failed {
         generation: u64,
-        song_title: String,
+        song: Song,
         error: String,
     },
     PreloadReady {
@@ -568,7 +870,7 @@ enum InternalMsg {
         runtime: PartyRuntime,
         message: String,
     },
-    HomeCached(HomeFeed),
+    HomeFetchFinished(Option<HomeFeed>),
     LibraryCached(LibrarySnapshot),
     SearchHistoryCached(Vec<SearchHistoryEntity>),
     LibraryTrackUpdated {
@@ -785,9 +1087,8 @@ fn run_backend_thread(
     let mut preloaded_next_song: Option<Song> = None;
     let current_lyrics: Arc<Mutex<Option<LyricsPayload>>> = Arc::new(Mutex::new(None));
     let mut lyrics_sync_state = LyricsSyncState::Idle;
-    let mut cached_home: Option<HomeFeed> = None;
+    let mut home_fetch = HomeFetchState::default();
     let mut cached_library: Option<LibrarySnapshot> = None;
-    let mut home_fetch_in_flight = false;
 
     let mut eq_enabled = false;
     let mut eq_preset = EqualizerPreset::Flat;
@@ -806,9 +1107,7 @@ fn run_backend_thread(
     spawn_library_refresh(&rt, &db_worker, &internal_tx, &events);
 
     let mut last_tick = Instant::now();
-    let mut last_state = PlaybackState::Stopped;
-    let mut last_song_vid: Option<String> = None;
-    let mut last_published_pos_ms = 0u64;
+    let mut loop_state = PlaybackLoopState::default();
 
     loop {
         // 1. Wait reactively for an inbound UI command or an async internal completion.
@@ -863,6 +1162,7 @@ fn run_backend_thread(
                             &mut active_load_cancel,
                             &mut preload_cancel,
                         );
+                        loop_state.clear_in_flight();
                         error_retry.reset();
                         engine.stop();
                     }
@@ -929,6 +1229,7 @@ fn run_backend_thread(
                     if load_gen.load(Ordering::Acquire) != generation {
                         continue; // Superseded by a newer user click!
                     }
+                    loop_state.finish_in_flight_if_matches(generation);
                     let effective_dur_ms = decoder
                         .info()
                         .duration_ms
@@ -966,16 +1267,12 @@ fn run_backend_thread(
                             engine.wait_prebuffer(200, Duration::from_millis(80));
                             engine.play();
                             let snap = engine.snapshot();
-                            last_state = snap.state;
-                            last_song_vid = Some(song.video_id.clone());
+                            loop_state.last_state = snap.state;
+                            loop_state.last_song_vid = Some(song.video_id.clone());
                             current_playing_song = Some(song.clone());
                             preloaded_next_song = None;
-                            last_published_pos_ms = snap.position_ms;
-                            if error_retry.video_id.as_deref() != Some(song.video_id.as_str()) {
-                                error_retry.reset();
-                            } else {
-                                error_retry.retry_at = None;
-                            }
+                            loop_state.last_published_pos_ms = snap.position_ms;
+                            error_retry.on_load_succeeded(&song.video_id);
 
                             events.emit(BackendEvent::PlaybackUpdated(Box::new(snap.clone())));
                             events.emit(BackendEvent::StatusNotice(format!(
@@ -1038,25 +1335,37 @@ fn run_backend_thread(
                             );
                         }
                         Err(err) => {
-                            events.emit(BackendEvent::ErrorNotice(format!(
-                                "Playback failed for \"{}\": {err}",
-                                song.title
-                            )));
+                            let err_str = err.to_string();
+                            handle_async_load_failure(
+                                &engine,
+                                &mut loop_state,
+                                &mut error_retry,
+                                &song,
+                                err_str,
+                                Instant::now(),
+                                &events,
+                            );
                         }
                     }
                 }
                 InternalMsg::Failed {
                     generation,
-                    song_title,
+                    song,
                     error,
                 } => {
                     if load_gen.load(Ordering::Acquire) != generation {
                         continue;
                     }
-                    events.emit(BackendEvent::ErrorNotice(format!(
-                        "Playback failed for \"{song_title}\": {error}"
-                    )));
-                    events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
+                    loop_state.finish_in_flight_if_matches(generation);
+                    handle_async_load_failure(
+                        &engine,
+                        &mut loop_state,
+                        &mut error_retry,
+                        &song,
+                        error,
+                        Instant::now(),
+                        &events,
+                    );
                 }
                 InternalMsg::PreloadReady {
                     generation,
@@ -1172,9 +1481,8 @@ fn run_backend_thread(
                     }
                     events.emit(BackendEvent::StatusNotice(message));
                 }
-                InternalMsg::HomeCached(feed) => {
-                    home_fetch_in_flight = false;
-                    cached_home = Some(feed);
+                InternalMsg::HomeFetchFinished(feed) => {
+                    home_fetch.mark_finished(feed);
                 }
                 InternalMsg::LibraryCached(lib) => {
                     cached_library = Some(lib);
@@ -1230,10 +1538,14 @@ fn run_backend_thread(
                         pipewire_active,
                         audio_banner: audio_banner.clone(),
                         audio_devices: cached_audio_devices.clone(),
-                        playback: engine.snapshot(),
+                        playback: loop_state.effective_snapshot(
+                            engine.snapshot(),
+                            &error_retry,
+                            current_playing_song.as_ref(),
+                        ),
                         queue: queue.snapshot(),
                         lyrics: lyrics_sync_state.clone(),
-                        home: cached_home.clone(),
+                        home: home_fetch.cached.clone(),
                         library: cached_library.clone(),
                         party: party_snap,
                         eq_enabled,
@@ -1248,8 +1560,8 @@ fn run_backend_thread(
                     };
                     events.emit(BackendEvent::FullStateSynced(Box::new(full)));
 
-                    if cached_home.is_none() && !home_fetch_in_flight {
-                        home_fetch_in_flight = true;
+                    if home_fetch.should_start_on_sync() {
+                        home_fetch.mark_started();
                         spawn_load_home(&rt, &yt_repo, &internal_tx, &events);
                     }
                     if cached_library.is_none() {
@@ -1257,7 +1569,7 @@ fn run_backend_thread(
                     }
                 }
                 BackendCommand::LoadHome => {
-                    home_fetch_in_flight = true;
+                    home_fetch.mark_started();
                     spawn_load_home(&rt, &yt_repo, &internal_tx, &events);
                 }
                 BackendCommand::Search { query, filter } => {
@@ -1443,6 +1755,8 @@ fn run_backend_thread(
                         lyrics_sync_state = LyricsSyncState::Loading;
                         start_async_song_load_at(
                             &mut engine,
+                            &mut loop_state,
+                            &mut current_playing_song,
                             &load_gen,
                             &preload_gen,
                             &mut active_load_cancel,
@@ -1469,6 +1783,8 @@ fn run_backend_thread(
                         lyrics_sync_state = LyricsSyncState::Loading;
                         start_async_song_load_at(
                             &mut engine,
+                            &mut loop_state,
+                            &mut current_playing_song,
                             &load_gen,
                             &preload_gen,
                             &mut active_load_cancel,
@@ -1513,6 +1829,8 @@ fn run_backend_thread(
                         lyrics_sync_state = LyricsSyncState::Loading;
                         start_async_song_load_at(
                             &mut engine,
+                            &mut loop_state,
+                            &mut current_playing_song,
                             &load_gen,
                             &preload_gen,
                             &mut active_load_cancel,
@@ -1545,6 +1863,7 @@ fn run_backend_thread(
                         preloaded_next_song = None;
                         current_playing_song = None;
                         engine.stop();
+                        loop_state.sync_stopped();
                         emit_queue(&queue, &events);
                         events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                     }
@@ -1554,6 +1873,8 @@ fn run_backend_thread(
                         lyrics_sync_state = LyricsSyncState::Loading;
                         start_async_song_load_at(
                             &mut engine,
+                            &mut loop_state,
+                            &mut current_playing_song,
                             &load_gen,
                             &preload_gen,
                             &mut active_load_cancel,
@@ -1602,6 +1923,7 @@ fn run_backend_thread(
                     preloaded_next_song = None;
                     current_playing_song = None;
                     engine.stop();
+                    loop_state.sync_stopped();
                     emit_queue(&queue, &events);
                     events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                 }
@@ -1643,22 +1965,54 @@ fn run_backend_thread(
                 }
                 BackendCommand::PlayPause => {
                     let snap_before = engine.snapshot();
-                    if snap_before.state == PlaybackState::Error {
+                    if let Some(fb) = engine.take_fallback_resume_state() {
+                        // Resuming after an ALSA USB DAC unplug -> PipeWire fallback:
+                        // reload and seek directly to the preserved playhead position.
                         error_retry.reset();
+                        start_async_song_load_at(
+                            &mut engine,
+                            &mut loop_state,
+                            &mut current_playing_song,
+                            &load_gen,
+                            &preload_gen,
+                            &mut active_load_cancel,
+                            &mut preload_cancel,
+                            &mut preloaded_next_song,
+                            &rt,
+                            &http_arc,
+                            &resolver,
+                            &remote_auth,
+                            &db_worker,
+                            &current_lyrics,
+                            fb.song,
+                            fb.position_ms,
+                            false,
+                            &internal_tx,
+                            &events,
+                        );
+                    } else if snap_before.state == PlaybackState::Error {
                         let err_msg = snap_before.last_error.as_deref().unwrap_or("");
-                        let resume_ms = snap_before.position_ms;
-                        let needs_fresh_resolve = snap_before.current_song.is_none()
-                            || err_msg.contains("HTTP 403")
-                            || err_msg.contains("HTTP 404")
-                            || err_msg.contains("HTTP 410");
-                        if needs_fresh_resolve
-                            && let Some(song) = current_playing_song
-                                .clone()
-                                .or_else(|| queue.current_song().cloned())
-                        {
+                        let candidate_song = current_playing_song
+                            .clone()
+                            .or_else(|| queue.current_song().cloned());
+                        let resume_ms = if snap_before.position_ms > 0 {
+                            snap_before.position_ms
+                        } else {
+                            candidate_song
+                                .as_ref()
+                                .and_then(|s| error_retry.resume_ms_for(&s.video_id))
+                                .unwrap_or(loop_state.last_published_pos_ms)
+                        };
+                        let needs_fresh_resolve =
+                            snap_before.current_song.is_none() || is_refusal_error(err_msg);
+                        error_retry.reset();
+                        if needs_fresh_resolve && let Some(song) = candidate_song {
+                            resolver.invalidate_video(&song.video_id);
                             db_worker.delete_stream_cache_for_video(song.video_id.clone());
                             start_async_song_load_at(
                                 &mut engine,
+                                &mut loop_state,
+                                &mut current_playing_song,
                                 &load_gen,
                                 &preload_gen,
                                 &mut active_load_cancel,
@@ -1680,31 +2034,45 @@ fn run_backend_thread(
                             engine.play();
                             events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                         }
-                    } else if snap_before.current_song.is_none()
-                        && let Some(song) = current_playing_song
-                            .clone()
-                            .or_else(|| queue.current_song().cloned())
-                    {
-                        // e.g. after ALSA USB DAC fallback cleared deck workers.
-                        start_async_song_load_at(
-                            &mut engine,
-                            &load_gen,
-                            &preload_gen,
-                            &mut active_load_cancel,
-                            &mut preload_cancel,
-                            &mut preloaded_next_song,
-                            &rt,
-                            &http_arc,
-                            &resolver,
-                            &remote_auth,
-                            &db_worker,
-                            &current_lyrics,
-                            song,
-                            last_published_pos_ms,
-                            false,
-                            &internal_tx,
-                            &events,
-                        );
+                    } else if snap_before.current_song.is_none() {
+                        if loop_state.in_flight.is_none()
+                            && let Some(target) = resolve_manual_resume_target(
+                                None,
+                                current_playing_song
+                                    .clone()
+                                    .or_else(|| queue.current_song().cloned()),
+                                &error_retry,
+                                loop_state.last_published_pos_ms,
+                            )
+                        {
+                            error_retry.reset();
+                            if target.bypass_cache {
+                                resolver.invalidate_video(&target.song.video_id);
+                                db_worker
+                                    .delete_stream_cache_for_video(target.song.video_id.clone());
+                            }
+                            start_async_song_load_at(
+                                &mut engine,
+                                &mut loop_state,
+                                &mut current_playing_song,
+                                &load_gen,
+                                &preload_gen,
+                                &mut active_load_cancel,
+                                &mut preload_cancel,
+                                &mut preloaded_next_song,
+                                &rt,
+                                &http_arc,
+                                &resolver,
+                                &remote_auth,
+                                &db_worker,
+                                &current_lyrics,
+                                target.song,
+                                target.resume_ms,
+                                target.bypass_cache,
+                                &internal_tx,
+                                &events,
+                            );
+                        }
                     } else {
                         engine.toggle_play_pause();
                         events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
@@ -1746,11 +2114,12 @@ fn run_backend_thread(
                                     promoted.duration_text.clone(),
                                 );
                             }
-                            last_state = snap.state;
-                            last_song_vid = Some(promoted.video_id.clone());
+                            loop_state.clear_in_flight();
+                            loop_state.last_state = snap.state;
+                            loop_state.last_song_vid = Some(promoted.video_id.clone());
                             current_playing_song = Some(promoted.clone());
                             preloaded_next_song = None;
-                            last_published_pos_ms = snap.position_ms;
+                            loop_state.last_published_pos_ms = snap.position_ms;
 
                             events.emit(BackendEvent::PlaybackUpdated(Box::new(snap.clone())));
                             events.emit(BackendEvent::StatusNotice(format!(
@@ -1805,6 +2174,8 @@ fn run_backend_thread(
                             lyrics_sync_state = LyricsSyncState::Loading;
                             start_async_song_load_at(
                                 &mut engine,
+                                &mut loop_state,
+                                &mut current_playing_song,
                                 &load_gen,
                                 &preload_gen,
                                 &mut active_load_cancel,
@@ -1827,7 +2198,30 @@ fn run_backend_thread(
                 }
                 BackendCommand::PrevTrack => {
                     if engine.position_ms() > 3_500 {
-                        if let Ok(actual) = engine.seek_ms(0) {
+                        if let Some(fb) = engine.take_fallback_resume_state() {
+                            error_retry.reset();
+                            start_async_song_load_at(
+                                &mut engine,
+                                &mut loop_state,
+                                &mut current_playing_song,
+                                &load_gen,
+                                &preload_gen,
+                                &mut active_load_cancel,
+                                &mut preload_cancel,
+                                &mut preloaded_next_song,
+                                &rt,
+                                &http_arc,
+                                &resolver,
+                                &remote_auth,
+                                &db_worker,
+                                &current_lyrics,
+                                fb.song,
+                                0,
+                                false,
+                                &internal_tx,
+                                &events,
+                            );
+                        } else if let Ok(actual) = engine.seek_ms(0) {
                             notify_mpris_seeked(&rt, mpris_svc.as_ref(), actual);
                             events.emit(BackendEvent::PlaybackUpdated(Box::new(engine.snapshot())));
                         }
@@ -1839,6 +2233,8 @@ fn run_backend_thread(
                         lyrics_sync_state = LyricsSyncState::Loading;
                         start_async_song_load_at(
                             &mut engine,
+                            &mut loop_state,
+                            &mut current_playing_song,
                             &load_gen,
                             &preload_gen,
                             &mut active_load_cancel,
@@ -2611,11 +3007,17 @@ fn run_backend_thread(
             && last_reconnect_attempt.is_none_or(|t| t.elapsed() >= Duration::from_secs(2))
         {
             last_reconnect_attempt = Some(Instant::now());
-            let was_playing = matches!(last_state, PlaybackState::Playing | PlaybackState::Buffering);
-            let resume_pos = snap.position_ms;
-            let active_song = snap
-                .current_song
-                .clone()
+            let was_playing = matches!(
+                loop_state.last_state,
+                PlaybackState::Playing | PlaybackState::Buffering
+            );
+            let resume_pos = engine
+                .fallback_resume_state()
+                .map_or(snap.position_ms, |fb| fb.position_ms);
+            let active_song = engine
+                .fallback_resume_state()
+                .map(|fb| fb.song.clone())
+                .or_else(|| snap.current_song.clone())
                 .or_else(|| current_playing_song.clone());
             let was_alsa = matches!(engine.output_mode(), AudioOutputMode::AlsaExclusive { .. });
 
@@ -2628,28 +3030,38 @@ fn run_backend_thread(
                     };
                     events.emit(BackendEvent::StatusNotice(notice));
                     snap = engine.snapshot();
+                    loop_state.last_state = snap.state;
+                    loop_state.last_published_pos_ms = snap.position_ms;
                     events.emit(BackendEvent::PlaybackUpdated(Box::new(snap.clone())));
-                    if was_playing && let Some(song) = active_song {
-                        start_async_song_load_at(
-                            &mut engine,
-                            &load_gen,
-                            &preload_gen,
-                            &mut active_load_cancel,
-                            &mut preload_cancel,
-                            &mut preloaded_next_song,
-                            &rt,
-                            &http_arc,
-                            &resolver,
-                            &remote_auth,
-                            &db_worker,
-                            &current_lyrics,
-                            song,
-                            resume_pos,
-                            false,
-                            &internal_tx,
-                            &events,
-                        );
-                        snap = engine.snapshot();
+                    if was_playing {
+                        let resume_target = engine
+                            .take_fallback_resume_state()
+                            .map(|fb| (fb.song, fb.position_ms))
+                            .or_else(|| active_song.map(|s| (s, resume_pos)));
+                        if let Some((song, pos_ms)) = resume_target {
+                            start_async_song_load_at(
+                                &mut engine,
+                                &mut loop_state,
+                                &mut current_playing_song,
+                                &load_gen,
+                                &preload_gen,
+                                &mut active_load_cancel,
+                                &mut preload_cancel,
+                                &mut preloaded_next_song,
+                                &rt,
+                                &http_arc,
+                                &resolver,
+                                &remote_auth,
+                                &db_worker,
+                                &current_lyrics,
+                                song,
+                                pos_ms,
+                                false,
+                                &internal_tx,
+                                &events,
+                            );
+                            snap = engine.snapshot();
+                        }
                     }
                 }
                 Ok(false) => {}
@@ -2662,25 +3074,26 @@ fn run_backend_thread(
         }
 
         // 5c. Auto-retry mid-stream network errors from the last known position (max 3x).
-        if snap.state == PlaybackState::Error {
-            if last_state != PlaybackState::Error
-                && let Some(ref song) = current_playing_song
-                && is_retryable_remote_song(song)
-            {
-                if error_retry.video_id.as_deref() != Some(song.video_id.as_str()) {
-                    error_retry.video_id = Some(song.video_id.clone());
-                    error_retry.attempts = 0;
-                }
-                if error_retry.attempts < MAX_PLAYBACK_AUTO_RETRIES {
-                    error_retry.resume_ms = snap.position_ms;
-                    let delay = PlaybackErrorRetry::backoff_for_attempt(error_retry.attempts);
-                    error_retry.retry_at = Some(Instant::now() + delay);
+        if snap.state == PlaybackState::Error
+            && loop_state.last_state != PlaybackState::Error
+            && let Some(ref song) = current_playing_song
+            && is_retryable_remote_song(song)
+        {
+            match error_retry.on_engine_error(
+                &song.video_id,
+                snap.position_ms,
+                snap.last_error.as_deref(),
+                Instant::now(),
+            ) {
+                RetryScheduleOutcome::Scheduled {
+                    attempt_number,
+                    max_attempts,
+                } => {
                     events.emit(BackendEvent::StatusNotice(format!(
-                        "Connection interrupted — retrying playback ({}/{})...",
-                        error_retry.attempts + 1,
-                        MAX_PLAYBACK_AUTO_RETRIES
+                        "Connection interrupted — retrying playback ({attempt_number}/{max_attempts})..."
                     )));
-                } else {
+                }
+                RetryScheduleOutcome::Exhausted => {
                     let detail = snap
                         .last_error
                         .clone()
@@ -2690,45 +3103,43 @@ fn run_backend_thread(
                         song.title
                     )));
                 }
-            } else if error_retry
-                .retry_at
-                .is_some_and(|at| Instant::now() >= at)
-                && let Some(song) = current_playing_song.clone()
-            {
-                error_retry.retry_at = None;
-                error_retry.attempts = error_retry.attempts.saturating_add(1);
-                let resume_ms = error_retry.resume_ms;
-                let err_msg = snap.last_error.as_deref().unwrap_or("");
-                let bypass_cache = error_retry.attempts >= 2
-                    || err_msg.contains("HTTP 403")
-                    || err_msg.contains("HTTP 404")
-                    || err_msg.contains("HTTP 410");
-                if bypass_cache {
-                    db_worker.delete_stream_cache_for_video(song.video_id.clone());
-                }
-                start_async_song_load_at(
-                    &mut engine,
-                    &load_gen,
-                    &preload_gen,
-                    &mut active_load_cancel,
-                    &mut preload_cancel,
-                    &mut preloaded_next_song,
-                    &rt,
-                    &http_arc,
-                    &resolver,
-                    &remote_auth,
-                    &db_worker,
-                    &current_lyrics,
-                    song,
-                    resume_ms,
-                    bypass_cache,
-                    &internal_tx,
-                    &events,
-                );
-                snap = engine.snapshot();
             }
+        }
+
+        if loop_state.in_flight.is_none()
+            && matches!(snap.state, PlaybackState::Error | PlaybackState::Stopped)
+            && let Some(plan) =
+                error_retry.take_due_attempt(Instant::now(), snap.last_error.as_deref())
+            && let Some(song) = current_playing_song.clone()
+        {
+            if plan.bypass_cache {
+                resolver.invalidate_video(&song.video_id);
+                db_worker.delete_stream_cache_for_video(song.video_id.clone());
+            }
+            start_async_song_load_at(
+                &mut engine,
+                &mut loop_state,
+                &mut current_playing_song,
+                &load_gen,
+                &preload_gen,
+                &mut active_load_cancel,
+                &mut preload_cancel,
+                &mut preloaded_next_song,
+                &rt,
+                &http_arc,
+                &resolver,
+                &remote_auth,
+                &db_worker,
+                &current_lyrics,
+                song,
+                plan.resume_ms,
+                plan.bypass_cache,
+                &internal_tx,
+                &events,
+            );
+            snap = engine.snapshot();
         } else if snap.state == PlaybackState::Playing
-            && error_retry.attempts > 0
+            && (error_retry.attempts > 0 || error_retry.active || error_retry.exhausted)
             && snap.position_ms >= error_retry.resume_ms.saturating_add(1_500)
         {
             error_retry.reset();
@@ -2737,9 +3148,9 @@ fn run_backend_thread(
         // 5d. Detect gapless/crossfade automatic deck handoff to the preloaded standby song!
         if snap.state == PlaybackState::Playing
             && let Some(ref active_song) = snap.current_song
-            && last_song_vid.as_deref() != Some(active_song.video_id.as_str())
+            && loop_state.last_song_vid.as_deref() != Some(active_song.video_id.as_str())
         {
-            last_song_vid = Some(active_song.video_id.clone());
+            loop_state.last_song_vid = Some(active_song.video_id.clone());
             current_playing_song = Some(active_song.clone());
             preloaded_next_song = None;
             error_retry.reset();
@@ -2799,7 +3210,7 @@ fn run_backend_thread(
 
         // 5e. Auto-advance queue when track cleanly finishes without a preloaded standby deck.
         if snap.state == PlaybackState::Ended
-            && last_state == PlaybackState::Playing
+            && loop_state.last_state == PlaybackState::Playing
             && let Some(next_idx) = queue.next_index(true)
             && let Some(song) = queue.jump(next_idx)
         {
@@ -2808,6 +3219,8 @@ fn run_backend_thread(
             lyrics_sync_state = LyricsSyncState::Loading;
             start_async_song_load_at(
                 &mut engine,
+                &mut loop_state,
+                &mut current_playing_song,
                 &load_gen,
                 &preload_gen,
                 &mut active_load_cancel,
@@ -2828,11 +3241,7 @@ fn run_backend_thread(
             snap = engine.snapshot();
         }
 
-        let state_changed = snap.state != last_state;
-        let pos_changed = snap.position_ms.abs_diff(last_published_pos_ms) >= 100;
-        if state_changed || (snap.state == PlaybackState::Playing && pos_changed) {
-            last_state = snap.state;
-            last_published_pos_ms = snap.position_ms;
+        if loop_state.should_publish_tick_snapshot(&snap, &error_retry) {
             events.emit(BackendEvent::PlaybackUpdated(Box::new(snap.clone())));
             // Updates MPRIS cached position synchronously; only emits D-Bus PropertiesChanged
             // when playback status, track/metadata, rate, volume, or queue flags actually change.
@@ -3022,9 +3431,8 @@ fn spawn_load_home(
     let events_c = events.clone();
     rt.spawn(async move {
         let res = repo.home().await.map_err(|e| e.to_string());
-        if let Ok(ref feed) = res {
-            let _ = itx.send(InternalMsg::HomeCached(feed.clone())).await;
-        }
+        let cached = res.as_ref().ok().cloned();
+        let _ = itx.send(InternalMsg::HomeFetchFinished(cached)).await;
         events_c.emit(BackendEvent::HomeLoaded(res));
     });
 }
@@ -3045,11 +3453,68 @@ fn spawn_library_refresh(
     });
 }
 
+fn handle_async_load_failure(
+    engine: &AudioEngine,
+    loop_state: &mut PlaybackLoopState,
+    error_retry: &mut PlaybackErrorRetry,
+    song: &Song,
+    error: String,
+    now: Instant,
+    events: &EventHub,
+) {
+    match error_retry.on_async_load_failed(&song.video_id, &error, now) {
+        Some(RetryScheduleOutcome::Scheduled {
+            attempt_number,
+            max_attempts,
+        }) => {
+            loop_state.last_state = PlaybackState::Buffering;
+            loop_state.last_published_pos_ms = error_retry.resume_ms;
+            let mut retrying_snap = engine.snapshot();
+            retrying_snap.state = PlaybackState::Buffering;
+            retrying_snap.current_song = Some(song.clone());
+            retrying_snap.position_ms = error_retry.resume_ms;
+            retrying_snap.duration_ms = duration_millis(song.duration_text.as_deref());
+            retrying_snap.last_error = Some(error);
+            events.emit(BackendEvent::StatusNotice(format!(
+                "Connection interrupted — retrying playback ({attempt_number}/{max_attempts})..."
+            )));
+            events.emit(BackendEvent::PlaybackUpdated(Box::new(retrying_snap)));
+        }
+        Some(RetryScheduleOutcome::Exhausted) => {
+            loop_state.last_state = PlaybackState::Error;
+            loop_state.last_published_pos_ms = error_retry.resume_ms;
+            let mut err_snap = engine.snapshot();
+            err_snap.state = PlaybackState::Error;
+            err_snap.current_song = Some(song.clone());
+            err_snap.position_ms = error_retry.resume_ms;
+            err_snap.duration_ms = duration_millis(song.duration_text.as_deref());
+            err_snap.last_error = Some(error.clone());
+            events.emit(BackendEvent::ErrorNotice(format!(
+                "Playback failed for \"{}\": {error}",
+                song.title
+            )));
+            events.emit(BackendEvent::PlaybackUpdated(Box::new(err_snap)));
+        }
+        None => {
+            let snap = engine.snapshot();
+            loop_state.last_state = snap.state;
+            loop_state.last_published_pos_ms = snap.position_ms;
+            events.emit(BackendEvent::ErrorNotice(format!(
+                "Playback failed for \"{}\": {error}",
+                song.title
+            )));
+            events.emit(BackendEvent::PlaybackUpdated(Box::new(snap)));
+        }
+    }
+}
+
 /// Immediately updates UI to `Buffering` for `song` and resolves + opens the audio decoder
 /// asynchronously off the backend control loop (cancelling any prior stalled HTTP fetch).
 #[allow(clippy::too_many_arguments)]
 fn start_async_song_load_at(
     engine: &mut AudioEngine,
+    loop_state: &mut PlaybackLoopState,
+    current_playing_song: &mut Option<Song>,
     load_gen: &Arc<AtomicU64>,
     preload_gen: &Arc<AtomicU64>,
     active_load_cancel: &mut Option<StreamCancelToken>,
@@ -3069,7 +3534,9 @@ fn start_async_song_load_at(
 ) {
     let generation = cancel_all_loads(load_gen, preload_gen, active_load_cancel, preload_cancel);
     *preloaded_next_song = None;
+    *current_playing_song = Some(song.clone());
     engine.stop();
+    loop_state.begin_async_load(generation, song.clone(), resume_position_ms);
 
     let cancel_tok = StreamCancelToken::new();
     *active_load_cancel = Some(cancel_tok.clone());
@@ -3097,6 +3564,7 @@ fn start_async_song_load_at(
     let db_c = db_worker.clone();
     let rt_c = rt.clone();
     let tx = internal_tx.clone();
+    let song_for_err = song.clone();
 
     rt.spawn(async move {
         let prepared = prepare_track_decoder(
@@ -3130,11 +3598,11 @@ fn start_async_song_load_at(
                     })
                     .await;
             }
-            Err((song_title, error)) => {
+            Err((_song_title, error)) => {
                 let _ = tx
                     .send(InternalMsg::Failed {
                         generation,
-                        song_title,
+                        song: song_for_err,
                         error,
                     })
                     .await;
@@ -3575,12 +4043,16 @@ async fn prepare_track_decoder(
         let cache_key = StreamResolver::cache_key_for(&req);
 
         let mut seeded_from_db = false;
-        if attempt == 0
-            && !bypass_stream_cache
-            && let Some(cached) = db_worker.get_stream_cache(cache_key.clone()).await
-        {
-            resolver.seed_cached_stream(&req, cached_to_resolved_stream(cached));
-            seeded_from_db = true;
+        if attempt == 0 {
+            if bypass_stream_cache {
+                // Evict both RAM (`StreamResolver::recent`) and SQLite stream caches so retries
+                // truly fetch a fresh URL instead of reusing a stale in-memory entry.
+                resolver.invalidate_video(&song.video_id);
+                db_worker.delete_stream_cache_for_video(song.video_id.clone());
+            } else if let Some(cached) = db_worker.get_stream_cache(cache_key.clone()).await {
+                resolver.seed_cached_stream(&req, cached_to_resolved_stream(cached));
+                seeded_from_db = true;
+            }
         }
 
         let stream = resolver
@@ -3649,9 +4121,7 @@ async fn prepare_track_decoder(
                     return Err(map_err("cancelled".to_owned()));
                 }
                 let was_refused = refused_flag.load(Ordering::Acquire)
-                    || last_err.contains("HTTP 403")
-                    || last_err.contains("HTTP 404")
-                    || last_err.contains("HTTP 410");
+                    || is_refusal_error(&last_err);
                 if was_refused && attempt == 0 {
                     resolver.on_playback_refused(&song.video_id, &stream.profile_id, &stream.url);
                     db_worker.delete_stream_cache_for_video(song.video_id.clone());
@@ -4311,5 +4781,252 @@ mod tests {
 
         worker.shutdown_blocking();
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn non_standby_song_switch_does_not_overwrite_buffering_with_stopped() {
+        let mut engine = AudioEngine::with_null_sink();
+        let retry = PlaybackErrorRetry::default();
+        let songs = sample_songs(2);
+        let mut loop_state = PlaybackLoopState {
+            last_state: PlaybackState::Playing,
+            last_song_vid: Some(songs[0].video_id.clone()),
+            last_published_pos_ms: 52_000,
+            in_flight: None,
+        };
+
+        // Simulate `start_async_song_load_at` stopping the old track and emitting Buffering
+        // for track B while the decoder opens off-thread.
+        engine.stop();
+        loop_state.begin_async_load(1, songs[1].clone(), 0);
+        let stopped_snap = engine.snapshot();
+        assert_eq!(stopped_snap.state, PlaybackState::Stopped);
+        assert!(stopped_snap.current_song.is_none());
+
+        // End-of-iteration step 5 must NOT overwrite Buffering with Stopped/None.
+        assert!(!loop_state.should_publish_tick_snapshot(&stopped_snap, &retry));
+        assert_eq!(loop_state.last_state, PlaybackState::Buffering);
+
+        // Reopening from tray (`SyncFullState`) during in-flight load also sees Buffering + song B.
+        let projected = loop_state.effective_snapshot(stopped_snap.clone(), &retry, Some(&songs[1]));
+        assert_eq!(projected.state, PlaybackState::Buffering);
+        assert_eq!(
+            projected.current_song.as_ref().map(|s| s.video_id.as_str()),
+            Some("vid_1")
+        );
+
+        // Also verify resuming mid-track preserves `last_published_pos_ms` instead of zeroing it.
+        loop_state.begin_async_load(2, songs[0].clone(), 45_000);
+        assert!(!loop_state.should_publish_tick_snapshot(&stopped_snap, &retry));
+        assert_eq!(loop_state.last_published_pos_ms, 45_000);
+
+        // Once the in-flight load is explicitly cancelled/cleared (e.g. Stop), Stopped publishes cleanly.
+        loop_state.clear_in_flight();
+        assert!(loop_state.should_publish_tick_snapshot(&stopped_snap, &retry));
+        assert_eq!(loop_state.last_state, PlaybackState::Stopped);
+    }
+
+    #[test]
+    fn auto_retry_runs_all_three_attempts_and_preserves_resume_ms_for_manual_play() {
+        let engine = AudioEngine::with_null_sink();
+        let stopped_snap = engine.snapshot();
+        let song = Song::new("vid_net", "Network Track", "Artist", None);
+        let (hub, rx) = EventHub::new(32);
+
+        let mut loop_state = PlaybackLoopState {
+            last_state: PlaybackState::Playing,
+            last_song_vid: Some(song.video_id.clone()),
+            last_published_pos_ms: 45_000,
+            in_flight: None,
+        };
+        let mut retry = PlaybackErrorRetry::default();
+        let t0 = Instant::now();
+
+        // Engine hits mid-stream network error at 45s -> schedules retry 1/3 after 800ms.
+        assert_eq!(
+            retry.on_engine_error(&song.video_id, 45_000, Some("HTTP range error"), t0),
+            RetryScheduleOutcome::Scheduled {
+                attempt_number: 1,
+                max_attempts: 3,
+            }
+        );
+        assert!(retry.take_due_attempt(t0 + Duration::from_millis(500), None).is_none());
+
+        // Attempt 1 fires at +800ms (non-403 attempt 1 keeps cache; engine.stop() moves to Stopped).
+        let plan1 = retry
+            .take_due_attempt(t0 + Duration::from_millis(800), Some("HTTP range error"))
+            .expect("attempt 1 due");
+        assert_eq!(
+            plan1,
+            RetryAttemptPlan {
+                resume_ms: 45_000,
+                bypass_cache: false,
+            }
+        );
+        loop_state.begin_async_load(1, song.clone(), plan1.resume_ms);
+        assert!(!loop_state.should_publish_tick_snapshot(&stopped_snap, &retry));
+
+        // Attempt 1 fails while Wi-Fi is still down -> schedules retry 2/3 after 2s without resetting pos.
+        loop_state.finish_in_flight_if_matches(1);
+        let t1 = t0 + Duration::from_millis(1_000);
+        handle_async_load_failure(
+            &engine,
+            &mut loop_state,
+            &mut retry,
+            &song,
+            "network unreachable".to_owned(),
+            t1,
+            &hub,
+        );
+        assert!(retry.is_waiting_for_retry());
+        assert_eq!(loop_state.last_published_pos_ms, 45_000);
+        assert!(!loop_state.should_publish_tick_snapshot(&stopped_snap, &retry));
+
+        // Attempt 2 fires at t1 + 2s EVEN THOUGH engine is in Stopped state, and forces cache bypass.
+        assert!(retry.take_due_attempt(t1 + Duration::from_millis(1_500), None).is_none());
+        let plan2 = retry
+            .take_due_attempt(t1 + Duration::from_millis(2_000), None)
+            .expect("attempt 2 due");
+        assert_eq!(
+            plan2,
+            RetryAttemptPlan {
+                resume_ms: 45_000,
+                bypass_cache: true,
+            }
+        );
+        loop_state.begin_async_load(2, song.clone(), plan2.resume_ms);
+
+        // Attempt 2 fails -> schedules retry 3/3 after 4s.
+        loop_state.finish_in_flight_if_matches(2);
+        let t2 = t1 + Duration::from_millis(2_200);
+        handle_async_load_failure(
+            &engine,
+            &mut loop_state,
+            &mut retry,
+            &song,
+            "network unreachable".to_owned(),
+            t2,
+            &hub,
+        );
+        assert!(retry.is_waiting_for_retry());
+        assert_eq!(loop_state.last_published_pos_ms, 45_000);
+
+        // Attempt 3 fires at t2 + 4s with bypass_cache = true.
+        let plan3 = retry
+            .take_due_attempt(t2 + Duration::from_millis(4_000), None)
+            .expect("attempt 3 due");
+        assert_eq!(
+            plan3,
+            RetryAttemptPlan {
+                resume_ms: 45_000,
+                bypass_cache: true,
+            }
+        );
+        loop_state.begin_async_load(3, song.clone(), plan3.resume_ms);
+
+        // Attempt 3 fails -> retry cycle exhausted, Error snapshot emitted with 45s position preserved.
+        loop_state.finish_in_flight_if_matches(3);
+        let t3 = t2 + Duration::from_millis(4_200);
+        handle_async_load_failure(
+            &engine,
+            &mut loop_state,
+            &mut retry,
+            &song,
+            "network unreachable".to_owned(),
+            t3,
+            &hub,
+        );
+        assert!(retry.is_exhausted());
+        assert!(!retry.is_waiting_for_retry());
+        assert_eq!(loop_state.last_published_pos_ms, 45_000);
+        assert!(!loop_state.should_publish_tick_snapshot(&stopped_snap, &retry));
+
+        // Verify SyncFullState reflects Error at 45s instead of Stopped at 0.
+        let synced = loop_state.effective_snapshot(stopped_snap, &retry, Some(&song));
+        assert_eq!(synced.state, PlaybackState::Error);
+        assert_eq!(synced.position_ms, 45_000);
+        assert_eq!(
+            synced.current_song.as_ref().map(|s| s.video_id.as_str()),
+            Some("vid_net")
+        );
+
+        // Manual PlayPause after retries exhausted must resume from 45s with fresh URL resolution.
+        let manual = resolve_manual_resume_target(
+            None,
+            Some(song.clone()),
+            &retry,
+            0, // even if caller lost last_published_pos_ms, retry remembers 45_000
+        )
+        .expect("manual resume target");
+        assert_eq!(manual.resume_ms, 45_000);
+        assert!(manual.bypass_cache);
+
+        // Sanity-check that retry notices + final error notice were emitted.
+        let mut notices = Vec::new();
+        while let Ok(evt) = rx.try_recv() {
+            match evt {
+                BackendEvent::StatusNotice(s) => notices.push(s),
+                BackendEvent::ErrorNotice(e) => notices.push(e),
+                _ => {}
+            }
+        }
+        assert!(notices.iter().any(|m| m.contains("(2/3)")));
+        assert!(notices.iter().any(|m| m.contains("(3/3)")));
+        assert!(notices.iter().any(|m| m.contains("Playback failed")));
+    }
+
+    #[test]
+    fn home_fetch_state_resets_in_flight_on_failure_so_sync_can_retry() {
+        let mut home = HomeFetchState::default();
+        assert!(home.should_start_on_sync());
+
+        // First startup fetch begins while offline -> fails (None).
+        home.mark_started();
+        assert!(!home.should_start_on_sync());
+        home.mark_finished(None);
+        assert!(!home.in_flight);
+        assert!(home.cached.is_none());
+        assert!(
+            home.should_start_on_sync(),
+            "failed home fetch must clear in_flight so SyncFullState can retry"
+        );
+
+        // Subsequent retry succeeds -> cached and no longer auto-restarts on SyncFullState.
+        home.mark_started();
+        home.mark_finished(Some(HomeFeed {
+            shelves: Vec::new(),
+            continuation: None,
+        }));
+        assert!(!home.in_flight);
+        assert!(home.cached.is_some());
+        assert!(!home.should_start_on_sync());
+
+        // Manual refresh that fails later resets in_flight without wiping existing cached feed.
+        home.mark_started();
+        home.mark_finished(None);
+        assert!(!home.in_flight);
+        assert!(home.cached.is_some());
+    }
+
+    #[test]
+    fn manual_resume_target_prefers_fallback_resume_then_exhausted_retry() {
+        let dac_song = Song::new("vid_dac", "Hi-Res Track", "Artist", None);
+        let fallback = FallbackResumeState {
+            song: dac_song.clone(),
+            position_ms: 123_456,
+            duration_ms: 240_000,
+        };
+        let retry = PlaybackErrorRetry::default();
+
+        let from_fallback = resolve_manual_resume_target(Some(fallback), None, &retry, 0)
+            .expect("fallback resume target");
+        assert_eq!(from_fallback.song.video_id, "vid_dac");
+        assert_eq!(from_fallback.resume_ms, 123_456);
+        assert!(!from_fallback.bypass_cache);
+
+        let from_last_pos = resolve_manual_resume_target(None, Some(dac_song), &retry, 88_000)
+            .expect("last published pos target");
+        assert_eq!(from_last_pos.resume_ms, 88_000);
+        assert!(!from_last_pos.bypass_cache);
     }
 }
