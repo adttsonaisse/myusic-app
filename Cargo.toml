@@ -127,9 +127,15 @@ opt-level = 2
 opt-level = 2
 [profile.dev.package.symphonia-codec-alac]
 opt-level = 2
+[profile.dev.package.symphonia-format-mkv]
+opt-level = 2
+[profile.dev.package.symphonia-adapter-libopus]
+opt-level = 2
 [profile.dev.package.rubato]
 opt-level = 2
 [profile.dev.package.bitchord-dsp-core]
+opt-level = 2
+[profile.dev.package.bitchord-audio]
 opt-level = 2
 
 # Frame-critical UI layout/text/image decoding (gpui-ce/wgpu stays opt-level = 0 for RAM).
