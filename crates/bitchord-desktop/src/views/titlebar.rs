@@ -17,6 +17,8 @@ impl BitChordApp {
         let in_party_code = self.party.code.clone();
         let sleep_rem = self.playback.sleep_timer_remaining_ms;
         let sleep_after = self.playback.sleep_after_track;
+        let can_back = self.can_go_back();
+        let can_fwd = self.can_go_forward();
 
         div()
             .w_full()
@@ -30,6 +32,74 @@ impl BitChordApp {
             .items_center()
             .justify_between()
             .gap(px(12.0))
+            // Browser-style Back / Forward history controls (Alt+Left / Alt+Right)
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .id("tb-nav-back")
+                            .w(px(28.0))
+                            .h(px(28.0))
+                            .rounded(px(7.0))
+                            .bg(theme.surface_elevated)
+                            .border_1()
+                            .border_color(theme.border)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(can_back, |el| {
+                                el.cursor_pointer()
+                                    .hover(move |s| s.bg(theme.surface_hover))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.go_back(cx);
+                                    }))
+                            })
+                            .when(!can_back, |el| el.opacity(0.4))
+                            .child(icons::icon(
+                                icons::CHEVRON_LEFT,
+                                15.0,
+                                if can_back {
+                                    theme.text_primary
+                                } else {
+                                    theme.text_muted
+                                },
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("tb-nav-forward")
+                            .w(px(28.0))
+                            .h(px(28.0))
+                            .rounded(px(7.0))
+                            .bg(theme.surface_elevated)
+                            .border_1()
+                            .border_color(theme.border)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(can_fwd, |el| {
+                                el.cursor_pointer()
+                                    .hover(move |s| s.bg(theme.surface_hover))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.go_forward(cx);
+                                    }))
+                            })
+                            .when(!can_fwd, |el| el.opacity(0.4))
+                            .child(icons::icon(
+                                icons::CHEVRON_RIGHT,
+                                15.0,
+                                if can_fwd {
+                                    theme.text_primary
+                                } else {
+                                    theme.text_muted
+                                },
+                            )),
+                    ),
+            )
             // Left: current route title + status pills + draggable Wayland CSD spacer
             .child(
                 div()

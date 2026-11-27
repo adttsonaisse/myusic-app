@@ -97,7 +97,6 @@ pub struct QueueViewSnapshot {
     pub shuffle: bool,
     pub repeat_all: bool,
     pub repeat_one: bool,
-    #[allow(dead_code)]
     pub autoplay_start_index: Option<usize>,
 }
 
@@ -108,8 +107,8 @@ pub struct LibrarySnapshot {
     pub songs: Vec<Song>,
     pub liked_songs: Vec<Song>,
     pub downloads: Vec<SavedSongMetadata>,
-    pub playlists: Vec<LocalPlaylist>,
     #[allow(dead_code)]
+    pub playlists: Vec<LocalPlaylist>,
     pub playlist_summaries: Vec<(LocalPlaylist, usize)>,
     pub search_history: Vec<SearchHistoryRecord>,
     pub liked_video_ids: HashSet<String>,
@@ -135,7 +134,6 @@ pub enum DownloadStatus {
 
 /// Live progress snapshot for an offline track download managed via [`DownloadStore`].
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct DownloadProgress {
     pub video_id: String,
     pub title: String,
@@ -207,6 +205,7 @@ pub struct FullStateSnapshot {
 pub enum BackendCommand {
     /// Requests a full state sync snapshot (used on initial mount and tray reopen).
     SyncFullState,
+    #[allow(dead_code)]
     LoadHome,
     RefreshHome,
     Search {

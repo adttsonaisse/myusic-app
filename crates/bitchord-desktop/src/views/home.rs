@@ -9,7 +9,6 @@ use gpui::{Context, FontWeight, div, px};
 use crate::actions::Route;
 use crate::app::{BitChordApp, LoadState};
 use crate::artwork::song_thumbnail_url;
-use crate::backend::BackendCommand;
 use crate::branding;
 use crate::icons;
 
@@ -79,7 +78,7 @@ impl BitChordApp {
                                     .text_color(theme.text_primary)
                                     .hover(move |s| s.bg(theme.surface_hover))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.send(BackendCommand::LoadHome, cx);
+                                        this.refresh_home(cx);
                                     }))
                                     .child(icons::icon(icons::REFRESH, 14.5, theme.text_secondary))
                                     .child("Refresh Feed"),
@@ -262,7 +261,7 @@ impl BitChordApp {
                             .text_color(theme.text_primary)
                             .hover(move |s| s.bg(theme.surface_hover))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.send(BackendCommand::LoadHome, cx);
+                                this.refresh_home(cx);
                             }))
                             .child(icons::icon(icons::REFRESH, 13.5, theme.text_primary))
                             .child("Retry"),

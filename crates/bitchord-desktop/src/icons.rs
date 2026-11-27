@@ -152,6 +152,27 @@ pub const HISTORY: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox=
 /// Lucide `chevron-left`.
 pub const CHEVRON_LEFT: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>"##;
 
+/// Lucide `chevron-right`.
+pub const CHEVRON_RIGHT: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>"##;
+
+/// Lucide `chevron-up`.
+pub const CHEVRON_UP: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg>"##;
+
+/// Lucide `chevron-down`.
+pub const CHEVRON_DOWN: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>"##;
+
+/// Lucide `radio` (Start Radio & Autoplay indicator).
+pub const RADIO: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.9 19.1C1 15.2 1 8.8 4.9 4.9"/><path d="M7.8 16.2c-2.3-2.3-2.3-6.1 0-8.5"/><circle cx="12" cy="12" r="2"/><path d="M16.2 7.8c2.3 2.3 2.3 6.1 0 8.5"/><path d="M19.1 4.9C23 8.8 23 15.1 19.1 19"/></svg>"##;
+
+/// Lucide `check` (offline downloaded / saved confirmation).
+pub const CHECK: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>"##;
+
+/// Lucide `pencil` (rename playlist).
+pub const PENCIL: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/></svg>"##;
+
+/// Lucide `save` (save queue as playlist).
+pub const SAVE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7"/><path d="M7 3v4a1 1 0 0 0 1 1h7"/></svg>"##;
+
 /// Lucide `arrow-up-left` (fill query into search box).
 pub const ARROW_UP_LEFT: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17V7h10"/><path d="M17 17 7 7"/></svg>"##;
 
@@ -167,7 +188,7 @@ mod tests {
 
     #[test]
     fn all_lucide_icons_are_valid_24x24_svgs_and_lyrics_differs_from_queue() {
-        let icons: [(&str, &[u8]); 33] = [
+        let icons: [(&str, &[u8]); 42] = [
             ("BRAND_WAVE", BRAND_WAVE),
             ("HOME", HOME),
             ("SEARCH", SEARCH),
@@ -201,6 +222,15 @@ mod tests {
             ("TRANSLATE", TRANSLATE),
             ("CLOCK", CLOCK),
             ("LIST_PLUS", LIST_PLUS),
+            ("CHEVRON_LEFT", CHEVRON_LEFT),
+            ("CHEVRON_RIGHT", CHEVRON_RIGHT),
+            ("CHEVRON_UP", CHEVRON_UP),
+            ("CHEVRON_DOWN", CHEVRON_DOWN),
+            ("RADIO", RADIO),
+            ("CHECK", CHECK),
+            ("PENCIL", PENCIL),
+            ("SAVE", SAVE),
+            ("ARROW_UP_LEFT", ARROW_UP_LEFT),
         ];
 
         for (name, bytes) in icons {

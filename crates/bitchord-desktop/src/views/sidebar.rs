@@ -93,8 +93,7 @@ impl BitChordApp {
                                     .cursor_pointer()
                                     .hover(move |s| s.bg(theme.surface_hover))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.sidebar_collapsed = !this.sidebar_collapsed;
-                                        cx.notify();
+                                        this.toggle_sidebar(cx);
                                     }))
                                     .child(icons::icon(
                                         if collapsed {
@@ -263,6 +262,8 @@ impl BitChordApp {
     ) -> impl IntoElement {
         let active = self.route == target;
         let collapsed = self.sidebar_collapsed;
+        let active_dl_badge = (target == Route::Downloads && !self.active_downloads.is_empty())
+            .then_some(self.active_downloads.len());
         let bg = if active {
             theme.surface_elevated
         } else {
@@ -320,6 +321,8 @@ impl BitChordApp {
             .when(!collapsed, |el| {
                 el.child(
                     div()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .text_size(px(13.5))
                         .font_weight(if active {
                             FontWeight::SEMIBOLD
@@ -327,8 +330,22 @@ impl BitChordApp {
                             FontWeight::NORMAL
                         })
                         .text_color(fg)
+                        .truncate()
                         .child(label),
                 )
+                .when_some(active_dl_badge, |b_el, n| {
+                    b_el.child(
+                        div()
+                            .px(px(6.0))
+                            .py(px(1.0))
+                            .rounded_full()
+                            .bg(theme.accent)
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme.on_accent)
+                            .child(format!("{n}")),
+                    )
+                })
             })
     }
 }

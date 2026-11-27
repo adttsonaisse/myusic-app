@@ -54,6 +54,34 @@ pub enum LoadState<T> {
     Error(String),
 }
 
+/// Top-level sections inside the daily-driver Library screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LibraryTab {
+    #[default]
+    AllSongs,
+    Liked,
+    Playlists,
+    Downloads,
+}
+
+impl LibraryTab {
+    pub const ALL: [Self; 4] = [
+        Self::AllSongs,
+        Self::Liked,
+        Self::Playlists,
+        Self::Downloads,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::AllSongs => "Songs",
+            Self::Liked => "Liked Songs",
+            Self::Playlists => "Playlists",
+            Self::Downloads => "Downloads",
+        }
+    }
+}
+
 /// Source filter tabs for the unified Library screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LibrarySourceFilter {
@@ -140,11 +168,16 @@ pub struct BitChordApp {
     pub show_translated_lyrics: bool,
     pub library: LibrarySnapshot,
     pub liked_video_ids: HashSet<String>,
+    pub library_tab: LibraryTab,
     pub library_source_filter: LibrarySourceFilter,
     pub library_search_query: String,
     pub library_search_results: Option<Vec<Song>>,
     pub selected_playlist_id: Option<String>,
     pub selected_playlist_songs: LoadState<Vec<Song>>,
+    pub playlist_create_open: bool,
+    pub playlist_rename_id: Option<String>,
+    pub queue_save_open: bool,
+    pub playlist_picker_song: Option<Song>,
     pub active_downloads: HashMap<String, DownloadProgress>,
     pub party: ListenTogetherState,
     pub party_probe_status: Option<String>,
@@ -173,6 +206,11 @@ pub struct BitChordApp {
 
     // Reusable keyboard-accessible inputs
     pub search_input: Entity<TextInput>,
+    pub library_search_input: Entity<TextInput>,
+    pub new_playlist_input: Entity<TextInput>,
+    pub rename_playlist_input: Entity<TextInput>,
+    pub queue_save_input: Entity<TextInput>,
+    pub picker_new_playlist_input: Entity<TextInput>,
     pub folder_input: Entity<TextInput>,
     pub party_server_input: Entity<TextInput>,
     pub party_code_input: Entity<TextInput>,
@@ -205,6 +243,15 @@ impl BitChordApp {
         let search_input = cx.new(|cx| {
             TextInput::new("Search songs, artists, albums...", cx).with_leading_icon(icons::SEARCH)
         });
+        let library_search_input = cx.new(|cx| {
+            TextInput::new("Instant search library (title, artist, album)...", cx)
+                .with_leading_icon(icons::SEARCH)
+        });
+        let new_playlist_input = cx.new(|cx| TextInput::new("New playlist name...", cx));
+        let rename_playlist_input = cx.new(|cx| TextInput::new("Rename playlist...", cx));
+        let queue_save_input = cx.new(|cx| TextInput::new("Playlist name (optional)...", cx));
+        let picker_new_playlist_input =
+            cx.new(|cx| TextInput::new("Or type a new playlist name...", cx));
         let lyrics_view = cx.new(LyricsView::new);
         let default_music_dir = backend
             .initial_settings
@@ -342,6 +389,63 @@ impl BitChordApp {
                 this.scan_folder(path.clone(), cx);
             }
         }));
+        subscriptions.push(
+            cx.subscribe(&library_search_input, |this, _, event, cx| match event {
+                TextInputEvent::Changed(query) | TextInputEvent::Submitted(query) => {
+                    this.search_library(query.clone(), cx);
+                }
+                TextInputEvent::Escape if !this.library_search_query.is_empty() => {
+                    this.clear_library_search(cx);
+                }
+                _ => {}
+            }),
+        );
+        subscriptions.push(cx.subscribe(&new_playlist_input, |this, _, event, cx| {
+            match event {
+                TextInputEvent::Submitted(name) => {
+                    this.submit_create_playlist(name.clone(), cx);
+                }
+                TextInputEvent::Escape => {
+                    this.playlist_create_open = false;
+                    cx.notify();
+                }
+                _ => {}
+            }
+        }));
+        subscriptions.push(cx.subscribe(&rename_playlist_input, |this, _, event, cx| {
+            match event {
+                TextInputEvent::Submitted(name) => {
+                    this.submit_rename_playlist(name.clone(), cx);
+                }
+                TextInputEvent::Escape => {
+                    this.cancel_rename_playlist(cx);
+                }
+                _ => {}
+            }
+        }));
+        subscriptions.push(cx.subscribe(&queue_save_input, |this, _, event, cx| {
+            match event {
+                TextInputEvent::Submitted(name) => {
+                    this.submit_save_queue_as_playlist(name.clone(), cx);
+                }
+                TextInputEvent::Escape => {
+                    this.queue_save_open = false;
+                    cx.notify();
+                }
+                _ => {}
+            }
+        }));
+        subscriptions.push(
+            cx.subscribe(&picker_new_playlist_input, |this, _, event, cx| match event {
+                TextInputEvent::Submitted(name) => {
+                    this.submit_picker_create_playlist(name.clone(), cx);
+                }
+                TextInputEvent::Escape => {
+                    this.close_playlist_picker(cx);
+                }
+                _ => {}
+            }),
+        );
         subscriptions.push(cx.subscribe(&party_code_input, |this, _, event, cx| {
             if let TextInputEvent::Submitted(code) = event {
                 this.join_party(code.clone(), cx);
@@ -448,11 +552,16 @@ impl BitChordApp {
             show_translated_lyrics: false,
             library: LibrarySnapshot::default(),
             liked_video_ids: HashSet::new(),
+            library_tab: LibraryTab::AllSongs,
             library_source_filter: LibrarySourceFilter::All,
             library_search_query: String::new(),
             library_search_results: None,
             selected_playlist_id: None,
             selected_playlist_songs: LoadState::Idle,
+            playlist_create_open: false,
+            playlist_rename_id: None,
+            queue_save_open: false,
+            playlist_picker_song: None,
             active_downloads: HashMap::new(),
             party: ListenTogetherState::default(),
             party_probe_status: None,
@@ -477,6 +586,11 @@ impl BitChordApp {
             status_notice: None,
             error_notice: None,
             search_input,
+            library_search_input,
+            new_playlist_input,
+            rename_playlist_input,
+            queue_save_input,
+            picker_new_playlist_input,
             folder_input,
             party_server_input,
             party_code_input,
@@ -575,12 +689,10 @@ impl BitChordApp {
         cx.notify();
     }
 
-    #[allow(dead_code)]
     pub fn can_go_back(&self) -> bool {
         self.nav_history.can_go_back()
     }
 
-    #[allow(dead_code)]
     pub fn can_go_forward(&self) -> bool {
         self.nav_history.can_go_forward()
     }
@@ -632,7 +744,6 @@ impl BitChordApp {
         cx.notify();
     }
 
-    #[allow(dead_code)]
     pub fn set_sidebar_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
         if self.sidebar_collapsed == collapsed {
             return;
@@ -642,12 +753,10 @@ impl BitChordApp {
         cx.notify();
     }
 
-    #[allow(dead_code)]
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.set_sidebar_collapsed(!self.sidebar_collapsed, cx);
     }
 
-    #[allow(dead_code)]
     pub fn reorder_queue(&mut self, from_idx: usize, to_idx: usize, cx: &mut Context<Self>) {
         if from_idx == to_idx
             || from_idx >= self.queue.items.len()
@@ -658,7 +767,6 @@ impl BitChordApp {
         self.send(BackendCommand::ReorderQueue { from_idx, to_idx }, cx);
     }
 
-    #[allow(dead_code)]
     pub fn set_autoplay_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         if self.autoplay_enabled == enabled {
             return;
@@ -668,17 +776,14 @@ impl BitChordApp {
         cx.notify();
     }
 
-    #[allow(dead_code)]
     pub fn toggle_autoplay(&mut self, cx: &mut Context<Self>) {
         self.set_autoplay_enabled(!self.autoplay_enabled, cx);
     }
 
-    #[allow(dead_code)]
     pub fn start_radio(&mut self, song: Song, cx: &mut Context<Self>) {
         self.send(BackendCommand::StartRadio(Box::new(song)), cx);
     }
 
-    #[allow(dead_code)]
     pub fn create_playlist(
         &mut self,
         name: String,
@@ -696,12 +801,10 @@ impl BitChordApp {
         );
     }
 
-    #[allow(dead_code)]
     pub fn save_queue_as_playlist(&mut self, name: String, cx: &mut Context<Self>) {
         self.send(BackendCommand::SaveQueueAsPlaylist { name }, cx);
     }
 
-    #[allow(dead_code)]
     pub fn rename_playlist(
         &mut self,
         playlist_id: String,
@@ -717,17 +820,18 @@ impl BitChordApp {
         );
     }
 
-    #[allow(dead_code)]
     pub fn delete_playlist(&mut self, playlist_id: String, cx: &mut Context<Self>) {
         if self.selected_playlist_id.as_deref() == Some(playlist_id.as_str()) {
             self.selected_playlist_id = None;
             self.selected_playlist_songs = LoadState::Idle;
         }
+        if self.playlist_rename_id.as_deref() == Some(playlist_id.as_str()) {
+            self.playlist_rename_id = None;
+        }
         self.send(BackendCommand::DeletePlaylist { playlist_id }, cx);
         cx.notify();
     }
 
-    #[allow(dead_code)]
     pub fn add_song_to_playlist(
         &mut self,
         playlist_id: String,
@@ -743,7 +847,6 @@ impl BitChordApp {
         );
     }
 
-    #[allow(dead_code)]
     pub fn remove_song_from_playlist(
         &mut self,
         playlist_id: String,
@@ -759,7 +862,6 @@ impl BitChordApp {
         );
     }
 
-    #[allow(dead_code)]
     pub fn reorder_playlist_track(
         &mut self,
         playlist_id: String,
@@ -777,22 +879,112 @@ impl BitChordApp {
         );
     }
 
-    #[allow(dead_code)]
     pub fn open_local_playlist(&mut self, playlist_id: String, cx: &mut Context<Self>) {
         self.selected_playlist_id = Some(playlist_id.clone());
         self.selected_playlist_songs = LoadState::Loading;
+        self.playlist_rename_id = None;
         self.send(BackendCommand::LoadPlaylistSongs { playlist_id }, cx);
         cx.notify();
     }
 
-    #[allow(dead_code)]
     pub fn close_local_playlist(&mut self, cx: &mut Context<Self>) {
         self.selected_playlist_id = None;
         self.selected_playlist_songs = LoadState::Idle;
+        self.playlist_rename_id = None;
         cx.notify();
     }
 
-    #[allow(dead_code)]
+    pub fn open_playlist_picker(&mut self, song: Song, cx: &mut Context<Self>) {
+        self.playlist_picker_song = Some(song);
+        self.picker_new_playlist_input
+            .update(cx, |inp, cx| inp.set_text("", cx));
+        cx.notify();
+    }
+
+    pub fn close_playlist_picker(&mut self, cx: &mut Context<Self>) {
+        self.playlist_picker_song = None;
+        cx.notify();
+    }
+
+    pub fn submit_picker_create_playlist(&mut self, name: String, cx: &mut Context<Self>) {
+        let trimmed = name.trim().to_owned();
+        let Some(song) = self.playlist_picker_song.take() else {
+            return;
+        };
+        if trimmed.is_empty() {
+            self.playlist_picker_song = Some(song);
+            self.error_notice = Some("Enter a playlist name first.".to_owned());
+            cx.notify();
+            return;
+        }
+        self.picker_new_playlist_input
+            .update(cx, |inp, cx| inp.set_text("", cx));
+        self.create_playlist(trimmed, String::new(), vec![song], cx);
+        cx.notify();
+    }
+
+    pub fn submit_create_playlist(&mut self, name: String, cx: &mut Context<Self>) {
+        let trimmed = name.trim().to_owned();
+        if trimmed.is_empty() {
+            self.error_notice = Some("Playlist name cannot be empty.".to_owned());
+            cx.notify();
+            return;
+        }
+        self.playlist_create_open = false;
+        self.new_playlist_input
+            .update(cx, |inp, cx| inp.set_text("", cx));
+        self.create_playlist(trimmed, String::new(), Vec::new(), cx);
+        cx.notify();
+    }
+
+    pub fn start_rename_playlist(
+        &mut self,
+        playlist_id: String,
+        current_title: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.playlist_rename_id = Some(playlist_id);
+        self.rename_playlist_input
+            .update(cx, |inp, cx| inp.set_text(current_title, cx));
+        cx.notify();
+    }
+
+    pub fn cancel_rename_playlist(&mut self, cx: &mut Context<Self>) {
+        self.playlist_rename_id = None;
+        cx.notify();
+    }
+
+    pub fn submit_rename_playlist(&mut self, new_name: String, cx: &mut Context<Self>) {
+        let trimmed = new_name.trim().to_owned();
+        let Some(id) = self.playlist_rename_id.take() else {
+            return;
+        };
+        if trimmed.is_empty() {
+            self.error_notice = Some("Playlist name cannot be empty.".to_owned());
+            cx.notify();
+            return;
+        }
+        self.rename_playlist(id, trimmed, cx);
+        cx.notify();
+    }
+
+    pub fn submit_save_queue_as_playlist(&mut self, name: String, cx: &mut Context<Self>) {
+        let trimmed = name.trim().to_owned();
+        let final_name = if trimmed.is_empty() {
+            crate::views::track_actions::default_queue_playlist_name(
+                self.playback.current_song.as_ref(),
+                self.queue.items.len(),
+            )
+        } else {
+            trimmed
+        };
+        self.queue_save_open = false;
+        self.queue_save_input
+            .update(cx, |inp, cx| inp.set_text("", cx));
+        self.save_queue_as_playlist(final_name, cx);
+        cx.notify();
+    }
+
     pub fn is_song_downloaded(&self, video_id: &str) -> bool {
         self.library
             .downloads
@@ -800,32 +992,26 @@ impl BitChordApp {
             .any(|d| d.video_id == video_id)
     }
 
-    #[allow(dead_code)]
     pub fn download_progress(&self, video_id: &str) -> Option<&DownloadProgress> {
         self.active_downloads.get(video_id)
     }
 
-    #[allow(dead_code)]
     pub fn download_song(&mut self, song: Song, cx: &mut Context<Self>) {
         self.send(BackendCommand::DownloadSong(Box::new(song)), cx);
     }
 
-    #[allow(dead_code)]
     pub fn cancel_download(&mut self, video_id: String, cx: &mut Context<Self>) {
         self.send(BackendCommand::CancelDownload(video_id), cx);
     }
 
-    #[allow(dead_code)]
     pub fn delete_download(&mut self, video_id: String, cx: &mut Context<Self>) {
         self.send(BackendCommand::DeleteDownload(video_id), cx);
     }
 
-    #[allow(dead_code)]
     pub fn refresh_home(&mut self, cx: &mut Context<Self>) {
         self.send(BackendCommand::RefreshHome, cx);
     }
 
-    #[allow(dead_code)]
     pub fn refresh_current_detail(&mut self, cx: &mut Context<Self>) {
         if let Route::Detail {
             ref browse_id,
@@ -847,7 +1033,6 @@ impl BitChordApp {
         }
     }
 
-    #[allow(dead_code)]
     pub fn search_library(&mut self, query: String, cx: &mut Context<Self>) {
         let trimmed = query.trim().to_owned();
         self.library_search_query = trimmed.clone();
@@ -866,16 +1051,16 @@ impl BitChordApp {
         cx.notify();
     }
 
-    #[allow(dead_code)]
     pub fn clear_library_search(&mut self, cx: &mut Context<Self>) {
         self.library_search_query.clear();
         self.library_search_results = None;
+        self.library_search_input
+            .update(cx, |inp, cx| inp.set_text("", cx));
         cx.notify();
     }
 
     /// Returns the active list of Library tracks applying both the FTS5 instant search
     /// results (when a query is active) and the selected [`LibrarySourceFilter`].
-    #[allow(dead_code)]
     pub fn visible_library_songs(&self) -> Vec<Song> {
         let source = self
             .library_search_results
@@ -1731,7 +1916,14 @@ impl BitChordApp {
     }
 
     fn on_escape_close(&mut self, _: &CloseWindowAction, _w: &mut Window, cx: &mut Context<Self>) {
-        if self.search_suggestions_open {
+        if self.playlist_picker_song.is_some() {
+            self.close_playlist_picker(cx);
+        } else if self.playlist_rename_id.is_some() {
+            self.cancel_rename_playlist(cx);
+        } else if self.queue_save_open {
+            self.queue_save_open = false;
+            cx.notify();
+        } else if self.search_suggestions_open {
             self.search_suggestions_open = false;
             self.search_suggest_selected_idx = None;
             cx.notify();
@@ -1778,12 +1970,14 @@ impl Render for BitChordApp {
             .queue_open
             .then(|| self.render_queue_drawer(cx).into_any_element());
         let player_bar = self.render_player_bar(cx).into_any_element();
+        let playlist_picker_overlay = self.render_playlist_picker_overlay(cx);
 
         // Flush any newly rendered visible artwork URLs queued lazily during render_art_box().
         self.flush_pending_artwork(cx);
 
         div()
             .id("bitchord-root")
+            .relative()
             .key_context("Player")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_play_pause))
@@ -1934,6 +2128,8 @@ impl Render for BitChordApp {
             )
             // Persistent bottom floating Now Playing bar (glass surface 1 of 2)
             .child(player_bar)
+            // Floating Add-to-Playlist picker modal (when open)
+            .when_some(playlist_picker_overlay, |el, modal| el.child(modal))
     }
 }
 

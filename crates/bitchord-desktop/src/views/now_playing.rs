@@ -15,6 +15,7 @@ use crate::icons;
 use crate::pill_slider::{PillSliderStyle, pill_slider, progress_fraction};
 use crate::theme::rgba_hex;
 use crate::views::player_bar::format_duration_label;
+use crate::views::track_actions::{DownloadActionVisual, classify_download_action};
 
 const SPEEDS: [f32; 6] = [0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
 
@@ -377,6 +378,200 @@ impl BitChordApp {
                                             )),
                                     ),
                             )
+                            // Quick daily-driver track actions: Add to Playlist, Offline Download, Start Radio
+                            .when_some(song.cloned(), |el, cur_song| {
+                                let dl_visual = classify_download_action(
+                                    cur_song.local_path.is_some(),
+                                    self.is_song_downloaded(&cur_song.video_id),
+                                    self.download_progress(&cur_song.video_id),
+                                );
+                                let pl_song = cur_song.clone();
+                                let radio_song = cur_song.clone();
+                                let dl_song = cur_song.clone();
+                                let dl_vid = cur_song.video_id.clone();
+
+                                el.child(
+                                    div()
+                                        .w(px(320.0))
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap(px(8.0))
+                                        .child(
+                                            div()
+                                                .id("np-add-playlist")
+                                                .px(px(10.0))
+                                                .h(px(30.0))
+                                                .rounded(px(8.0))
+                                                .bg(surface_chip)
+                                                .border_1()
+                                                .border_color(chip_border)
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(5.0))
+                                                .cursor_pointer()
+                                                .text_size(px(11.5))
+                                                .text_color(ink_primary)
+                                                .hover(move |s| s.bg(surface_chip_hover))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.open_playlist_picker(pl_song.clone(), cx);
+                                                }))
+                                                .child(icons::icon(icons::PLUS, 13.0, ink_secondary))
+                                                .child("Playlist"),
+                                        )
+                                        .when_some(dl_visual, |d_el, state| match state {
+                                            DownloadActionVisual::Available => d_el.child(
+                                                div()
+                                                    .id("np-download")
+                                                    .px(px(10.0))
+                                                    .h(px(30.0))
+                                                    .rounded(px(8.0))
+                                                    .bg(surface_chip)
+                                                    .border_1()
+                                                    .border_color(chip_border)
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(5.0))
+                                                    .cursor_pointer()
+                                                    .text_size(px(11.5))
+                                                    .text_color(ink_primary)
+                                                    .hover(move |s| s.bg(surface_chip_hover))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.download_song(dl_song.clone(), cx);
+                                                    }))
+                                                    .child(icons::icon(
+                                                        icons::DOWNLOAD,
+                                                        13.0,
+                                                        ink_secondary,
+                                                    ))
+                                                    .child("Download"),
+                                            ),
+                                            DownloadActionVisual::Queued => d_el.child(
+                                                div()
+                                                    .id("np-download-q")
+                                                    .px(px(10.0))
+                                                    .h(px(30.0))
+                                                    .rounded(px(8.0))
+                                                    .bg(rgba_hex(0xFFFF_FF28))
+                                                    .border_1()
+                                                    .border_color(ink_primary)
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(5.0))
+                                                    .cursor_pointer()
+                                                    .text_size(px(11.5))
+                                                    .text_color(ink_primary)
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.cancel_download(dl_vid.clone(), cx);
+                                                    }))
+                                                    .child(icons::icon(
+                                                        icons::CLOSE,
+                                                        12.0,
+                                                        ink_primary,
+                                                    ))
+                                                    .child("Queued"),
+                                            ),
+                                            DownloadActionVisual::Downloading(pct) => d_el.child(
+                                                div()
+                                                    .id("np-download-pct")
+                                                    .px(px(10.0))
+                                                    .h(px(30.0))
+                                                    .rounded(px(8.0))
+                                                    .bg(rgba_hex(0xFFFF_FF30))
+                                                    .border_1()
+                                                    .border_color(ink_primary)
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(5.0))
+                                                    .cursor_pointer()
+                                                    .text_size(px(11.5))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(ink_primary)
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.cancel_download(dl_vid.clone(), cx);
+                                                    }))
+                                                    .child(icons::icon(
+                                                        icons::CLOSE,
+                                                        12.0,
+                                                        ink_primary,
+                                                    ))
+                                                    .child(format!("{pct}%")),
+                                            ),
+                                            DownloadActionVisual::Downloaded => d_el.child(
+                                                div()
+                                                    .id("np-download-ok")
+                                                    .px(px(10.0))
+                                                    .h(px(30.0))
+                                                    .rounded(px(8.0))
+                                                    .bg(rgba_hex(0xFFFF_FF24))
+                                                    .border_1()
+                                                    .border_color(chip_border)
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(5.0))
+                                                    .text_size(px(11.5))
+                                                    .text_color(ink_primary)
+                                                    .child(icons::icon(
+                                                        icons::CHECK,
+                                                        13.0,
+                                                        ink_primary,
+                                                    ))
+                                                    .child("Offline"),
+                                            ),
+                                            DownloadActionVisual::Failed => d_el.child(
+                                                div()
+                                                    .id("np-download-retry")
+                                                    .px(px(10.0))
+                                                    .h(px(30.0))
+                                                    .rounded(px(8.0))
+                                                    .bg(surface_chip)
+                                                    .border_1()
+                                                    .border_color(theme.danger)
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(5.0))
+                                                    .cursor_pointer()
+                                                    .text_size(px(11.5))
+                                                    .text_color(ink_primary)
+                                                    .hover(move |s| s.bg(surface_chip_hover))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.download_song(dl_song.clone(), cx);
+                                                    }))
+                                                    .child(icons::icon(
+                                                        icons::DOWNLOAD,
+                                                        13.0,
+                                                        theme.danger,
+                                                    ))
+                                                    .child("Retry"),
+                                            ),
+                                        })
+                                        .child(
+                                            div()
+                                                .id("np-start-radio")
+                                                .px(px(10.0))
+                                                .h(px(30.0))
+                                                .rounded(px(8.0))
+                                                .bg(surface_chip)
+                                                .border_1()
+                                                .border_color(chip_border)
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(5.0))
+                                                .cursor_pointer()
+                                                .text_size(px(11.5))
+                                                .text_color(ink_primary)
+                                                .hover(move |s| s.bg(surface_chip_hover))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.start_radio(radio_song.clone(), cx);
+                                                }))
+                                                .child(icons::icon(
+                                                    icons::RADIO,
+                                                    13.0,
+                                                    ink_secondary,
+                                                ))
+                                                .child("Radio"),
+                                        ),
+                                )
+                            })
                             // Quick DSP chips: Speed, Skip Silence, Spatial, Stats for Nerds
                             .child(
                                 div()

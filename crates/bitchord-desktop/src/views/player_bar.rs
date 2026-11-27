@@ -212,12 +212,12 @@ impl BitChordApp {
                                     ),
                             ),
                     )
-                    .when(song.is_some(), |el| {
+                    .when_some(song.cloned(), |el, cur_song| {
                         el.child(
                             div()
                                 .id("bar-like-btn")
-                                .w(px(32.0))
-                                .h(px(32.0))
+                                .w(px(30.0))
+                                .h(px(30.0))
                                 .flex_shrink_0()
                                 .rounded(px(8.0))
                                 .flex()
@@ -241,6 +241,23 @@ impl BitChordApp {
                                         theme.text_muted
                                     },
                                 )),
+                        )
+                        .child(
+                            div()
+                                .id("bar-add-pl-btn")
+                                .w(px(28.0))
+                                .h(px(28.0))
+                                .flex_shrink_0()
+                                .rounded(px(8.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(theme.surface_hover))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_playlist_picker(cur_song.clone(), cx);
+                                }))
+                                .child(icons::icon(icons::PLUS, 14.5, theme.text_muted)),
                         )
                     }),
             )

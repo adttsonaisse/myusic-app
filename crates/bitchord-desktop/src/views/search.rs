@@ -938,16 +938,13 @@ impl BitChordApp {
                                             EntityType::Other => icons::HISTORY,
                                         };
                                         let maybe_song = entry.to_song();
-                                        let is_liked = maybe_song
-                                            .as_ref()
-                                            .is_some_and(|s| self.is_song_liked(&s.video_id));
                                         let art_url = entry.artwork_url.clone().or_else(|| {
                                             maybe_song.as_ref().and_then(song_thumbnail_url)
                                         });
                                         let (meta_line, duration_label) =
                                             format_recent_metadata(&entry);
                                         let click_entry = entry.clone();
-                                        let like_song = maybe_song.clone();
+                                        let action_song = maybe_song.clone();
 
                                         div()
                                             .id(("recent-search-card", idx))
@@ -1073,42 +1070,15 @@ impl BitChordApp {
                                                             .text_color(theme.text_secondary)
                                                             .child(badge),
                                                     )
-                                                    .when_some(like_song, |l_el, song_to_like| {
-                                                        l_el.child(
-                                                            div()
-                                                                .id(("recent-like", idx))
-                                                                .w(px(28.0))
-                                                                .h(px(28.0))
-                                                                .rounded(px(6.0))
-                                                                .flex()
-                                                                .items_center()
-                                                                .justify_center()
-                                                                .hover(move |s| {
-                                                                    s.bg(theme.surface_active)
-                                                                })
-                                                                .on_click(cx.listener(
-                                                                    move |this, _, _, cx| {
-                                                                        this.toggle_like_song(
-                                                                            song_to_like.clone(),
-                                                                            cx,
-                                                                        );
-                                                                        cx.stop_propagation();
-                                                                    },
-                                                                ))
-                                                                .child(icons::icon(
-                                                                    if is_liked {
-                                                                        icons::HEART_FILLED
-                                                                    } else {
-                                                                        icons::HEART
-                                                                    },
-                                                                    14.0,
-                                                                    if is_liked {
-                                                                        theme.accent
-                                                                    } else {
-                                                                        theme.text_muted
-                                                                    },
-                                                                )),
-                                                        )
+                                                    .when_some(action_song, |l_el, song_for_act| {
+                                                        l_el.child(self.render_track_action_buttons(
+                                                            "recent",
+                                                            idx,
+                                                            &song_for_act,
+                                                            false,
+                                                            theme,
+                                                            cx,
+                                                        ))
                                                     })
                                                     .child(
                                                         div()
@@ -1222,14 +1192,11 @@ impl BitChordApp {
                                     SearchResult::TopTrack { song }
                                     | SearchResult::Track { song } => {
                                         let is_cur = active_vid == Some(song.video_id.as_str());
-                                        let is_liked = this.is_song_liked(&song.video_id);
                                         let songs_c = playable_songs.clone();
                                         let start_idx = songs_c
                                             .iter()
                                             .position(|s| s.video_id == song.video_id)
                                             .unwrap_or(0);
-                                        let next_s = song.clone();
-                                        let like_s = song.clone();
                                         let rec_song = song.clone();
                                         let art = song_thumbnail_url(&song);
                                         let sub_text = match &song.album_name {
@@ -1325,74 +1292,9 @@ impl BitChordApp {
                                                                     .unwrap_or_default(),
                                                             ),
                                                     )
-                                                    .child(
-                                                        div()
-                                                            .id(("search-like", idx))
-                                                            .w(px(28.0))
-                                                            .h(px(28.0))
-                                                            .rounded(px(7.0))
-                                                            .flex()
-                                                            .items_center()
-                                                            .justify_center()
-                                                            .hover(move |s| s.bg(t.surface_active))
-                                                            .on_click(cx.listener(
-                                                                move |this, _, _, cx| {
-                                                                    this.toggle_like_song(
-                                                                        like_s.clone(),
-                                                                        cx,
-                                                                    );
-                                                                    cx.stop_propagation();
-                                                                },
-                                                            ))
-                                                            .child(icons::icon(
-                                                                if is_liked {
-                                                                    icons::HEART_FILLED
-                                                                } else {
-                                                                    icons::HEART
-                                                                },
-                                                                14.0,
-                                                                if is_liked {
-                                                                    t.accent
-                                                                } else {
-                                                                    t.text_muted
-                                                                },
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .id(("search-next", idx))
-                                                            .px(px(9.0))
-                                                            .py(px(5.0))
-                                                            .rounded(px(7.0))
-                                                            .bg(t.surface_elevated)
-                                                            .border_1()
-                                                            .border_color(t.border)
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap(px(4.0))
-                                                            .text_size(px(11.0))
-                                                            .text_color(t.text_secondary)
-                                                            .hover(move |s| s.bg(t.surface_active))
-                                                            .on_click(cx.listener(
-                                                                move |this, _, _, cx| {
-                                                                    this.send(
-                                                                        BackendCommand::PlayNext(
-                                                                            Box::new(
-                                                                                next_s.clone(),
-                                                                            ),
-                                                                        ),
-                                                                        cx,
-                                                                    );
-                                                                    cx.stop_propagation();
-                                                                },
-                                                            ))
-                                                            .child(icons::icon(
-                                                                icons::LIST_PLUS,
-                                                                12.5,
-                                                                t.text_secondary,
-                                                            ))
-                                                            .child("Next"),
-                                                    ),
+                                                    .child(this.render_track_action_buttons(
+                                                        "search", idx, &song, true, t, cx,
+                                                    )),
                                             )
                                             .into_any_element()
                                     }

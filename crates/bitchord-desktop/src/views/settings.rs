@@ -211,9 +211,76 @@ impl BitChordApp {
                         ))
                     }),
             )
-            // 3. Playback & Crossfade + Stream Backend (ADR-004)
+            // 3. Playback, Autoplay, Crossfade & Stream Backend (ADR-004)
             .child(
-                section_card("Playback, Crossfade & Stream Backend", icons::DISC, theme)
+                section_card("Playback, Autoplay, Crossfade & Stream Backend", icons::DISC, theme)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(8.0))
+                            .child(toggle_chip(
+                                "set-autoplay",
+                                if self.autoplay_enabled {
+                                    "Autoplay Similar Tracks: On"
+                                } else {
+                                    "Autoplay Similar Tracks: Off"
+                                },
+                                self.autoplay_enabled,
+                                theme,
+                                cx.listener(|this, _, _, cx| {
+                                    this.toggle_autoplay(cx);
+                                }),
+                            ))
+                            .child(toggle_chip(
+                                "set-speed",
+                                format!("Speed: {:.2}x", self.playback.speed),
+                                (self.playback.speed - 1.0).abs() > 0.01,
+                                theme,
+                                cx.listener(|this, _, _, cx| {
+                                    const SPEEDS: [f32; 6] = [0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+                                    let cur = this.playback.speed;
+                                    let next = SPEEDS
+                                        .iter()
+                                        .copied()
+                                        .find(|&s| s > cur + 0.05)
+                                        .unwrap_or(SPEEDS[0]);
+                                    this.send(BackendCommand::SetSpeed(next), cx);
+                                }),
+                            ))
+                            .child(toggle_chip(
+                                "set-skip-silence",
+                                if self.playback.skip_silence {
+                                    "Skip Silence: On"
+                                } else {
+                                    "Skip Silence: Off"
+                                },
+                                self.playback.skip_silence,
+                                theme,
+                                cx.listener(|this, _, _, cx| {
+                                    this.send(
+                                        BackendCommand::SetSkipSilence(!this.playback.skip_silence),
+                                        cx,
+                                    );
+                                }),
+                            ))
+                            .child(toggle_chip(
+                                "set-spatial-audio",
+                                if self.playback.spatial_audio {
+                                    "Spatial Audio: On"
+                                } else {
+                                    "Spatial Audio: Off"
+                                },
+                                self.playback.spatial_audio,
+                                theme,
+                                cx.listener(|this, _, _, cx| {
+                                    this.send(
+                                        BackendCommand::SetSpatial(!this.playback.spatial_audio),
+                                        cx,
+                                    );
+                                }),
+                            )),
+                    )
                     .child(
                         div()
                             .flex()
