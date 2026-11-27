@@ -93,8 +93,7 @@ impl BitChordApp {
                                     .text_color(ink_primary)
                                     .hover(move |s| s.bg(surface_chip_hover))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.route = this.previous_route.clone();
-                                        cx.notify();
+                                        this.close_now_playing(cx);
                                     }))
                                     .child(icons::icon(icons::CHEVRON_LEFT, 15.0, ink_primary))
                                     .child("Back to Browse"),

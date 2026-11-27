@@ -123,6 +123,18 @@ impl NavigationHistory {
         Some(next)
     }
 
+    /// Exits a transient overlay route (such as `Route::NowPlaying`) cleanly so
+    /// the titlebar Back button never retains a stale duplicate entry.
+    pub fn exit_route(&mut self, current: Route, fallback: Route) -> Route {
+        if let Some(prev) = self.go_back(current) {
+            prev
+        } else if fallback != Route::NowPlaying {
+            fallback
+        } else {
+            Route::Home
+        }
+    }
+
     #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.back_stack.clear();
@@ -244,5 +256,46 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, NavigationHistory::MAX_ENTRIES);
+    }
+
+    #[test]
+    fn navigation_history_exit_route_avoids_stale_back_noop() {
+        let mut hist = NavigationHistory::new();
+
+        // Open NowPlaying from Home.
+        let mut previous_route = Route::Home;
+        hist.push(Route::Home, &Route::NowPlaying);
+        let mut route = Route::NowPlaying;
+        assert!(hist.can_go_back());
+
+        // Closing NowPlaying returns to Home and leaves back_stack empty (no stale Home no-op).
+        route = hist.exit_route(route, previous_route.clone());
+        assert_eq!(route, Route::Home);
+        assert!(!hist.can_go_back());
+        assert!(hist.can_go_forward());
+
+        // Multi-step: Home -> Search -> NowPlaying, then close NowPlaying -> Search, Back -> Home.
+        hist.clear();
+        hist.push(Route::Home, &Route::Search);
+        previous_route = Route::Search;
+        hist.push(Route::Search, &Route::NowPlaying);
+        route = Route::NowPlaying;
+
+        route = hist.exit_route(route, previous_route);
+        assert_eq!(route, Route::Search);
+        assert!(hist.can_go_back());
+        assert_eq!(hist.go_back(route), Some(Route::Home));
+        assert!(!hist.can_go_back());
+
+        // Fallback when back_stack is empty.
+        hist.clear();
+        assert_eq!(
+            hist.exit_route(Route::NowPlaying, Route::Library),
+            Route::Library
+        );
+        assert_eq!(
+            hist.exit_route(Route::NowPlaying, Route::NowPlaying),
+            Route::Home
+        );
     }
 }

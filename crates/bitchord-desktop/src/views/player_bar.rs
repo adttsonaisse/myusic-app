@@ -131,13 +131,7 @@ impl BitChordApp {
                             .p(px(5.0))
                             .hover(move |s| s.bg(theme.surface_hover))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                if this.route == Route::NowPlaying {
-                                    this.route = this.previous_route.clone();
-                                } else {
-                                    this.navigate(Route::NowPlaying, cx);
-                                    return;
-                                }
-                                cx.notify();
+                                this.toggle_now_playing(cx);
                             }))
                             .child(self.render_art_box(
                                 art_url.as_deref(),
@@ -472,13 +466,7 @@ impl BitChordApp {
                             })
                             .hover(move |s| s.bg(theme.surface_hover))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                if this.route == Route::NowPlaying {
-                                    this.route = this.previous_route.clone();
-                                } else {
-                                    this.navigate(Route::NowPlaying, cx);
-                                    return;
-                                }
-                                cx.notify();
+                                this.toggle_now_playing(cx);
                             }))
                             .child(icons::icon(
                                 icons::LYRICS,

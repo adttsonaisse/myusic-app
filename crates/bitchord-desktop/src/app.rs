@@ -713,6 +713,24 @@ impl BitChordApp {
         true
     }
 
+    pub fn close_now_playing(&mut self, cx: &mut Context<Self>) {
+        if self.route != Route::NowPlaying {
+            return;
+        }
+        let target = self
+            .nav_history
+            .exit_route(self.route.clone(), self.previous_route.clone());
+        self.apply_history_route(target, cx);
+    }
+
+    pub fn toggle_now_playing(&mut self, cx: &mut Context<Self>) {
+        if self.route == Route::NowPlaying {
+            self.close_now_playing(cx);
+        } else {
+            self.navigate(Route::NowPlaying, cx);
+        }
+    }
+
     fn apply_history_route(&mut self, target: Route, cx: &mut Context<Self>) {
         if self.route != Route::NowPlaying {
             self.previous_route = self.route.clone();
@@ -1001,6 +1019,9 @@ impl BitChordApp {
     }
 
     pub fn cancel_download(&mut self, video_id: String, cx: &mut Context<Self>) {
+        if self.active_downloads.remove(&video_id).is_some() {
+            cx.notify();
+        }
         self.send(BackendCommand::CancelDownload(video_id), cx);
     }
 
@@ -1865,14 +1886,7 @@ impl BitChordApp {
         _w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.route == Route::NowPlaying {
-            let prev = self.previous_route.clone();
-            self.route = prev;
-        } else {
-            self.navigate(Route::NowPlaying, cx);
-            return;
-        }
-        cx.notify();
+        self.toggle_now_playing(cx);
     }
 
     fn on_toggle_queue(&mut self, _: &ToggleQueue, _w: &mut Window, cx: &mut Context<Self>) {
@@ -1881,13 +1895,7 @@ impl BitChordApp {
     }
 
     fn on_toggle_lyrics(&mut self, _: &ToggleLyrics, _w: &mut Window, cx: &mut Context<Self>) {
-        if self.route == Route::NowPlaying {
-            self.route = self.previous_route.clone();
-        } else {
-            self.navigate(Route::NowPlaying, cx);
-            return;
-        }
-        cx.notify();
+        self.toggle_now_playing(cx);
     }
 
     fn on_toggle_theme(&mut self, _: &ToggleTheme, _w: &mut Window, cx: &mut Context<Self>) {
@@ -1931,8 +1939,7 @@ impl BitChordApp {
             self.queue_open = false;
             cx.notify();
         } else if self.route == Route::NowPlaying {
-            self.route = self.previous_route.clone();
-            cx.notify();
+            self.close_now_playing(cx);
         }
     }
 

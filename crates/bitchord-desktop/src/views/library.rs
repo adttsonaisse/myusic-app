@@ -34,7 +34,10 @@ pub fn sort_active_downloads(map: &HashMap<String, DownloadProgress>) -> Vec<Dow
     list
 }
 
-/// Converts a persisted offline [`SavedSongMetadata`] record into a playable local [`Song`].
+/// Converts a persisted offline [`SavedSongMetadata`] record into a playable [`Song`].
+/// Keeps `local_path` as `None` so playback does not pollute `songs.local_path` in SQLite;
+/// `prepare_track_decoder` automatically prefers the offline file from `downloads` before
+/// touching the network.
 pub fn download_record_to_song(rec: &SavedSongMetadata) -> Song {
     let mut song = Song::new(
         rec.video_id.clone(),
@@ -43,7 +46,7 @@ pub fn download_record_to_song(rec: &SavedSongMetadata) -> Song {
         rec.thumbnail_url.clone(),
     );
     song.album_name = rec.album_name.clone();
-    song.local_path = Some(rec.uri.clone());
+    song.duration_text = rec.duration_text.clone();
     song
 }
 
@@ -2127,5 +2130,37 @@ mod tests {
         assert_eq!(playlist_reorder_target(1, 3, 1), Some(2));
         assert_eq!(playlist_reorder_target(2, 3, 1), None);
         assert_eq!(playlist_reorder_target(2, 3, -1), Some(1));
+    }
+
+    #[test]
+    fn download_record_to_song_preserves_remote_identity_and_duration() {
+        let rec = SavedSongMetadata {
+            video_id: "yt_offline_1".to_owned(),
+            title: "Starboy".to_owned(),
+            artist: "The Weeknd".to_owned(),
+            thumbnail_url: Some("https://img.example/starboy.jpg".to_owned()),
+            duration_text: Some("3:50".to_owned()),
+            album_name: Some("Starboy".to_owned()),
+            uri: "file:///tmp/bitchord-downloads/starboy.webm".to_owned(),
+            download_format: Some("OPUS · 160 kbps".to_owned()),
+            date_added_seconds: Some(1_700_000_000),
+        };
+
+        let song = download_record_to_song(&rec);
+        assert_eq!(song.video_id, "yt_offline_1");
+        assert_eq!(song.local_path, None);
+        assert_eq!(song.duration_text.as_deref(), Some("3:50"));
+        assert_eq!(song.album_name.as_deref(), Some("Starboy"));
+
+        // After an offline download is deleted, the song remains re-downloadable and retryable.
+        assert_eq!(
+            crate::views::track_actions::classify_download_action(
+                song.local_path.is_some(),
+                false,
+                None,
+            ),
+            Some(crate::views::track_actions::DownloadActionVisual::Available)
+        );
+        assert!(crate::backend::is_retryable_remote_song(&song));
     }
 }

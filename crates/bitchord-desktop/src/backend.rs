@@ -960,6 +960,27 @@ struct DownloadTaskEntry {
     progress: DownloadProgress,
 }
 
+/// Cancels an active download (if still running) or dismisses an already-finished/failed
+/// download row from the UI by always emitting [`BackendEvent::DownloadRemoved`].
+/// Returns `true` if a live task was cancelled, or `false` if it was only a dismissal.
+fn cancel_or_dismiss_download(
+    active_downloads: &mut HashMap<String, DownloadTaskEntry>,
+    video_id: String,
+    events: &EventHub,
+) -> bool {
+    let cancelled_running = if let Some(entry) = active_downloads.remove(&video_id) {
+        entry.cancel.cancel();
+        true
+    } else {
+        false
+    };
+    events.emit(BackendEvent::DownloadRemoved(video_id));
+    if cancelled_running {
+        events.emit(BackendEvent::StatusNotice("Download cancelled".to_owned()));
+    }
+    cancelled_running
+}
+
 const HOME_BROWSE_CACHE_KEY: &str = "home:default";
 
 fn detail_browse_cache_key(kind: BrowseType, browse_id: &str) -> (String, &'static str) {
@@ -3327,11 +3348,7 @@ fn run_backend_thread(
                     );
                 }
                 BackendCommand::CancelDownload(video_id) => {
-                    if let Some(entry) = active_downloads.remove(&video_id) {
-                        entry.cancel.cancel();
-                        events.emit(BackendEvent::DownloadRemoved(video_id));
-                        events.emit(BackendEvent::StatusNotice("Download cancelled".to_owned()));
-                    }
+                    cancel_or_dismiss_download(&mut active_downloads, video_id, &events);
                 }
                 BackendCommand::DeleteDownload(video_id) => {
                     if let Some(entry) = active_downloads.remove(&video_id) {
@@ -4278,7 +4295,7 @@ fn run_backend_thread(
     }
 }
 
-fn is_retryable_remote_song(song: &Song) -> bool {
+pub(crate) fn is_retryable_remote_song(song: &Song) -> bool {
     song.local_path.is_none() && !Path::new(&song.video_id).exists()
 }
 
@@ -6939,5 +6956,56 @@ mod tests {
         let padded = eq_bands_from_settings(&short);
         assert_eq!(padded[0], 2.5);
         assert_eq!(padded[1], 0.0);
+    }
+
+    #[test]
+    fn cancel_or_dismiss_download_emits_removed_for_running_and_failed_entries() {
+        let (events, rx) = EventHub::new(32);
+        let mut active: HashMap<String, DownloadTaskEntry> = HashMap::new();
+
+        // 1. Live in-flight download: cancels token and emits DownloadRemoved + StatusNotice.
+        let tok = StreamCancelToken::new();
+        active.insert(
+            "yt_live".to_owned(),
+            DownloadTaskEntry {
+                cancel: tok.clone(),
+                progress: DownloadProgress {
+                    video_id: "yt_live".to_owned(),
+                    title: "Live Track".to_owned(),
+                    artist: "Artist".to_owned(),
+                    status: DownloadStatus::Downloading,
+                    bytes_downloaded: 128,
+                    total_bytes: Some(1024),
+                    progress: 0.125,
+                },
+            },
+        );
+        assert!(cancel_or_dismiss_download(
+            &mut active,
+            "yt_live".to_owned(),
+            &events
+        ));
+        assert!(tok.is_cancelled());
+        assert!(active.is_empty());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(BackendEvent::DownloadRemoved(ref id)) if id == "yt_live"
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(BackendEvent::StatusNotice(ref msg)) if msg == "Download cancelled"
+        ));
+
+        // 2. Failed download already evicted via DownloadTaskFinished: Dismiss still emits DownloadRemoved.
+        assert!(!cancel_or_dismiss_download(
+            &mut active,
+            "yt_failed".to_owned(),
+            &events
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(BackendEvent::DownloadRemoved(ref id)) if id == "yt_failed"
+        ));
+        assert!(rx.try_recv().is_err());
     }
 }
