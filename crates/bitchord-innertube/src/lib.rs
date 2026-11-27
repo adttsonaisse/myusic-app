@@ -25,7 +25,10 @@ pub use cipher::CipherSandbox;
 pub use client::{InnertubeClient, PlaybackTracking, build_shared_http_client};
 pub use error::{InnertubeError, PermanentReason, StreamError};
 pub use locale::LocaleTags;
-pub use parser::{BrowseHeader, InnertubeParser, LibraryItemPage, PlaylistShelfPage, SearchPage};
+pub use parser::{
+    BrowseHeader, InnertubeParser, LibraryItemPage, PlaylistShelfPage, SearchPage,
+    SearchSuggestionsResult,
+};
 pub use player_client::{PlayerClient, WEB_USER_AGENT};
 pub use repository::{YtMusicRepository, browse_ids};
 pub use song_info::{SongInfo, SongInfoParser, SongInfoRepository, compact_count};

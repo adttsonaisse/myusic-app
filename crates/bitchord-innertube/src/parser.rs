@@ -73,6 +73,16 @@ pub struct SearchPage {
     pub continuation: Option<String>,
 }
 
+/// Structured output from `music/get_search_suggestions`: query completions
+/// (including history suggestions) alongside direct song/artist/album/playlist
+/// matches returned in the same payload.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchSuggestionsResult {
+    pub queries: Vec<String>,
+    pub items: Vec<SearchResult>,
+}
+
 /// A playlist page's own tracks, YouTube's suggested additions, and continuation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaylistShelfPage {
@@ -231,19 +241,44 @@ impl InnertubeParser {
     }
 
     pub fn parse_search_suggestions(&self, response: &Value) -> Vec<String> {
-        let mut seen = HashSet::new();
-        let mut out = Vec::new();
-        for renderer in collect_renderers(response, "searchSuggestionRenderer") {
+        self.parse_search_suggestions_structured(response).queries
+    }
+
+    pub fn parse_search_suggestions_structured(&self, response: &Value) -> SearchSuggestionsResult {
+        let mut seen_queries = HashSet::new();
+        let mut queries = Vec::new();
+        let mut seen_items = HashSet::new();
+        let mut items = Vec::new();
+        let default_credit = Credits::default();
+
+        for renderer in collect_suggestion_query_renderers(response) {
             let query = obj_val(renderer, "navigationEndpoint")
                 .and_then(|o| obj_val(o, "searchEndpoint"))
                 .and_then(|o| str_val(o, "query"))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
                 .map(ToOwned::to_owned)
-                .unwrap_or_else(|| runs_text(renderer.get("suggestion")));
-            if !query.trim().is_empty() && seen.insert(query.clone()) {
-                out.push(query);
+                .unwrap_or_else(|| text_or_simple(renderer.get("suggestion")).trim().to_owned());
+            if !query.is_empty() && seen_queries.insert(query.to_lowercase()) {
+                queries.push(query);
             }
         }
-        out
+
+        for renderer in collect_renderers(response, "musicResponsiveListItemRenderer") {
+            if let Some(browse) = parse_browse_item(renderer) {
+                if seen_items.insert(format!("b:{}", browse.browse_id)) {
+                    items.push(SearchResult::Browse { item: browse });
+                }
+            } else if let Some(mut song) =
+                self.parse_responsive_list_item(Some(renderer), &default_credit)
+                && seen_items.insert(format!("v:{}", song.video_id))
+            {
+                ensure_song_thumbnail(&mut song);
+                items.push(SearchResult::Track { song });
+            }
+        }
+
+        SearchSuggestionsResult { queries, items }
     }
 
     // ---- Home & Explore -----------------------------------------------------
@@ -1289,7 +1324,31 @@ impl InnertubeParser {
                     .and_then(|o| obj_val(o, "playNavigationEndpoint"))
                     .and_then(|o| obj_val(o, "watchEndpoint"))
                     .and_then(|o| str_val(o, "videoId"))
-            })?;
+            })
+            .or_else(|| {
+                obj_val(renderer, "navigationEndpoint")
+                    .and_then(|n| obj_val(n, "watchEndpoint"))
+                    .and_then(|w| str_val(w, "videoId"))
+            })
+            .or_else(|| {
+                renderer
+                    .get("flexColumns")
+                    .and_then(Value::as_array)
+                    .and_then(|cols| cols.first())
+                    .and_then(|c| c.get("musicResponsiveListItemFlexColumnRenderer"))
+                    .and_then(|c| c.get("text"))
+                    .and_then(|t| t.get("runs"))
+                    .and_then(Value::as_array)
+                    .and_then(|runs| {
+                        runs.iter().find_map(|r| {
+                            r.get("navigationEndpoint")?
+                                .get("watchEndpoint")?
+                                .as_object()
+                                .and_then(|w| str_val(w, "videoId"))
+                        })
+                    })
+            })
+            .filter(|id| !id.trim().is_empty())?;
 
         if is_private_upload(renderer) {
             self.uploaded.mark(video_id);
@@ -1400,6 +1459,29 @@ impl InnertubeParser {
             &credits.artists
         };
 
+        let plain_album = if !episode
+            && row_type.as_deref() == Some("song")
+            && credits.album_name.is_none()
+            && fallback.album_name.is_none()
+        {
+            parts
+                .iter()
+                .copied()
+                .filter(|p| {
+                    let lower = p.to_lowercase();
+                    !DURATION_RE.is_match(p)
+                        && !TYPE_WORDS.contains(&lower.as_str())
+                        && !TALLY_RE.is_match(p)
+                        && !YEAR_RE.is_match(p)
+                })
+                .nth(1)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+        } else {
+            None
+        };
+
         Some(Song {
             video_id: video_id.to_owned(),
             title,
@@ -1413,11 +1495,15 @@ impl InnertubeParser {
                 stated_artists,
             ),
             album_id: credits.album_id.or_else(|| fallback.album_id.clone()),
-            album_name: credits.album_name.or_else(|| fallback.album_name.clone()),
+            album_name: credits
+                .album_name
+                .or(plain_album)
+                .or_else(|| fallback.album_name.clone()),
             set_video_id: obj_val(renderer, "playlistItemData")
                 .and_then(|d| str_val(d, "playlistSetVideoId"))
                 .map(ToOwned::to_owned),
             is_video: !episode
+                && row_type.as_deref() != Some("song")
                 && (row_type.as_deref() == Some("video")
                     || thumbnails.is_some_and(|a| is_not_square(a))),
             is_explicit: has_explicit_badge_map(renderer),
@@ -1745,7 +1831,7 @@ fn episode_runtime(text: &str) -> Option<String> {
 fn parse_browse_item(renderer: &Map<String, Value>) -> Option<BrowseItem> {
     let endpoint =
         obj_val(renderer, "navigationEndpoint").and_then(|n| obj_val(n, "browseEndpoint"))?;
-    let browse_id = str_val(endpoint, "browseId")?;
+    let browse_id = str_val(endpoint, "browseId").filter(|id| !id.trim().is_empty())?;
     let page_type = obj_val(endpoint, "browseEndpointContextSupportedConfigs")
         .and_then(|c| obj_val(c, "browseEndpointContextMusicConfig"))
         .and_then(|c| str_val(c, "pageType"))
@@ -1779,12 +1865,13 @@ fn parse_browse_item(renderer: &Map<String, Value>) -> Option<BrowseItem> {
         .and_then(|t| t.get("thumbnails"))
         .and_then(Value::as_array)
         .and_then(|a| best_thumbnail(a));
+    let kind = browse_type_of_with_fallback(page_type, browse_id, &subtitle);
     Some(BrowseItem {
         browse_id: browse_id.to_owned(),
         title,
         subtitle,
         thumbnail_url,
-        r#type: browse_type_of(page_type),
+        r#type: kind,
     })
 }
 
@@ -1946,6 +2033,47 @@ fn browse_type_of(page_type: &str) -> BrowseType {
         BrowseType::Playlist
     } else {
         BrowseType::Other
+    }
+}
+
+fn browse_type_of_with_fallback(page_type: &str, browse_id: &str, subtitle: &str) -> BrowseType {
+    let from_page = browse_type_of(page_type);
+    if from_page != BrowseType::Other {
+        return from_page;
+    }
+    if browse_id.starts_with("MPRE") || browse_id.starts_with("OLAK") {
+        return BrowseType::Album;
+    }
+    if browse_id.starts_with("UC") {
+        return BrowseType::Artist;
+    }
+    if browse_id.starts_with("VL") || browse_id.starts_with("PL") || browse_id.starts_with("RDCLAK")
+    {
+        return BrowseType::Playlist;
+    }
+    match subtitle
+        .split(" • ")
+        .next()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("artist") => BrowseType::Artist,
+        Some("album" | "single" | "ep") => BrowseType::Album,
+        Some("playlist") => BrowseType::Playlist,
+        _ => BrowseType::Other,
+    }
+}
+
+pub(crate) fn ensure_song_thumbnail(song: &mut Song) {
+    let has_thumb = song
+        .thumbnail_url
+        .as_deref()
+        .is_some_and(|u| !u.trim().is_empty());
+    if !has_thumb && !song.video_id.trim().is_empty() {
+        song.thumbnail_url = Some(format!(
+            "https://i.ytimg.com/vi/{}/hqdefault.jpg",
+            song.video_id.trim()
+        ));
     }
 }
 
@@ -2386,9 +2514,15 @@ fn first_run_text(val: Option<&Value>) -> Option<String> {
 
 fn best_thumbnail(thumbnails: &[Value]) -> Option<String> {
     thumbnails
-        .last()?
-        .as_object()
-        .and_then(|o| str_val(o, "url"))
+        .iter()
+        .rev()
+        .filter_map(|v| {
+            v.as_object()
+                .and_then(|o| str_val(o, "url"))
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+        })
+        .next()
         .map(ToOwned::to_owned)
 }
 
@@ -2407,6 +2541,40 @@ fn is_not_square(thumbnails: &[Value]) -> bool {
     }
     let ratio = w / h;
     !(0.85..=1.15).contains(&ratio)
+}
+
+fn collect_suggestion_query_renderers(root: &Value) -> Vec<&Map<String, Value>> {
+    let mut out = Vec::new();
+    walk_suggestion_query_renderers(root, &mut out);
+    out
+}
+
+fn walk_suggestion_query_renderers<'a>(node: &'a Value, out: &mut Vec<&'a Map<String, Value>>) {
+    match node {
+        Value::Object(map) => {
+            if let Some(obj) = map
+                .get("searchSuggestionRenderer")
+                .and_then(Value::as_object)
+            {
+                out.push(obj);
+            }
+            if let Some(obj) = map
+                .get("historySuggestionRenderer")
+                .and_then(Value::as_object)
+            {
+                out.push(obj);
+            }
+            for v in map.values() {
+                walk_suggestion_query_renderers(v, out);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                walk_suggestion_query_renderers(v, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn collect_renderers<'a>(root: &'a Value, name: &str) -> Vec<&'a Map<String, Value>> {
@@ -2839,5 +3007,258 @@ mod tests {
             .expect("card song");
         assert_eq!(card_song.duration_text.as_deref(), Some("2:05:09"));
         assert_eq!(card_song.artist, "Host Name");
+    }
+
+    #[test]
+    fn parses_structured_search_suggestions_queries_history_and_entities() {
+        let p = parser();
+        let payload: Value = serde_json::from_str(
+            r#"{
+              "contents": [
+                {
+                  "searchSuggestionsSectionRenderer": {
+                    "contents": [
+                      {
+                        "historySuggestionRenderer": {
+                          "suggestion": { "runs": [ { "text": "  bohemian rhapsody live  " } ] },
+                          "navigationEndpoint": { "searchEndpoint": { "query": "  bohemian rhapsody live  " } }
+                        }
+                      },
+                      {
+                        "searchSuggestionRenderer": {
+                          "suggestion": { "runs": [ { "text": "Bohemian Rhapsody", "bold": true }, { "text": " Live" } ] },
+                          "navigationEndpoint": { "searchEndpoint": { "query": "Bohemian Rhapsody Live" } }
+                        }
+                      },
+                      {
+                        "searchSuggestionRenderer": {
+                          "suggestion": { "runs": [ { "text": "bohemian rhapsody" } ] },
+                          "navigationEndpoint": { "searchEndpoint": { "query": "bohemian rhapsody" } }
+                        }
+                      },
+                      {
+                        "searchSuggestionRenderer": {
+                          "suggestion": { "runs": [ { "text": "queen " }, { "text": "greatest hits" } ] }
+                        }
+                      },
+                      {
+                        "searchSuggestionRenderer": {
+                          "suggestion": { "runs": [ { "text": "   " } ] }
+                        }
+                      }
+                    ]
+                  }
+                },
+                {
+                  "searchSuggestionsSectionRenderer": {
+                    "contents": [
+                      {
+                        "musicResponsiveListItemRenderer": {
+                          "thumbnail": { "musicThumbnailRenderer": { "thumbnail": { "thumbnails": [
+                            { "url": "https://lh3.googleusercontent.com/bohemian-120", "width": 120, "height": 120 },
+                            { "url": "https://lh3.googleusercontent.com/bohemian-544", "width": 544, "height": 544 }
+                          ] } } },
+                          "overlay": { "musicItemThumbnailOverlayRenderer": { "content": { "musicPlayButtonRenderer": {
+                            "playNavigationEndpoint": { "watchEndpoint": { "videoId": "fJ9rUzIMcZQ" } }
+                          } } } },
+                          "flexColumns": [
+                            { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [ { "text": "Bohemian Rhapsody" } ] } } },
+                            { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [
+                              { "text": "Song" }, { "text": " • " },
+                              { "text": "Queen", "navigationEndpoint": { "browseEndpoint": {
+                                "browseId": "UCiMhD4jzUqG-IgPzUmmytRQ",
+                                "browseEndpointContextSupportedConfigs": { "browseEndpointContextMusicConfig": {
+                                  "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                                } }
+                              } } },
+                              { "text": " • " },
+                              { "text": "A Night at the Opera", "navigationEndpoint": { "browseEndpoint": {
+                                "browseId": "MPREb_opera001",
+                                "browseEndpointContextSupportedConfigs": { "browseEndpointContextMusicConfig": {
+                                  "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+                                } }
+                              } } },
+                              { "text": " • " }, { "text": "5:55" }
+                            ] } } }
+                          ]
+                        }
+                      },
+                      {
+                        "musicResponsiveListItemRenderer": {
+                          "navigationEndpoint": { "watchEndpoint": { "videoId": "fJ9rUzIMcZQ" } },
+                          "flexColumns": [
+                            { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [ { "text": "Bohemian Rhapsody (Dup)" } ] } } },
+                            { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [ { "text": "Song • Queen • 5:55" } ] } } }
+                          ]
+                        }
+                      },
+                      {
+                        "musicResponsiveListItemRenderer": {
+                          "thumbnail": { "musicThumbnailRenderer": { "thumbnail": { "thumbnails": [] } } },
+                          "navigationEndpoint": { "watchEndpoint": { "videoId": "HgzGwKwLmgM" } },
+                          "flexColumns": [
+                            { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [ { "text": "Don't Stop Me Now" } ] } } },
+                            { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [
+                              { "text": "Song • Queen • Jazz • 3:29" }
+                            ] } } }
+                          ]
+                        }
+                      },
+                      {
+                        "musicResponsiveListItemRenderer": {
+                          "thumbnail": { "musicThumbnailRenderer": { "thumbnail": { "thumbnails": [
+                            { "url": "https://lh3.googleusercontent.com/queen-artist", "width": 226, "height": 226 }
+                          ] } } },
+                          "navigationEndpoint": { "browseEndpoint": {
+                            "browseId": "UCiMhD4jzUqG-IgPzUmmytRQ",
+                            "browseEndpointContextSupportedConfigs": { "browseEndpointContextMusicConfig": {
+                              "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                            } }
+                          } },
+                          "flexColumns": [
+                            { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [ { "text": "Queen" } ] } } },
+                            { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [ { "text": "Artist • 51M monthly audience" } ] } } }
+                          ]
+                        }
+                      },
+                      {
+                        "musicResponsiveListItemRenderer": {
+                          "navigationEndpoint": { "browseEndpoint": {
+                            "browseId": "UCiMhD4jzUqG-IgPzUmmytRQ",
+                            "browseEndpointContextSupportedConfigs": { "browseEndpointContextMusicConfig": {
+                              "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                            } }
+                          } },
+                          "flexColumns": [
+                            { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [ { "text": "Queen Duplicate" } ] } } },
+                            { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [ { "text": "Artist" } ] } } }
+                          ]
+                        }
+                      },
+                      {
+                        "musicResponsiveListItemRenderer": {
+                          "thumbnail": { "musicThumbnailRenderer": { "thumbnail": { "thumbnails": [
+                            { "url": "https://lh3.googleusercontent.com/opera-album", "width": 226, "height": 226 }
+                          ] } } },
+                          "navigationEndpoint": { "browseEndpoint": {
+                            "browseId": "MPREb_opera001",
+                            "browseEndpointContextSupportedConfigs": { "browseEndpointContextMusicConfig": {
+                              "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+                            } }
+                          } },
+                          "flexColumns": [
+                            { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [ { "text": "A Night at the Opera" } ] } } },
+                            { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [ { "text": "Album • Queen • 1975" } ] } } }
+                          ]
+                        }
+                      },
+                      {
+                        "musicResponsiveListItemRenderer": {
+                          "thumbnail": { "musicThumbnailRenderer": { "thumbnail": { "thumbnails": [
+                            { "url": "https://lh3.googleusercontent.com/queen-playlist", "width": 226, "height": 226 }
+                          ] } } },
+                          "navigationEndpoint": { "browseEndpoint": {
+                            "browseId": "RDCLAK5uy_queen_essentials"
+                          } },
+                          "flexColumns": [
+                            { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [ { "text": "Presenting Queen" } ] } } },
+                            { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [ { "text": "Playlist • YouTube Music" } ] } } }
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }"#,
+        )
+        .expect("valid suggestion fixture");
+
+        let parsed = p.parse_search_suggestions_structured(&payload);
+        assert_eq!(
+            parsed.queries,
+            vec![
+                "bohemian rhapsody live",
+                "bohemian rhapsody",
+                "queen greatest hits",
+            ]
+        );
+        // Backwards-compatible helper stays aligned with structured queries.
+        assert_eq!(p.parse_search_suggestions(&payload), parsed.queries);
+
+        assert_eq!(parsed.items.len(), 5);
+
+        match &parsed.items[0] {
+            SearchResult::Track { song } => {
+                assert_eq!(song.video_id, "fJ9rUzIMcZQ");
+                assert_eq!(song.title, "Bohemian Rhapsody");
+                assert_eq!(song.artist, "Queen");
+                assert_eq!(song.artist_id.as_deref(), Some("UCiMhD4jzUqG-IgPzUmmytRQ"));
+                assert_eq!(song.album_name.as_deref(), Some("A Night at the Opera"));
+                assert_eq!(song.album_id.as_deref(), Some("MPREb_opera001"));
+                assert_eq!(song.duration_text.as_deref(), Some("5:55"));
+                assert_eq!(
+                    song.thumbnail_url.as_deref(),
+                    Some("https://lh3.googleusercontent.com/bohemian-544")
+                );
+                assert!(!song.is_video);
+            }
+            other => panic!("expected song 0, got {other:?}"),
+        }
+
+        match &parsed.items[1] {
+            SearchResult::Track { song } => {
+                assert_eq!(song.video_id, "HgzGwKwLmgM");
+                assert_eq!(song.title, "Don't Stop Me Now");
+                assert_eq!(song.artist, "Queen");
+                assert_eq!(song.album_name.as_deref(), Some("Jazz"));
+                assert_eq!(song.duration_text.as_deref(), Some("3:29"));
+                assert_eq!(
+                    song.thumbnail_url.as_deref(),
+                    Some("https://i.ytimg.com/vi/HgzGwKwLmgM/hqdefault.jpg")
+                );
+                assert!(!song.is_video);
+            }
+            other => panic!("expected song 1 with fallback thumbnail, got {other:?}"),
+        }
+
+        match &parsed.items[2] {
+            SearchResult::Browse { item } => {
+                assert_eq!(item.browse_id, "UCiMhD4jzUqG-IgPzUmmytRQ");
+                assert_eq!(item.title, "Queen");
+                assert_eq!(item.r#type, BrowseType::Artist);
+                assert_eq!(
+                    item.thumbnail_url.as_deref(),
+                    Some("https://lh3.googleusercontent.com/queen-artist")
+                );
+            }
+            other => panic!("expected artist browse item, got {other:?}"),
+        }
+
+        match &parsed.items[3] {
+            SearchResult::Browse { item } => {
+                assert_eq!(item.browse_id, "MPREb_opera001");
+                assert_eq!(item.title, "A Night at the Opera");
+                assert_eq!(item.r#type, BrowseType::Album);
+                assert_eq!(
+                    item.thumbnail_url.as_deref(),
+                    Some("https://lh3.googleusercontent.com/opera-album")
+                );
+            }
+            other => panic!("expected album browse item, got {other:?}"),
+        }
+
+        match &parsed.items[4] {
+            SearchResult::Browse { item } => {
+                assert_eq!(item.browse_id, "RDCLAK5uy_queen_essentials");
+                assert_eq!(item.title, "Presenting Queen");
+                assert_eq!(item.r#type, BrowseType::Playlist);
+                assert_eq!(
+                    item.thumbnail_url.as_deref(),
+                    Some("https://lh3.googleusercontent.com/queen-playlist")
+                );
+            }
+            other => panic!("expected playlist browse item, got {other:?}"),
+        }
     }
 }

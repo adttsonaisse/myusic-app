@@ -1,18 +1,21 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, RwLock};
 
 use bitchord_model::{
     Account, AccountChannel, ArtistPage, HomeFeed, HomeShelf, LibraryState, LikeStatus,
-    MoodGenreSection, PlaylistMove, PlaylistPrivacy, SearchFilter, Song, SongMenu, UserPlaylist,
-    VersionPair, VersionTimeMap,
+    MoodGenreSection, PlaylistMove, PlaylistPrivacy, SearchFilter, SearchResult, Song, SongMenu,
+    UserPlaylist, VersionPair, VersionTimeMap,
 };
 
 use crate::client::InnertubeClient;
 use crate::error::InnertubeError;
 use crate::parser::{
     BrowseHeader, InnertubeParser, LibraryItemPage, PlaylistShelfPage, SearchPage,
+    SearchSuggestionsResult, ensure_song_thumbnail,
 };
+
+const TYPEAHEAD_FALLBACK_MAX_ITEMS: usize = 6;
 
 /// Standard YouTube Music browse IDs used across Home, Explore, and Library.
 pub mod browse_ids {
@@ -150,6 +153,49 @@ impl YtMusicRepository {
             Ok(self.parser.parse_search_suggestions(&raw))
         })
         .await
+    }
+
+    /// Fetches structured search suggestions (query completions + direct song,
+    /// artist, album, and playlist matches) in a single `music/get_search_suggestions`
+    /// request, falling back thinly to `search_typeahead` (max 6 items, error ignored)
+    /// only when the suggestion endpoint returns no direct items.
+    pub async fn search_suggestions_structured(
+        &self,
+        input: &str,
+    ) -> Result<SearchSuggestionsResult, InnertubeError> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(SearchSuggestionsResult::default());
+        }
+        let mut result = self
+            .call(|| async {
+                let raw = self.client.search_suggestions(trimmed).await?;
+                Ok(self.parser.parse_search_suggestions_structured(&raw))
+            })
+            .await?;
+
+        if result.items.is_empty()
+            && let Ok(page) = self.search_typeahead(trimmed).await
+        {
+            let mut seen = HashSet::new();
+            for mut row in page.rows {
+                let key = match &mut row {
+                    SearchResult::TopTrack { song } | SearchResult::Track { song } => {
+                        ensure_song_thumbnail(song);
+                        format!("v:{}", song.video_id)
+                    }
+                    SearchResult::Browse { item } => format!("b:{}", item.browse_id),
+                };
+                if seen.insert(key) {
+                    result.items.push(row);
+                    if result.items.len() >= TYPEAHEAD_FALLBACK_MAX_ITEMS {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     pub async fn search_typeahead(&self, query: &str) -> Result<SearchPage, InnertubeError> {
@@ -367,5 +413,263 @@ impl YtMusicRepository {
     ) -> Result<(), InnertubeError> {
         self.call(|| async { self.client.move_playlist_items(playlist_id, moves).await })
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+    use crate::client::build_shared_http_client;
+
+    async fn spawn_mock_repo(
+        responder: impl Fn(String, String) -> (u16, String) + Send + Sync + 'static,
+    ) -> YtMusicRepository {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let responder = Arc::new(responder);
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let responder = Arc::clone(&responder);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let header_end = loop {
+                        let n = match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos;
+                        }
+                    };
+                    let headers_str = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+                    let req_line = headers_str.lines().next().unwrap_or_default().to_owned();
+                    let content_len: usize = headers_str
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse().ok())?
+                        })
+                        .unwrap_or(0);
+                    let body_start = header_end + 4;
+                    while buf.len() < body_start + content_len {
+                        let n = match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let body = String::from_utf8_lossy(
+                        &buf[body_start..(body_start + content_len).min(buf.len())],
+                    )
+                    .into_owned();
+                    let (code, resp_body) = responder(req_line, body);
+                    let reason = if code == 200 { "OK" } else { "ERR" };
+                    let resp = format!(
+                        "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        let base = format!("http://{addr}");
+        let client = Arc::new(InnertubeClient::with_endpoints(
+            Arc::new(build_shared_http_client()),
+            format!("{base}/youtubei/v1"),
+            base.clone(),
+            base,
+        ));
+        YtMusicRepository::new(client, Arc::new(InnertubeParser::default()))
+    }
+
+    #[tokio::test]
+    async fn search_suggestions_structured_uses_single_request_when_items_present() {
+        let suggest_hits = Arc::new(AtomicUsize::new(0));
+        let search_hits = Arc::new(AtomicUsize::new(0));
+        let s_hits = Arc::clone(&suggest_hits);
+        let t_hits = Arc::clone(&search_hits);
+
+        let repo = spawn_mock_repo(move |req_line, _body| {
+            if req_line.contains("/music/get_search_suggestions") {
+                s_hits.fetch_add(1, Ordering::SeqCst);
+                return (
+                    200,
+                    r#"{
+                      "contents": [
+                        { "searchSuggestionsSectionRenderer": { "contents": [
+                          { "searchSuggestionRenderer": {
+                            "navigationEndpoint": { "searchEndpoint": { "query": "starboy" } }
+                          } }
+                        ] } },
+                        { "searchSuggestionsSectionRenderer": { "contents": [
+                          { "musicResponsiveListItemRenderer": {
+                            "navigationEndpoint": { "watchEndpoint": { "videoId": "34Na4j8AVgA" } },
+                            "flexColumns": [
+                              { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [ { "text": "Starboy" } ] } } },
+                              { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [ { "text": "Song • The Weeknd • 3:50" } ] } } }
+                            ]
+                          } }
+                        ] } }
+                      ]
+                    }"#
+                    .to_owned(),
+                );
+            }
+            if req_line.contains("/search") {
+                t_hits.fetch_add(1, Ordering::SeqCst);
+            }
+            (500, "{}".to_owned())
+        })
+        .await;
+
+        let res = repo
+            .search_suggestions_structured("starb")
+            .await
+            .expect("structured suggestions ok");
+        assert_eq!(suggest_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(search_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(res.queries, vec!["starboy"]);
+        assert_eq!(res.items.len(), 1);
+        match &res.items[0] {
+            SearchResult::Track { song } => {
+                assert_eq!(song.video_id, "34Na4j8AVgA");
+                assert_eq!(
+                    song.thumbnail_url.as_deref(),
+                    Some("https://i.ytimg.com/vi/34Na4j8AVgA/hqdefault.jpg")
+                );
+            }
+            other => panic!("expected Track, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn search_suggestions_structured_falls_back_to_typeahead_when_items_empty() {
+        let suggest_hits = Arc::new(AtomicUsize::new(0));
+        let search_hits = Arc::new(AtomicUsize::new(0));
+        let s_hits = Arc::clone(&suggest_hits);
+        let t_hits = Arc::clone(&search_hits);
+
+        let rows_json: String = (0..8)
+            .map(|i| {
+                format!(
+                    r#"{{ "musicResponsiveListItemRenderer": {{
+                        "playlistItemData": {{ "videoId": "vid0000000{i}" }},
+                        "flexColumns": [
+                            {{ "musicResponsiveListItemFlexColumnRenderer": {{ "text": {{ "runs": [ {{ "text": "Track {i}" }} ] }} }} }},
+                            {{ "musicResponsiveListItemFlexColumnRenderer": {{ "text": {{ "runs": [ {{ "text": "Song • Artist {i} • 3:1{i}" }} ] }} }} }}
+                        ]
+                    }} }}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let search_payload = format!(r#"{{ "contents": [ {rows_json} ] }}"#);
+
+        let repo = spawn_mock_repo(move |req_line, _body| {
+            if req_line.contains("/music/get_search_suggestions") {
+                s_hits.fetch_add(1, Ordering::SeqCst);
+                return (
+                    200,
+                    r#"{
+                      "contents": [
+                        { "searchSuggestionsSectionRenderer": { "contents": [
+                          { "searchSuggestionRenderer": {
+                            "navigationEndpoint": { "searchEndpoint": { "query": "niche track" } }
+                          } }
+                        ] } }
+                      ]
+                    }"#
+                    .to_owned(),
+                );
+            }
+            if req_line.contains("/search") {
+                t_hits.fetch_add(1, Ordering::SeqCst);
+                return (200, search_payload.clone());
+            }
+            (404, "{}".to_owned())
+        })
+        .await;
+
+        let res = repo
+            .search_suggestions_structured("niche")
+            .await
+            .expect("fallback ok");
+        assert_eq!(suggest_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(search_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(res.queries, vec!["niche track"]);
+        assert_eq!(res.items.len(), TYPEAHEAD_FALLBACK_MAX_ITEMS);
+        match &res.items[0] {
+            SearchResult::Track { song } => {
+                assert_eq!(song.video_id, "vid00000000");
+                assert_eq!(
+                    song.thumbnail_url.as_deref(),
+                    Some("https://i.ytimg.com/vi/vid00000000/hqdefault.jpg")
+                );
+            }
+            other => panic!("expected fallback Track, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn search_suggestions_structured_keeps_queries_on_fallback_error_and_skips_blank() {
+        let suggest_hits = Arc::new(AtomicUsize::new(0));
+        let search_hits = Arc::new(AtomicUsize::new(0));
+        let s_hits = Arc::clone(&suggest_hits);
+        let t_hits = Arc::clone(&search_hits);
+
+        let repo = spawn_mock_repo(move |req_line, _body| {
+            if req_line.contains("/music/get_search_suggestions") {
+                s_hits.fetch_add(1, Ordering::SeqCst);
+                return (
+                    200,
+                    r#"{
+                      "contents": [
+                        { "searchSuggestionsSectionRenderer": { "contents": [
+                          { "historySuggestionRenderer": {
+                            "navigationEndpoint": { "searchEndpoint": { "query": "lofi beats" } }
+                          } }
+                        ] } }
+                      ]
+                    }"#
+                    .to_owned(),
+                );
+            }
+            if req_line.contains("/search") {
+                t_hits.fetch_add(1, Ordering::SeqCst);
+                return (503, r#"{"error":"unavailable"}"#.to_owned());
+            }
+            (404, "{}".to_owned())
+        })
+        .await;
+
+        let empty = repo
+            .search_suggestions_structured("   ")
+            .await
+            .expect("blank ok");
+        assert!(empty.queries.is_empty() && empty.items.is_empty());
+        assert_eq!(suggest_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(search_hits.load(Ordering::SeqCst), 0);
+
+        let res = repo
+            .search_suggestions_structured("lofi")
+            .await
+            .expect("queries preserved on fallback failure");
+        assert_eq!(suggest_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(search_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(res.queries, vec!["lofi beats"]);
+        assert!(res.items.is_empty());
     }
 }
