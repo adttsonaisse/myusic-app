@@ -1198,6 +1198,21 @@ impl RecentCache {
         }
     }
 
+    fn remove_for_video(&mut self, video_id: &str) -> usize {
+        let prefix = format!("{video_id}:");
+        let keys: Vec<String> = self
+            .entries
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        let removed = keys.len();
+        for k in keys {
+            self.remove(&k);
+        }
+        removed
+    }
+
     fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();
@@ -1390,6 +1405,16 @@ impl StreamResolver {
         }
     }
 
+    /// Evicts all in-memory cached stream URLs for `video_id` so the next
+    /// [`Self::resolve`] call fetches a fresh stream from the backend without
+    /// benching or degrading any player profile.
+    pub fn invalidate_video(&self, video_id: &str) -> usize {
+        self.recent
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove_for_video(video_id)
+    }
+
     /// Reports a mid-playback 403/404/410 refusal: evicts cached URLs for
     /// `video_id`, marks `profile_id` as degraded (re-enabling synchronous probing
     /// under [`ProbePolicy::Optimistic`]), and benches `(video_id, profile_id)` for 10 minutes.
@@ -1403,18 +1428,10 @@ impl StreamResolver {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(profile_id.to_owned(), now);
-        {
-            let mut recent = self.recent.write().unwrap_or_else(|e| e.into_inner());
-            let keys: Vec<String> = recent
-                .entries
-                .keys()
-                .filter(|k| k.starts_with(&format!("{video_id}:")))
-                .cloned()
-                .collect();
-            for k in keys {
-                recent.remove(&k);
-            }
-        }
+        self.recent
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove_for_video(video_id);
         self.backend.on_refused(video_id, profile_id, url);
     }
 
@@ -1998,5 +2015,86 @@ mod tests {
             1,
             "degraded VISIONOS profile must perform blocking probe"
         );
+    }
+
+    #[tokio::test]
+    async fn invalidate_video_evicts_ram_cache_without_degrading_or_touching_others() {
+        let backend_calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_backend = Arc::clone(&backend_calls);
+
+        struct CountingBackend {
+            calls: Arc<AtomicUsize>,
+        }
+        impl StreamBackend for CountingBackend {
+            fn resolve_uncached<'a>(
+                &'a self,
+                req: &'a ResolveRequest,
+            ) -> BoxFuture<'a, Result<ResolvedStream, StreamError>> {
+                Box::pin(async move {
+                    let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    Ok(ResolvedStream {
+                        video_id: req.video_id.clone(),
+                        url: format!("https://example.invalid/{}/attempt-{n}", req.video_id),
+                        kbps: 160,
+                        mime_type: r#"audio/webm; codecs="opus""#.to_owned(),
+                        ext: "webm".to_owned(),
+                        content_length: Some(2_000_000),
+                        duration_ms: Some(120_000),
+                        loudness_db: None,
+                        is_live_hls: false,
+                        client_name: "VISIONOS".to_owned(),
+                        profile_id: "native:VISIONOS".to_owned(),
+                        media_headers: BTreeMap::new(),
+                        range_chunk_bytes: Some(1024 * 1024),
+                    })
+                })
+            }
+        }
+
+        let resolver = StreamResolver::new(
+            Arc::new(build_shared_http_client()),
+            Arc::new(CountingBackend {
+                calls: calls_for_backend,
+            }),
+            Arc::new(UploadedTracks::new()),
+        );
+
+        let req_a_256 = ResolveRequest::for_playback("vid_a", 256);
+        let req_a_128 = ResolveRequest::for_playback("vid_a", 128);
+        let req_prefix = ResolveRequest::for_playback("vid_a_other", 256);
+
+        let s1 = resolver.resolve(req_a_256.clone()).await.expect("resolve a 256");
+        let _ = resolver.resolve(req_a_128.clone()).await.expect("resolve a 128");
+        let s_other = resolver
+            .resolve(req_prefix.clone())
+            .await
+            .expect("resolve prefix sibling");
+        assert_eq!(backend_calls.load(Ordering::SeqCst), 3);
+
+        // Cached hit does not call backend again.
+        let s1_cached = resolver.resolve(req_a_256.clone()).await.expect("cached a");
+        assert_eq!(s1_cached.url, s1.url);
+        assert_eq!(backend_calls.load(Ordering::SeqCst), 3);
+
+        // Invalidate vid_a: evicts both 256 & 128 entries, leaves vid_a_other intact.
+        let removed = resolver.invalidate_video("vid_a");
+        assert_eq!(removed, 2);
+        assert_eq!(resolver.invalidate_video("vid_a"), 0);
+
+        // Sibling video with shared prefix remains cached in RAM.
+        let s_other_cached = resolver
+            .resolve(req_prefix)
+            .await
+            .expect("sibling still cached");
+        assert_eq!(s_other_cached.url, s_other.url);
+        assert_eq!(backend_calls.load(Ordering::SeqCst), 3);
+
+        // Next resolve for vid_a fetches a fresh URL from backend (without degrading VISIONOS).
+        let s1_fresh = resolver
+            .resolve(req_a_256)
+            .await
+            .expect("fresh resolve after invalidate");
+        assert_ne!(s1_fresh.url, s1.url);
+        assert_eq!(backend_calls.load(Ordering::SeqCst), 4);
     }
 }
