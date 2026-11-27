@@ -273,6 +273,16 @@ impl DeckSlot {
     }
 }
 
+/// Active track and playhead position preserved across an automatic output
+/// disconnect fallback (e.g. ALSA USB DAC unplugged -> PipeWire) so the UI and
+/// desktop backend can resume from the exact position instead of resetting to 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackResumeState {
+    pub song: Song,
+    pub position_ms: u64,
+    pub duration_ms: u64,
+}
+
 /// Dual-deck Linux native audio engine.
 pub struct AudioEngine {
     backend: AudioBackend,
@@ -296,6 +306,7 @@ pub struct AudioEngine {
     output_mode: AudioOutputMode,
     next_flush_epoch: u64,
     last_output_notice: Option<String>,
+    fallback_resume: Option<FallbackResumeState>,
 }
 
 impl AudioEngine {
@@ -358,6 +369,7 @@ impl AudioEngine {
             output_mode,
             next_flush_epoch: 0,
             last_output_notice: None,
+            fallback_resume: None,
         }
     }
 
@@ -379,6 +391,45 @@ impl AudioEngine {
             .or_else(|| self.last_output_notice.clone())
     }
 
+    /// Returns the track and playhead position preserved across an automatic
+    /// output disconnect fallback (e.g. ALSA USB DAC unplugged -> PipeWire),
+    /// if a fallback occurred and no new track has been loaded yet.
+    pub fn fallback_resume_state(&self) -> Option<&FallbackResumeState> {
+        self.fallback_resume.as_ref()
+    }
+
+    /// Takes and clears the preserved [`FallbackResumeState`] once the caller
+    /// handles reloading or resuming playback after an output disconnect fallback.
+    pub fn take_fallback_resume_state(&mut self) -> Option<FallbackResumeState> {
+        self.fallback_resume.take()
+    }
+
+    fn preserve_fallback_resume(&self) -> Option<FallbackResumeState> {
+        let active = self.crossfade.active_deck;
+        let song = self.deck(active).song.clone()?;
+        Some(FallbackResumeState {
+            song,
+            position_ms: self.position_ms(),
+            duration_ms: self.duration_ms(),
+        })
+    }
+
+    fn apply_backend_fallback(
+        &mut self,
+        backend: AudioBackend,
+        producers: SinkProducers,
+        mode: AudioOutputMode,
+        notice: String,
+    ) {
+        let preserved = self
+            .preserve_fallback_resume()
+            .or_else(|| self.fallback_resume.clone());
+        self.install_backend(backend, producers, mode);
+        self.fallback_resume = preserved;
+        self.last_output_notice = Some(notice);
+        self.state = PlaybackState::Paused;
+    }
+
     /// Re-initializes the active output backend after a PipeWire restart / TWS
     /// disconnect or falls back from a disconnected ALSA USB DAC to PipeWire Auto.
     /// Returns `Ok(true)` when a backend swap occurred.
@@ -387,6 +438,9 @@ impl AudioEngine {
             return Ok(false);
         }
         let reason = self.metrics.stream_error();
+        let preserved = self
+            .preserve_fallback_resume()
+            .or_else(|| self.fallback_resume.clone());
         let target_mode = match &self.output_mode {
             AudioOutputMode::AlsaExclusive { .. } => AudioOutputMode::PipeWireAuto,
             other => other.clone(),
@@ -398,6 +452,7 @@ impl AudioEngine {
         self.stop();
         let (backend, producers) = spawn_backend_for_mode(&target_mode, target_rate, None)?;
         self.install_backend(backend, producers, target_mode);
+        self.fallback_resume = preserved;
         self.last_output_notice = reason;
         Ok(true)
     }
@@ -896,6 +951,9 @@ impl AudioEngine {
         slot.stream_info = Some(info.clone());
         slot.nerd_stats = Some(nerd_stats);
         slot.loudness_gain = gain;
+        if deck_id == self.crossfade.active_deck {
+            self.fallback_resume = None;
+        }
 
         self.send_rt(RtCommand::SetLoudnessGain {
             deck: deck_id,
@@ -1003,6 +1061,7 @@ impl AudioEngine {
         self.crossfade.handed_off = false;
         self.planned_transition = None;
         self.active_transition = None;
+        self.fallback_resume = None;
         self.crossfade.active_deck = standby;
 
         self.send_rt(RtCommand::OpenTransition(DeckId::A));
@@ -1049,6 +1108,7 @@ impl AudioEngine {
         self.crossfade.handed_off = false;
         self.planned_transition = None;
         self.active_transition = None;
+        self.fallback_resume = None;
         self.send_active_solo_gains();
         self.sync_null_commands();
         self.state = PlaybackState::Stopped;
@@ -1185,6 +1245,11 @@ impl AudioEngine {
     pub fn position_ms(&self) -> u64 {
         let active = self.crossfade.active_deck;
         let slot = self.deck(active);
+        if slot.song.is_none()
+            && let Some(ref fb) = self.fallback_resume
+        {
+            return fb.position_ms;
+        }
         let base_ms = slot.base_position_ms();
         let played_frames = self.metrics.played_frames(active);
         let out_rate = u64::from(self.output_sample_rate().max(1));
@@ -1200,14 +1265,18 @@ impl AudioEngine {
 
     pub fn duration_ms(&self) -> u64 {
         let active = self.crossfade.active_deck;
-        self.deck(active)
-            .stream_info
+        let slot = self.deck(active);
+        if slot.song.is_none()
+            && let Some(ref fb) = self.fallback_resume
+        {
+            return fb.duration_ms;
+        }
+        slot.stream_info
             .as_ref()
             .and_then(|i| i.duration_ms)
             .filter(|&d| d > 0)
             .or_else(|| {
-                self.deck(active)
-                    .song
+                slot.song
                     .as_ref()
                     .map(|s| duration_millis(s.duration_text.as_deref()))
                     .filter(|&d| d > 0)
@@ -1219,7 +1288,8 @@ impl AudioEngine {
     /// rebuffering state, and the sleep timer by `delta_ms`.
     pub fn tick(&mut self, delta_ms: u64) {
         // 0. If an ALSA exclusive USB DAC was unplugged, fall back cleanly to PipeWire
-        //    instead of spinning in a silent progress loop.
+        //    instead of spinning in a silent progress loop, preserving the active track
+        //    and playhead position so desktop/UI can resume from the exact spot.
         if matches!(self.backend, AudioBackend::AlsaExclusive(_))
             && self.metrics.needs_reconnect()
         {
@@ -1228,16 +1298,21 @@ impl AudioEngine {
                 .stream_error()
                 .unwrap_or_else(|| "ALSA device disconnected; switched to PipeWire".to_owned());
             if let Ok((pw_sink, pw_prod)) = PipeWireSink::spawn(OUTPUT_SAMPLE_RATE) {
-                self.install_backend(
+                self.apply_backend_fallback(
                     AudioBackend::PipeWire(pw_sink),
                     pw_prod,
                     AudioOutputMode::PipeWireAuto,
+                    notice,
                 );
             } else {
+                let preserved = self
+                    .preserve_fallback_resume()
+                    .or_else(|| self.fallback_resume.clone());
                 self.stop();
+                self.fallback_resume = preserved;
+                self.last_output_notice = Some(notice);
+                self.state = PlaybackState::Paused;
             }
-            self.last_output_notice = Some(notice);
-            self.state = PlaybackState::Paused;
             return;
         }
 
@@ -1396,7 +1471,10 @@ impl AudioEngine {
         let slot = self.deck(active);
         PlaybackSnapshot {
             state: self.state,
-            current_song: slot.song.clone(),
+            current_song: slot
+                .song
+                .clone()
+                .or_else(|| self.fallback_resume.as_ref().map(|fb| fb.song.clone())),
             position_ms: self.position_ms(),
             duration_ms: self.duration_ms(),
             volume: self.volume,
@@ -2212,5 +2290,101 @@ mod tests {
         );
         engine.clear_standby();
         assert!(engine.standby_song().is_none());
+    }
+
+    #[test]
+    fn backend_fallback_preserves_resume_position_and_clears_on_take_or_load() {
+        let wav = build_test_wav_pcm16(48_000, 440.0, 2_000);
+        let mut engine = AudioEngine::with_null_sink();
+        engine
+            .load_bytes(
+                wav.clone(),
+                Some("wav".to_owned()),
+                Song::new("dac_track", "DAC Track", "Artist", None),
+                None,
+            )
+            .expect("load dac track");
+        engine.wait_prebuffer(600, Duration::from_millis(500));
+        engine.play();
+        // Advance playhead ~500 ms before simulated ALSA unplug fallback.
+        let _ = engine.render_null_frames(24_000).expect("render 500ms");
+        let pos_before = engine.position_ms();
+        let dur_before = engine.duration_ms();
+        assert!(
+            pos_before >= 400,
+            "expected playhead >= 400ms before fallback, got {pos_before}ms"
+        );
+        assert!(dur_before >= 1_900);
+
+        // Simulate ALSA ENODEV fallback swapping to a fresh output sink.
+        let (pw_null, pw_prod) = NullAudioSink::new(OUTPUT_SAMPLE_RATE);
+        engine.apply_backend_fallback(
+            AudioBackend::Null(Box::new(pw_null)),
+            pw_prod,
+            AudioOutputMode::PipeWireAuto,
+            "ALSA USB DAC disconnected (ENODEV); switched to PipeWire".to_owned(),
+        );
+
+        let snap = engine.snapshot();
+        assert_eq!(snap.state, PlaybackState::Paused);
+        assert_eq!(
+            snap.current_song.as_ref().map(|s| s.video_id.as_str()),
+            Some("dac_track")
+        );
+        assert_eq!(
+            snap.position_ms, pos_before,
+            "snapshot position must stay preserved across fallback instead of resetting to 0"
+        );
+        assert_eq!(snap.duration_ms, dur_before);
+        assert!(
+            snap.output_error
+                .as_deref()
+                .is_some_and(|e| e.contains("ENODEV"))
+        );
+
+        let fb = engine
+            .fallback_resume_state()
+            .expect("fallback_resume_state must be populated");
+        assert_eq!(fb.song.video_id, "dac_track");
+        assert_eq!(fb.position_ms, pos_before);
+        assert_eq!(fb.duration_ms, dur_before);
+
+        // Consuming take_fallback_resume_state hands ownership to desktop and clears it.
+        let taken = engine
+            .take_fallback_resume_state()
+            .expect("take_fallback_resume_state returns preserved state once");
+        assert_eq!(taken.position_ms, pos_before);
+        assert!(engine.fallback_resume_state().is_none());
+        assert_eq!(engine.position_ms(), 0);
+
+        // Loading a fresh track also clears any preserved fallback state.
+        engine
+            .load_bytes(
+                wav.clone(),
+                Some("wav".to_owned()),
+                Song::new("dac_track_2", "DAC Track 2", "Artist", None),
+                None,
+            )
+            .expect("reload");
+        engine.wait_prebuffer(400, Duration::from_millis(500));
+        engine.play();
+        let _ = engine.render_null_frames(12_000).expect("render 250ms");
+        let (pw_null2, pw_prod2) = NullAudioSink::new(OUTPUT_SAMPLE_RATE);
+        engine.apply_backend_fallback(
+            AudioBackend::Null(Box::new(pw_null2)),
+            pw_prod2,
+            AudioOutputMode::PipeWireAuto,
+            "fallback 2".to_owned(),
+        );
+        assert!(engine.fallback_resume_state().is_some());
+        engine
+            .load_bytes(
+                wav,
+                Some("wav".to_owned()),
+                Song::new("fresh", "Fresh", "Artist", None),
+                None,
+            )
+            .expect("fresh load");
+        assert!(engine.fallback_resume_state().is_none());
     }
 }

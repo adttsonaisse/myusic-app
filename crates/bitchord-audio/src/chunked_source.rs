@@ -306,7 +306,7 @@ impl ChunkedRangeSource {
         if src.total_len.is_none() {
             // Prime chunk 0 and wait only for its HTTP response headers (or error)
             // to learn total_len from Content-Range / Content-Length.
-            if let Some(slot) = src.ensure_chunk_started(0) {
+            if let Some(slot) = src.ensure_chunk_started(0, true) {
                 let mut guard = slot.state.lock().unwrap_or_else(|e| e.into_inner());
                 while !guard.header_ready && !guard.done && !src.cancel.is_cancelled() {
                     guard = slot.ready.wait(guard).unwrap_or_else(|e| e.into_inner());
@@ -347,9 +347,23 @@ impl ChunkedRangeSource {
         self.cancel.clone()
     }
 
-    fn ensure_chunk_started(&mut self, chunk_idx: u64) -> Option<Arc<ChunkSlot>> {
+    fn ensure_chunk_started(&mut self, chunk_idx: u64, retry_failed: bool) -> Option<Arc<ChunkSlot>> {
         if let Some(existing) = self.chunks.get(&chunk_idx) {
-            return Some(Arc::clone(&existing.slot));
+            let should_retry = retry_failed
+                && !self.cancel.is_cancelled()
+                && {
+                    let guard = existing.slot.state.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.done && is_retryable_slot_error(guard.error.as_ref())
+                };
+            if !should_retry {
+                return Some(Arc::clone(&existing.slot));
+            }
+            if let Some(removed) = self.chunks.remove(&chunk_idx) {
+                removed.task.abort();
+            }
+            if let Some(pos) = self.cache_order.iter().position(|&id| id == chunk_idx) {
+                self.cache_order.remove(pos);
+            }
         }
         let start = chunk_idx.saturating_mul(self.chunk_bytes);
         let max_len = match self.total_len {
@@ -405,7 +419,7 @@ impl ChunkedRangeSource {
             if next_idx.saturating_mul(self.chunk_bytes) >= total {
                 break;
             }
-            let _ = self.ensure_chunk_started(next_idx);
+            let _ = self.ensure_chunk_started(next_idx, false);
         }
     }
 
@@ -461,6 +475,23 @@ impl Drop for ChunkedRangeSource {
         for chunk in self.chunks.values() {
             chunk.task.abort();
         }
+    }
+}
+
+/// Returns `true` when a finished chunk slot failed due to a transient/network
+/// error and should be evicted & refetched on a subsequent read/retry, while
+/// keeping permanent refusals (403/404/410), protocol errors, and cancellations
+/// sticky so they are never spammed.
+fn is_retryable_slot_error(error: Option<&(io::ErrorKind, String)>) -> bool {
+    match error {
+        None => false,
+        Some((
+            io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::PermissionDenied
+            | io::ErrorKind::InvalidData,
+            _,
+        )) => false,
+        Some(_) => true,
     }
 }
 
@@ -709,7 +740,7 @@ impl Read for ChunkedRangeSource {
         let chunk_idx = self.pos / self.chunk_bytes;
         let offset_in_chunk = (self.pos % self.chunk_bytes) as usize;
 
-        let Some(slot) = self.ensure_chunk_started(chunk_idx) else {
+        let Some(slot) = self.ensure_chunk_started(chunk_idx, true) else {
             return Ok(0);
         };
         // Trigger non-blocking background prefetch of upcoming sequential chunks.
@@ -1085,5 +1116,162 @@ mod tests {
         assert_eq!(got, payload);
         assert_eq!(attempt.load(Ordering::SeqCst), 3);
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn evicts_and_refetches_transient_failed_chunk_on_retry() {
+        use std::sync::atomic::AtomicBool;
+
+        let payload: Vec<u8> = (0..4_096usize).map(|i| ((i * 7) % 251) as u8).collect();
+        let payload_arc = Arc::new(payload.clone());
+        let fail_requests = Arc::new(AtomicBool::new(true));
+        let hits = Arc::new(AtomicUsize::new(0));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let fail_srv = Arc::clone(&fail_requests);
+        let hits_srv = Arc::clone(&hits);
+        let data_srv = Arc::clone(&payload_arc);
+
+        let _server = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let fail = Arc::clone(&fail_srv);
+                let hits = Arc::clone(&hits_srv);
+                let data = Arc::clone(&data_srv);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    if fail.load(Ordering::SeqCst) {
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                    } else {
+                        let head = format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4095/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            data.len(),
+                            data.len()
+                        );
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        let _ = sock.write_all(&data).await;
+                    }
+                });
+            }
+        });
+
+        let handle = Handle::current();
+        let url = format!("http://127.0.0.1:{}/recover.bin", addr.port());
+        let fail_flip = Arc::clone(&fail_requests);
+        let got = tokio::task::spawn_blocking(move || {
+            let mut src = ChunkedRangeSource::new(
+                Client::new(),
+                handle,
+                url,
+                Vec::new(),
+                Some(4_096),
+                4_096,
+                None,
+            )
+            .expect("create source");
+
+            // First read exhausts internal transient retries and lands in a failed slot.
+            let mut first_buf = [0u8; 64];
+            let first_err = src.read(&mut first_buf).expect_err("expected initial 502 error");
+            assert_eq!(first_err.kind(), io::ErrorKind::Other);
+
+            // Network comes back; subsequent read (e.g. play -> retry_after_error -> seek)
+            // must evict the failed transient slot and fetch fresh bytes cleanly.
+            fail_flip.store(false, Ordering::SeqCst);
+            src.seek(SeekFrom::Start(0)).expect("seek back to 0");
+            let mut recovered = Vec::new();
+            src.read_to_end(&mut recovered)
+                .expect("retry read must succeed after evicting failed slot");
+            recovered
+        })
+        .await
+        .expect("join blocking");
+
+        assert_eq!(got, payload);
+        assert!(
+            hits.load(Ordering::SeqCst) >= MAX_TRANSIENT_RETRIES + 2,
+            "expected initial failed attempts plus fresh retry fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn keeps_403_and_cancelled_chunk_errors_sticky_without_refetch() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let hits_srv = Arc::clone(&hits);
+
+        let _server = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let hits = Arc::clone(&hits_srv);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+
+        let handle = Handle::current();
+        let url = format!("http://127.0.0.1:{}/refused.bin", addr.port());
+        let (err1_kind, err2_kind) = tokio::task::spawn_blocking(move || {
+            let mut src = ChunkedRangeSource::new(
+                Client::new(),
+                handle,
+                url,
+                Vec::new(),
+                Some(4_096),
+                4_096,
+                None,
+            )
+            .expect("create 403 source");
+            let mut buf = [0u8; 32];
+            let e1 = src.read(&mut buf).expect_err("first 403").kind();
+            let e2 = src.read(&mut buf).expect_err("second 403 must stay sticky").kind();
+            (e1, e2)
+        })
+        .await
+        .expect("join 403");
+
+        assert_eq!(err1_kind, io::ErrorKind::PermissionDenied);
+        assert_eq!(err2_kind, io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "403 refusal must stay sticky and never spam refetch"
+        );
+
+        // Cancelled token must also never refetch on subsequent reads.
+        let cancel = StreamCancelToken::new();
+        cancel.cancel();
+        let handle2 = Handle::current();
+        let url2 = format!("http://127.0.0.1:{}/cancelled.bin", addr.port());
+        let cancel_kind = tokio::task::spawn_blocking(move || {
+            let mut src = ChunkedRangeSource::new_with_cancel(
+                Client::new(),
+                handle2,
+                url2,
+                Vec::new(),
+                Some(4_096),
+                4_096,
+                None,
+                cancel,
+            )
+            .expect("create cancelled source");
+            let mut buf = [0u8; 16];
+            src.read(&mut buf).expect_err("cancelled read").kind()
+        })
+        .await
+        .expect("join cancel");
+
+        assert_eq!(cancel_kind, io::ErrorKind::ConnectionAborted);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "cancelled source must not issue HTTP calls");
     }
 }

@@ -48,8 +48,8 @@ pub use dsp::{
     loudness_db_to_linear_gain, sanitize_samples,
 };
 pub use engine::{
-    AudioEngine, AudioSourceSpec, EngineError, HeadlessPlaybackReport, PlaybackSnapshot,
-    PlaybackState, open_http_decoder, open_http_decoder_with_cancel,
+    AudioEngine, AudioSourceSpec, EngineError, FallbackResumeState, HeadlessPlaybackReport,
+    PlaybackSnapshot, PlaybackState, open_http_decoder, open_http_decoder_with_cancel,
 };
 pub use mpris::{
     BitChordMprisPlayer, DESKTOP_ENTRY, IDENTITY, LoopStatus, MPRIS_BUS_SUFFIX, MprisCommand,
