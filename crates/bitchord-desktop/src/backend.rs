@@ -1265,6 +1265,20 @@ fn save_settings_async(rt: &Handle, settings_path: &Path, settings: &AppSettings
     });
 }
 
+/// Runs `fut` on `rt` with a bounded timeout, constructing `tokio::time::timeout`
+/// inside the runtime context so callers on non-Tokio OS threads (such as
+/// `bitchord-backend`) never panic with "there is no reactor running".
+fn block_on_with_timeout<F>(
+    rt: &Handle,
+    timeout: Duration,
+    fut: F,
+) -> Result<F::Output, tokio::time::error::Elapsed>
+where
+    F: std::future::Future,
+{
+    rt.block_on(async move { tokio::time::timeout(timeout, fut).await })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_backend_thread(
     rt: Handle,
@@ -1357,19 +1371,16 @@ fn run_backend_thread(
 
     // Best-effort initial Secret Service load with bounded timeout so locked/headless
     // desktops never hang startup; all subsequent keyring writes run asynchronously.
-    let secret_store: Option<Arc<KeyringSecretStore>> = rt
-        .block_on(async {
-            tokio::time::timeout(Duration::from_millis(800), KeyringSecretStore::open())
-                .await
-                .ok()
-                .and_then(Result::ok)
-        })
-        .map(Arc::new);
+    let secret_store: Option<Arc<KeyringSecretStore>> =
+        block_on_with_timeout(&rt, Duration::from_millis(800), KeyringSecretStore::open())
+            .ok()
+            .and_then(Result::ok)
+            .map(Arc::new);
     if let Some(ref store) = secret_store {
         let store_c = Arc::clone(store);
         let innertube_c = Arc::clone(&innertube);
         let remote_auth_c = Arc::clone(&remote_auth);
-        let _ = rt.block_on(tokio::time::timeout(Duration::from_millis(800), async move {
+        let _ = block_on_with_timeout(&rt, Duration::from_millis(800), async move {
             if let Ok(Some(cookie)) = store_c.get(SecretKey::YoutubeCookie).await {
                 innertube_c.set_cookie(Some(cookie.expose().to_owned()));
             }
@@ -1391,16 +1402,13 @@ fn run_backend_thread(
                 guard.webdav.password = webdav_pw;
                 guard.smb.password = smb_pw;
             }
-        }));
+        });
     }
 
     // Start MPRIS2 D-Bus server (`org.mpris.MediaPlayer2.bitchord`).
-    let mpris_state = rt.block_on(async {
-        tokio::time::timeout(Duration::from_secs(2), MprisService::start())
-            .await
-            .ok()
-            .and_then(Result::ok)
-    });
+    let mpris_state = block_on_with_timeout(&rt, Duration::from_secs(2), MprisService::start())
+        .ok()
+        .and_then(Result::ok);
     let (mpris_svc, mut mpris_rx) = match mpris_state {
         Some((svc, rx)) => (Some(Arc::new(svc)), Some(rx)),
         None => (None, None),
@@ -7007,5 +7015,35 @@ mod tests {
             Ok(BackendEvent::DownloadRemoved(ref id)) if id == "yt_failed"
         ));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn block_on_with_timeout_runs_safely_from_non_tokio_thread() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        // Execute on a plain OS thread (matching `bitchord-backend`, which has no entered
+        // Tokio reactor) to ensure `tokio::time::timeout` is never constructed outside `rt`.
+        let join = std::thread::spawn(move || {
+            let ok = block_on_with_timeout(&handle, Duration::from_millis(500), async {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                42usize
+            });
+            assert_eq!(ok.expect("should complete before timeout"), 42);
+
+            let timed_out = block_on_with_timeout(
+                &handle,
+                Duration::from_millis(20),
+                std::future::pending::<()>(),
+            );
+            assert!(timed_out.is_err(), "pending future should time out cleanly");
+        });
+
+        join.join()
+            .expect("non-tokio thread must not panic with missing reactor");
     }
 }
